@@ -1,0 +1,80 @@
+# WorldVision-SLAM 벤치마크 뷰어 매니페스트
+# 지표는 python/tools/bench_run.py 가 계산한 값 그대로다.
+# SEQ	name	dataset	seq_dir	gt_file	identity_ate_cm
+# RUN	name	system	label	kind	ate_cm	rpe_mm	ms_per_frame	frames	status	traj_file
+SEQ	kitti_00	kitti	D:/Program Files/Slam-Model/data/kitti_00	D:/Program Files/Slam-Model/data/kitti_00/groundtruth.txt	11123.38
+RUN	kitti_00	baseline	ORB + PnP (classical)	descriptor	129.03	35.80	33.8	400	ok	D:/Program Files/Slam-Model/results/bench/kitti_00_baseline.txt
+RUN	kitti_00	wme	WME ECDA (Tier 0)	descriptor-free	94.32	25.90	46.9	400	ok	D:/Program Files/Slam-Model/results/bench/kitti_00_wme.txt
+SEQ	kitti_04	kitti	D:/Program Files/Slam-Model/data/kitti_04	D:/Program Files/Slam-Model/data/kitti_04/groundtruth.txt	11353.10
+RUN	kitti_04	baseline	ORB + PnP (classical)	descriptor	5056.93	422.15	38.7	136	ok	D:/Program Files/Slam-Model/results/bench/kitti_04_baseline.txt
+RUN	kitti_04	wme	WME ECDA (Tier 0)	descriptor-free	954.78	38.31	39.3	136	ok	D:/Program Files/Slam-Model/results/bench/kitti_04_wme.txt
+SEQ	kitti_05	kitti	D:/Program Files/Slam-Model/data/kitti_05	D:/Program Files/Slam-Model/data/kitti_05/groundtruth.txt	8818.45
+RUN	kitti_05	baseline	ORB + PnP (classical)	descriptor	160.25	34.21	30.1	400	ok	D:/Program Files/Slam-Model/results/bench/kitti_05_baseline.txt
+RUN	kitti_05	wme	WME ECDA (Tier 0)	descriptor-free	141.48	16.17	43.0	400	ok	D:/Program Files/Slam-Model/results/bench/kitti_05_wme.txt
+SEQ	kitti_07	kitti	D:/Program Files/Slam-Model/data/kitti_07	D:/Program Files/Slam-Model/data/kitti_07/groundtruth.txt	8430.02
+RUN	kitti_07	baseline	ORB + PnP (classical)	descriptor	304.09	29.63	30.0	400	ok	D:/Program Files/Slam-Model/results/bench/kitti_07_baseline.txt
+RUN	kitti_07	wme	WME ECDA (Tier 0)	descriptor-free	107.93	15.77	40.3	400	ok	D:/Program Files/Slam-Model/results/bench/kitti_07_wme.txt
+SEQ	freiburg1_360	tum	D:/Program Files/Slam-Model/data/rgbd_dataset_freiburg1_360	D:/Program Files/Slam-Model/data/rgbd_dataset_freiburg1_360/groundtruth.txt	16.44
+RUN	freiburg1_360	baseline	ORB + PnP (classical)	descriptor	13.62	12.15	44.6	165	ok	D:/Program Files/Slam-Model/results/bench/freiburg1_360_baseline.txt
+RUN	freiburg1_360	wme	WME ECDA (Tier 0)	descriptor-free	10.37	8.63	52.7	165	ok	D:/Program Files/Slam-Model/results/bench/freiburg1_360_wme.txt
+RUN	freiburg1_360	wme_masked	WME + token mask (YOLO)	descriptor-free	10.37	8.63	152.7	165	ok	D:/Program Files/Slam-Model/results/bench/freiburg1_360_wme_masked.txt
+SEQ	freiburg1_desk	tum	D:/Program Files/Slam-Model/data/rgbd_dataset_freiburg1_desk	D:/Program Files/Slam-Model/data/rgbd_dataset_freiburg1_desk/groundtruth.txt	57.64
+RUN	freiburg1_desk	baseline	ORB + PnP (classical)	descriptor	3.55	6.90	33.9	164	ok	D:/Program Files/Slam-Model/results/bench/freiburg1_desk_baseline.txt
+RUN	freiburg1_desk	wme	WME ECDA (Tier 0)	descriptor-free	2.53	5.65	49.1	164	ok	D:/Program Files/Slam-Model/results/bench/freiburg1_desk_wme.txt
+RUN	freiburg1_desk	wme_masked	WME + token mask (YOLO)	descriptor-free	2.53	5.65	169.3	164	ok	D:/Program Files/Slam-Model/results/bench/freiburg1_desk_wme_masked.txt
+SEQ	freiburg1_plant	tum	D:/Program Files/Slam-Model/data/rgbd_dataset_freiburg1_plant	D:/Program Files/Slam-Model/data/rgbd_dataset_freiburg1_plant/groundtruth.txt	40.70
+RUN	freiburg1_plant	baseline	ORB + PnP (classical)	descriptor	3.37	6.93	42.8	165	ok	D:/Program Files/Slam-Model/results/bench/freiburg1_plant_baseline.txt
+RUN	freiburg1_plant	wme	WME ECDA (Tier 0)	descriptor-free	4.51	4.12	45.7	165	ok	D:/Program Files/Slam-Model/results/bench/freiburg1_plant_wme.txt
+RUN	freiburg1_plant	wme_masked	WME + token mask (YOLO)	descriptor-free	4.61	4.26	167.1	165	ok	D:/Program Files/Slam-Model/results/bench/freiburg1_plant_wme_masked.txt
+SEQ	freiburg1_room	tum	D:/Program Files/Slam-Model/data/rgbd_dataset_freiburg1_room	D:/Program Files/Slam-Model/data/rgbd_dataset_freiburg1_room/groundtruth.txt	101.65
+RUN	freiburg1_room	baseline	ORB + PnP (classical)	descriptor	48.06	5.60	42.7	1362	ok	D:/Program Files/Slam-Model/results/bench/freiburg1_room_baseline.txt
+RUN	freiburg1_room	wme	WME ECDA (Tier 0)	descriptor-free	21.72	4.24	57.4	1362	ok	D:/Program Files/Slam-Model/results/bench/freiburg1_room_wme.txt
+RUN	freiburg1_room	wme_masked	WME + token mask (YOLO)	descriptor-free	21.17	4.28	196.8	1362	ok	D:/Program Files/Slam-Model/results/bench/freiburg1_room_wme_masked.txt
+SEQ	freiburg1_teddy	tum	D:/Program Files/Slam-Model/data/rgbd_dataset_freiburg1_teddy	D:/Program Files/Slam-Model/data/rgbd_dataset_freiburg1_teddy/groundtruth.txt	52.16
+RUN	freiburg1_teddy	baseline	ORB + PnP (classical)	descriptor	6.22	8.35	42.1	165	ok	D:/Program Files/Slam-Model/results/bench/freiburg1_teddy_baseline.txt
+RUN	freiburg1_teddy	wme	WME ECDA (Tier 0)	descriptor-free	5.30	5.21	44.7	165	ok	D:/Program Files/Slam-Model/results/bench/freiburg1_teddy_wme.txt
+RUN	freiburg1_teddy	wme_masked	WME + token mask (YOLO)	descriptor-free	5.30	5.21	215.4	165	ok	D:/Program Files/Slam-Model/results/bench/freiburg1_teddy_wme_masked.txt
+SEQ	freiburg1_xyz	tum	D:/Program Files/Slam-Model/data/rgbd_dataset_freiburg1_xyz	D:/Program Files/Slam-Model/data/rgbd_dataset_freiburg1_xyz/groundtruth.txt	17.21
+RUN	freiburg1_xyz	baseline	ORB + PnP (classical)	descriptor	2.61	3.96	34.3	250	ok	D:/Program Files/Slam-Model/results/bench/freiburg1_xyz_baseline.txt
+RUN	freiburg1_xyz	wme	WME ECDA (Tier 0)	descriptor-free	1.56	3.89	52.4	250	ok	D:/Program Files/Slam-Model/results/bench/freiburg1_xyz_wme.txt
+RUN	freiburg1_xyz	wme_masked	WME + token mask (YOLO)	descriptor-free	1.53	3.89	196.8	250	ok	D:/Program Files/Slam-Model/results/bench/freiburg1_xyz_wme_masked.txt
+SEQ	freiburg2_desk	tum	D:/Program Files/Slam-Model/data/rgbd_dataset_freiburg2_desk	D:/Program Files/Slam-Model/data/rgbd_dataset_freiburg2_desk/groundtruth.txt	39.46
+RUN	freiburg2_desk	baseline	ORB + PnP (classical)	descriptor	0.98	2.36	39.9	256	ok	D:/Program Files/Slam-Model/results/bench/freiburg2_desk_baseline.txt
+RUN	freiburg2_desk	wme	WME ECDA (Tier 0)	descriptor-free	2.38	1.67	44.7	256	ok	D:/Program Files/Slam-Model/results/bench/freiburg2_desk_wme.txt
+RUN	freiburg2_desk	wme_masked	WME + token mask (YOLO)	descriptor-free	2.38	1.67	155.8	256	ok	D:/Program Files/Slam-Model/results/bench/freiburg2_desk_wme_masked.txt
+SEQ	freiburg2_desk_with_person	tum	D:/Program Files/Slam-Model/data/rgbd_dataset_freiburg2_desk_with_person	D:/Program Files/Slam-Model/data/rgbd_dataset_freiburg2_desk_with_person/groundtruth.txt	19.63
+RUN	freiburg2_desk_with_person	baseline	ORB + PnP (classical)	descriptor	0.73	2.27	36.2	258	ok	D:/Program Files/Slam-Model/results/bench/freiburg2_desk_with_person_baseline.txt
+RUN	freiburg2_desk_with_person	wme	WME ECDA (Tier 0)	descriptor-free	0.94	1.06	49.7	258	ok	D:/Program Files/Slam-Model/results/bench/freiburg2_desk_with_person_wme.txt
+RUN	freiburg2_desk_with_person	wme_masked	WME + token mask (YOLO)	descriptor-free	0.94	1.06	168.6	258	ok	D:/Program Files/Slam-Model/results/bench/freiburg2_desk_with_person_wme_masked.txt
+SEQ	freiburg3_nostructure_notexture_far	tum	D:/Program Files/Slam-Model/data/rgbd_dataset_freiburg3_nostructure_notexture_far	D:/Program Files/Slam-Model/data/rgbd_dataset_freiburg3_nostructure_notexture_far/groundtruth.txt	87.90
+RUN	freiburg3_nostructure_notexture_far	baseline	ORB + PnP (classical)	descriptor	146.26	7.67	26.4	451	ok	D:/Program Files/Slam-Model/results/bench/freiburg3_nostructure_notexture_far_baseline.txt
+RUN	freiburg3_nostructure_notexture_far	wme	WME ECDA (Tier 0)	descriptor-free	87.90	6.86	41.1	451	no_output	D:/Program Files/Slam-Model/results/bench/freiburg3_nostructure_notexture_far_wme.txt
+RUN	freiburg3_nostructure_notexture_far	wme_masked	WME + token mask (YOLO)	descriptor-free	87.90	6.86	140.8	451	no_output	D:/Program Files/Slam-Model/results/bench/freiburg3_nostructure_notexture_far_wme_masked.txt
+SEQ	freiburg3_nostructure_texture_far	tum	D:/Program Files/Slam-Model/data/rgbd_dataset_freiburg3_nostructure_texture_far	D:/Program Files/Slam-Model/data/rgbd_dataset_freiburg3_nostructure_texture_far/groundtruth.txt	139.61
+RUN	freiburg3_nostructure_texture_far	baseline	ORB + PnP (classical)	descriptor	34.12	23.04	26.0	447	ok	D:/Program Files/Slam-Model/results/bench/freiburg3_nostructure_texture_far_baseline.txt
+RUN	freiburg3_nostructure_texture_far	wme	WME ECDA (Tier 0)	descriptor-free	7.74	18.89	39.7	447	ok	D:/Program Files/Slam-Model/results/bench/freiburg3_nostructure_texture_far_wme.txt
+RUN	freiburg3_nostructure_texture_far	wme_masked	WME + token mask (YOLO)	descriptor-free	7.21	18.91	130.3	447	ok	D:/Program Files/Slam-Model/results/bench/freiburg3_nostructure_texture_far_wme_masked.txt
+SEQ	freiburg3_sitting_halfsphere	tum	D:/Program Files/Slam-Model/data/rgbd_dataset_freiburg3_sitting_halfsphere	D:/Program Files/Slam-Model/data/rgbd_dataset_freiburg3_sitting_halfsphere/groundtruth.txt	22.85
+RUN	freiburg3_sitting_halfsphere	baseline	ORB + PnP (classical)	descriptor	1.26	5.37	39.6	259	ok	D:/Program Files/Slam-Model/results/bench/freiburg3_sitting_halfsphere_baseline.txt
+RUN	freiburg3_sitting_halfsphere	wme	WME ECDA (Tier 0)	descriptor-free	1.50	4.11	36.0	259	ok	D:/Program Files/Slam-Model/results/bench/freiburg3_sitting_halfsphere_wme.txt
+RUN	freiburg3_sitting_halfsphere	wme_masked	WME + token mask (YOLO)	descriptor-free	12.54	4.94	122.5	259	ok	D:/Program Files/Slam-Model/results/bench/freiburg3_sitting_halfsphere_wme_masked.txt
+SEQ	freiburg3_sitting_xyz	tum	D:/Program Files/Slam-Model/data/rgbd_dataset_freiburg3_sitting_xyz	D:/Program Files/Slam-Model/data/rgbd_dataset_freiburg3_sitting_xyz/groundtruth.txt	19.86
+RUN	freiburg3_sitting_xyz	baseline	ORB + PnP (classical)	descriptor	8.85	8.59	35.0	258	ok	D:/Program Files/Slam-Model/results/bench/freiburg3_sitting_xyz_baseline.txt
+RUN	freiburg3_sitting_xyz	wme	WME ECDA (Tier 0)	descriptor-free	1.01	4.63	31.5	258	ok	D:/Program Files/Slam-Model/results/bench/freiburg3_sitting_xyz_wme.txt
+RUN	freiburg3_sitting_xyz	wme_masked	WME + token mask (YOLO)	descriptor-free	1.03	4.69	129.0	258	ok	D:/Program Files/Slam-Model/results/bench/freiburg3_sitting_xyz_wme_masked.txt
+SEQ	freiburg3_structure_notexture_far	tum	D:/Program Files/Slam-Model/data/rgbd_dataset_freiburg3_structure_notexture_far	D:/Program Files/Slam-Model/data/rgbd_dataset_freiburg3_structure_notexture_far/groundtruth.txt	123.62
+RUN	freiburg3_structure_notexture_far	baseline	ORB + PnP (classical)	descriptor	92230741478548.11	12.18	21.0	722	diverged	D:/Program Files/Slam-Model/results/bench/freiburg3_structure_notexture_far_baseline.txt
+RUN	freiburg3_structure_notexture_far	wme	WME ECDA (Tier 0)	descriptor-free	12.20	8.01	36.5	722	ok	D:/Program Files/Slam-Model/results/bench/freiburg3_structure_notexture_far_wme.txt
+RUN	freiburg3_structure_notexture_far	wme_masked	WME + token mask (YOLO)	descriptor-free	12.20	8.01	134.6	722	ok	D:/Program Files/Slam-Model/results/bench/freiburg3_structure_notexture_far_wme_masked.txt
+SEQ	freiburg3_structure_texture_far	tum	D:/Program Files/Slam-Model/data/rgbd_dataset_freiburg3_structure_texture_far	D:/Program Files/Slam-Model/data/rgbd_dataset_freiburg3_structure_texture_far/groundtruth.txt	130.93
+RUN	freiburg3_structure_texture_far	baseline	ORB + PnP (classical)	descriptor	3.30	8.89	34.3	720	ok	D:/Program Files/Slam-Model/results/bench/freiburg3_structure_texture_far_baseline.txt
+RUN	freiburg3_structure_texture_far	wme	WME ECDA (Tier 0)	descriptor-free	1.95	7.51	49.9	720	ok	D:/Program Files/Slam-Model/results/bench/freiburg3_structure_texture_far_wme.txt
+RUN	freiburg3_structure_texture_far	wme_masked	WME + token mask (YOLO)	descriptor-free	7.73	7.33	194.1	720	ok	D:/Program Files/Slam-Model/results/bench/freiburg3_structure_texture_far_wme_masked.txt
+SEQ	freiburg3_walking_halfsphere	tum	D:/Program Files/Slam-Model/data/rgbd_dataset_freiburg3_walking_halfsphere	D:/Program Files/Slam-Model/data/rgbd_dataset_freiburg3_walking_halfsphere/groundtruth.txt	57.30
+RUN	freiburg3_walking_halfsphere	baseline	ORB + PnP (classical)	descriptor	17.86	17.28	36.7	253	ok	D:/Program Files/Slam-Model/results/bench/freiburg3_walking_halfsphere_baseline.txt
+RUN	freiburg3_walking_halfsphere	wme	WME ECDA (Tier 0)	descriptor-free	46.08	13.62	36.1	253	ok	D:/Program Files/Slam-Model/results/bench/freiburg3_walking_halfsphere_wme.txt
+RUN	freiburg3_walking_halfsphere	wme_masked	WME + token mask (YOLO)	descriptor-free	10.77	11.17	137.8	253	ok	D:/Program Files/Slam-Model/results/bench/freiburg3_walking_halfsphere_wme_masked.txt
+SEQ	freiburg3_walking_xyz	tum	D:/Program Files/Slam-Model/data/rgbd_dataset_freiburg3_walking_xyz	D:/Program Files/Slam-Model/data/rgbd_dataset_freiburg3_walking_xyz/groundtruth.txt	28.02
+RUN	freiburg3_walking_xyz	baseline	ORB + PnP (classical)	descriptor	19.34	13.43	37.7	258	ok	D:/Program Files/Slam-Model/results/bench/freiburg3_walking_xyz_baseline.txt
+RUN	freiburg3_walking_xyz	wme	WME ECDA (Tier 0)	descriptor-free	20.72	12.65	41.2	258	ok	D:/Program Files/Slam-Model/results/bench/freiburg3_walking_xyz_wme.txt
+RUN	freiburg3_walking_xyz	wme_masked	WME + token mask (YOLO)	descriptor-free	6.48	9.82	135.9	258	ok	D:/Program Files/Slam-Model/results/bench/freiburg3_walking_xyz_wme_masked.txt
