@@ -1,0 +1,112 @@
+D:\Program Files\Slam-Model\python\tools\fusion_alpha.py:43: RuntimeWarning: wme._core 를 임포트하지 못했다 - 차등 테스트가 전부 skip 된다: ImportError: DLL load failed while importing _core: 지정된 모듈을 찾을 수 없습니다.
+  from wme.eval.trajectory import Trajectory, evaluate_ate  # noqa: E402
+
+========================================================================================
+[1] Oracle headroom - can ANY per-frame rule beat Tier-0-only?
+========================================================================================
+Per frame the oracle picks the configuration with the smallest true error.
+No observable rule can do better. Headroom here bounds parts [2] and [3].
+
+                sequence    T0 ATE  oracle ATE    T0 err  oracle err  headroom  most-picked
+           freiburg1_360    10.37c       7.67c    10.31m      10.27m     1.00x  t0 89%, t0t2_uni 6%
+          freiburg1_desk     2.53c       2.25c     7.59m       6.77m     1.12x  t0 82%, t0t2_env 6%
+           freiburg1_xyz     1.56c       2.67c     5.29m       4.55m     1.16x  t0 69%, t0t1_env 8%
+   freiburg3_sitting_xyz     1.01c       1.29c     5.54m       4.80m     1.15x  t0 57%, t0t2_env 17%
+   freiburg3_walking_xyz    20.72c      12.89c    16.39m      12.91m     1.27x  t0 56%, t0t2_uni 14%
+
+  ATE in cm, per-frame error in mm. 'headroom' = T0 error / oracle error.
+
+========================================================================================
+[2] Is there a constant weighting that beats Tier-0-only?
+========================================================================================
+grid: alpha1/alpha0 and alpha2/alpha0 in [0.0, 0.0001, 0.001, 0.01, 0.1, 0.3, 1.0, 3.0]   ((0,0) = Tier-0-only)
+
+       held-out sequence       fitted (a1,a2)  held-out ATE    T0 ATE    change  verdict
+           freiburg1_360        (0.001, 0.01)        10.47c    10.37c     +1.0%      tie
+          freiburg1_desk        (0.001, 0.01)         2.53c     2.53c     -0.2%      tie
+           freiburg1_xyz          (0.0, 0.01)         1.55c     1.56c     -0.2%      tie
+   freiburg3_sitting_xyz        (0.01, 0.001)         1.05c     1.01c     +3.7%    worse
+   freiburg3_walking_xyz       (0.001, 0.001)        20.72c    20.72c     -0.0%      tie
+
+  in-sample best over all 5: (0.001, 0.01)  -> freiburg1_360 10.47  freiburg1_desk 2.53  freiburg1_xyz 1.55  freiburg3_sitting_xyz 1.00  freiburg3_walking_xyz 20.60
+  leave-one-out: beats Tier-0-only on 0/5, ties on 4
+  Every fitted point sits at alpha_k <= 0.01, i.e. the fit's answer is
+  'switch the other tiers off'. A tie there is that, not a win.
+
+========================================================================================
+[3] Is it robustness? A per-frame chi-square consistency gate
+========================================================================================
+Drop a tier whose disagreement with Tier 0 exceeds its OWN stated covariance.
+Observable at run time. One parameter, and it is a chi-square quantile.
+
+      gate  freiburg1_360  freiburg1_des  freiburg1_xyz  freiburg3_sit  freiburg3_wal   logmean   T1 pass  T2 pass
+   t0 only         10.37c          2.53c          1.56c          1.01c         20.72c     3.86      0.0%     0.0%
+    p=0.01         10.03c          2.51c          1.51c          1.54c         20.60c     4.14      9.0%    33.8%
+    p=0.05          9.44c          2.53c          1.49c          1.85c         20.70c     4.23     14.8%    44.2%
+     p=0.1          8.78c          2.53c          1.49c          1.92c         19.94c     4.17     20.3%    49.2%
+    p=0.25          7.80c          2.67c          1.44c          1.73c         19.26c     3.98     32.0%    57.4%
+     p=0.5          7.36c          2.38c          1.45c          1.88c         18.44c     3.88     48.3%    65.3%
+     p=0.9          8.31c          2.29c          1.66c          2.28c         18.64c     4.22     67.7%    75.4%
+    p=0.95         10.37c          2.38c          2.62c          2.48c         19.14c     4.98     74.5%    79.4%
+    p=0.99         14.07c          2.38c          3.68c          2.48c         19.74c     5.71     81.0%    81.8%
+   p=0.999         14.71c          2.40c          3.58c          4.01c         21.64c     6.43     86.3%    84.8%
+   no gate         39.31c          2.94c          3.27c          5.96c         19.49c     8.48    100.0%   100.0%
+
+  'T1/T2 pass' = share of offered frames the gate admits, averaged over
+  sequences. At 0 % the row IS Tier-0-only and any difference is noise;
+  at 100 % it is the ungated fusion 18.2 already reported.
+
+  leave-one-out on the gate threshold:
+           freiburg1_360  fitted     p=0.5  held-out    7.36c  T0  10.37c    -29.0%  better
+          freiburg1_desk  fitted     p=0.5  held-out    2.38c  T0   2.53c     -6.3%  better
+           freiburg1_xyz  fitted     p=0.5  held-out    1.45c  T0   1.56c     -6.6%  better
+   freiburg3_sitting_xyz  fitted     p=0.5  held-out    1.88c  T0   1.01c    +87.0%  worse
+   freiburg3_walking_xyz  fitted     p=0.5  held-out   18.44c  T0  20.72c    -11.0%  better
+  leave-one-out: gated fusion beats Tier-0-only on 4/5, ties on 0
+
+========================================================================================
+[4] Does gating restore the complementarity claim?
+========================================================================================
+18.3 found fusion identifies Tier 0's weak axis and then fills it with a
+WORSE number: selectivity 0.65-1.23, and on fr1_360's rank-deficient frames
+the error along that exact axis got 3.9x worse. Same measurement, gated.
+
+                sequence  frames  weak gain  orth gain  selectivity   rank<6 frames
+           freiburg1_360     164      0.957      0.843        1.135   88  weak-axis 6.53e-03 -> 5.99e-03 (1.09x)
+          freiburg1_desk     163      1.026      1.000        1.026   0
+           freiburg1_xyz     245      1.078      0.963        1.120   0
+   freiburg3_sitting_xyz     257      0.940      0.826        1.139   0
+   freiburg3_walking_xyz     257      0.881      0.890        0.991   0
+
+  selectivity > 1 = the improvement is concentrated on the axis Tier 0
+  said it could not see, which is the mechanism the architecture claims.
+
+  Where the gain actually is - per-frame relative translation error (mm):
+                sequence           median                p95                p99                max
+           freiburg1_360    10.3->12.6        40.8->40.0         70.6->70.6         81.0->81.0    
+          freiburg1_desk     7.6->7.3         19.8->20.5         24.7->25.2         25.4->29.5    
+           freiburg1_xyz     5.3->5.1         15.5->15.6         26.5->25.3         29.0->29.9    
+   freiburg3_sitting_xyz     5.5->6.9         20.7->21.2         25.8->33.9         41.6->63.7    
+   freiburg3_walking_xyz    16.4->17.8        59.4->56.6         79.2->79.2        114.4->114.4   
+  A gain that lives in p99 and not in the median is a robustness gain.
+
+  Magnitude vs sign - only the signed part accumulates into ATE:
+                sequence         rms |e| (mm)          |mean e| (mm)        bias fraction
+           freiburg1_360     19.89->21.19          3.391->3.020          0.170->0.142    
+          freiburg1_desk      9.89->10.40          1.191->0.933          0.120->0.090    
+           freiburg1_xyz      8.28->8.43           1.265->1.122          0.153->0.133    
+   freiburg3_sitting_xyz      9.05->11.44          1.538->1.750          0.170->0.153    
+   freiburg3_walking_xyz     29.07->29.09          0.944->1.451          0.032->0.050    
+  ATE integrates the chain. An estimator selected on per-frame magnitude
+  can be picked for the wrong statistic entirely - which is also why the
+  oracle in [1] lowers per-frame error and RAISES ATE on two sequences.
+
+========================================================================================
+[5] Verdict
+========================================================================================
+  oracle per-frame headroom over T0   : 1.15x (median)
+  oracle beats T0 in ATE on            : 3/5 sequences
+  fitted constant beats T0 (LOO)       : 0/5 win, 4 tie
+  gated fusion beats T0 (LOO)          : 4/5 win, 0 tie
+  best gate by log-mean ATE (in-sample): t0 only
+

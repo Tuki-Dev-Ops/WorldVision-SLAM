@@ -1,0 +1,25 @@
+{
+ "sequence": "freiburg1_room",
+ "modes": {
+  "orb": {
+   "label": "ORB descriptors",
+   "before": 48.060331734846656,
+   "after": 20.66843562664165,
+   "n": 44,
+   "scored": 44,
+   "trans_median_cm": 2.144649432141641,
+   "rot_median_deg": 1.1785535992776157,
+   "gross_false": 1
+  },
+  "tcg": {
+   "label": "Object constellations",
+   "before": 21.72266580458699,
+   "after": 15.05945977344411,
+   "n": 3,
+   "scored": 3,
+   "trans_median_cm": 15.448381676769532,
+   "rot_median_deg": 5.854853051020446,
+   "gross_false": 1
+  }
+ }
+}

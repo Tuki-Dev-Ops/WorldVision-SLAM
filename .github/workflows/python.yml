@@ -1,0 +1,67 @@
+# Python layer: reference oracle, evaluation harness and YOLO bridge.
+#
+# This half of the repo is the differential oracle for the C++ engine, so it has
+# to stay green independently of whether the extension module builds. The C++
+# differential tests themselves live in the `linux` workflow, where _core is
+# actually compiled; here they self-skip via wme.HAS_NATIVE.
+#
+# numpy is the only hard runtime dependency. cv2 and onnxruntime are imported
+# lazily inside wme/yolo.py, so they are deliberately not installed - if that
+# laziness ever regresses, this job is what catches it.
+name: python
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: python-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    name: pytest (py${{ matrix.python }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.10', '3.11', '3.12', '3.13']
+
+    defaults:
+      run:
+        working-directory: python
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Versions
+        run: |
+          python --version
+          python -c "import numpy; print('numpy', numpy.__version__)"
+
+      # pyproject sets testpaths=tests and pythonpath=. , so this is the same
+      # invocation the author uses locally.
+      - name: pytest
+        run: python -m pytest -q --durations=10
+
+      # The lazy-import contract, asserted rather than assumed.
+      - name: Assert optional imports stay lazy
+        run: |
+          python - <<'PY'
+          import importlib.util as u
+          assert u.find_spec("cv2") is None, "cv2 leaked into the base install"
+          assert u.find_spec("onnxruntime") is None, "onnxruntime leaked into the base install"
+          import wme, wme.yolo  # must import with neither present
+          print("ok: wme.yolo imports without cv2 / onnxruntime")
+          PY

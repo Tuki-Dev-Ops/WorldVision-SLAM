@@ -1,0 +1,47 @@
+build/
+out/
+_deps/
+cmake-build-*/
+.vs/
+.vscode/
+.idea/
+compile_commands.json
+CMakeUserPresets.json
+*.o
+*.obj
+*.so
+*.dylib
+*.dll
+*.lib
+*.a
+*.exe
+*.pdb
+*.ilk
+*.log
+*.csv
+*.engine
+*.onnx
+*.trt
+
+# Python
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*.egg-info/
+.venv/
+python/wme/_core*.pyd
+python/wme/_core*.so
+
+# --- 데이터셋 (내려받기 스크립트로 재현) --------------------------------------
+# TUM 16 시퀀스 + KITTI odometry gray = 51 GB. 저장소에 들어갈 것이 아니다.
+#   python tools/tum_fetch.py
+#   python tools/fetch_kitti.py
+data/
+
+# --- 대형 산출물 --------------------------------------------------------------
+*.pyd
+*.zip
+*.pt
+models/*.onnx
+third_party/**/*.dll
+third_party/**/*.lib

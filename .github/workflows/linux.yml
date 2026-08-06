@@ -1,0 +1,206 @@
+# Linux / gcc + clang, C++20.
+#
+# This is the job the engine has never seen: it has only ever been compiled by
+# MSVC 19.44, which is far more permissive about missing includes and two-phase
+# name lookup than either gcc or clang.
+#
+# Two configurations per compiler:
+#   minimal - Eigen, spdlog and GoogleTest come from FetchContent; OpenCV and
+#             ONNX Runtime are absent. This is the graceful-degradation path in
+#             cmake/WmeDependencies.cmake: only wme_math and test_math build.
+#             It is also the fastest signal, so it runs unconditionally.
+#   full    - OpenCV 4.10 built from source (cached) + ONNX Runtime 1.22, plus
+#             the pybind11 bindings so the C++/Python differential tests run.
+#
+# Distro OpenCV is not usable here: Ubuntu 24.04 ships 4.6, and
+# WmeDependencies.cmake requires >= 4.8.
+name: linux
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: linux-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  OPENCV_VERSION: 4.10.0
+  ORT_VERSION: 1.22.0
+
+jobs:
+  # --------------------------------------------------------------------------
+  # No optional dependencies at all. Proves the degradation path still compiles
+  # and that Eigen/spdlog/GoogleTest resolve through FetchContent.
+  # --------------------------------------------------------------------------
+  minimal:
+    name: ${{ matrix.compiler }} (no OpenCV)
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+        include:
+          - compiler: gcc
+            cc: gcc-13
+            cxx: g++-13
+            pkgs: gcc-13 g++-13
+          - compiler: clang
+            cc: clang-18
+            cxx: clang++-18
+            pkgs: clang-18
+
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build ${{ matrix.pkgs }}
+          ${{ matrix.cxx }} --version
+          cmake --version
+
+      # Eigen and spdlog are deliberately NOT installed from apt so that the
+      # FetchContent fallback in WmeDependencies.cmake is the path under test.
+      - name: Configure
+        run: |
+          cmake -S . -B build/ci -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DWME_WITH_ONNXRUNTIME=OFF \
+            -DWME_BUILD_BENCHMARKS=OFF \
+            -DCMAKE_DISABLE_FIND_PACKAGE_OpenCV=ON
+
+      # No -Werror. WmeCompilerFlags already adds -Wall -Wextra -Wpedantic plus
+      # -Wshadow/-Wold-style-cast/-Wdouble-promotion; turning those fatal would
+      # make third-party template instantiations gate the build. The log is the
+      # artefact - read it.
+      - name: Build
+        run: cmake --build build/ci
+
+      - name: Test
+        run: ctest --test-dir build/ci --output-on-failure --no-tests=error
+
+  # --------------------------------------------------------------------------
+  # Everything on: OpenCV, ONNX Runtime, benchmarks, python bindings.
+  # --------------------------------------------------------------------------
+  full:
+    name: ${{ matrix.compiler }} (OpenCV + ORT)
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+        include:
+          - compiler: gcc
+            cc: gcc-13
+            cxx: g++-13
+            pkgs: gcc-13 g++-13
+          - compiler: clang
+            cc: clang-18
+            cxx: clang++-18
+            pkgs: clang-18
+
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+      OPENCV_PREFIX: /opt/opencv
+      ORT_ROOT: /opt/onnxruntime
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build pkg-config zlib1g-dev libjpeg-dev libpng-dev libtiff-dev \
+            ${{ matrix.pkgs }}
+          ${{ matrix.cxx }} --version
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # OpenCV is built with the exact module set WmeDependencies.cmake asks for.
+      # GUI backends are off: highgui only has to link, nothing ever opens a
+      # window in CI. The cache key is the version, so this costs ~20 min once.
+      - name: Cache OpenCV
+        id: cache-opencv
+        uses: actions/cache@v4
+        with:
+          path: /opt/opencv
+          key: opencv-linux-${{ env.OPENCV_VERSION }}-${{ matrix.compiler }}
+
+      - name: Build OpenCV
+        if: steps.cache-opencv.outputs.cache-hit != 'true'
+        run: |
+          curl -sSL -o opencv.tar.gz \
+            "https://github.com/opencv/opencv/archive/refs/tags/${OPENCV_VERSION}.tar.gz"
+          tar xf opencv.tar.gz
+          cmake -S "opencv-${OPENCV_VERSION}" -B ocv-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="${OPENCV_PREFIX}" \
+            -DBUILD_LIST=core,imgproc,imgcodecs,videoio,calib3d,highgui,dnn \
+            -DBUILD_TESTS=OFF -DBUILD_PERF_TESTS=OFF -DBUILD_EXAMPLES=OFF \
+            -DBUILD_DOCS=OFF -DBUILD_opencv_apps=OFF -DBUILD_JAVA=OFF \
+            -DBUILD_opencv_python2=OFF -DBUILD_opencv_python3=OFF \
+            -DWITH_CUDA=OFF -DWITH_GTK=OFF -DWITH_QT=OFF -DWITH_IPP=OFF \
+            -DOPENCV_GENERATE_PKGCONFIG=OFF
+          sudo cmake --build ocv-build --target install
+          sudo chown -R "$(id -u):$(id -g)" "${OPENCV_PREFIX}"
+
+      - name: Cache ONNX Runtime
+        id: cache-ort
+        uses: actions/cache@v4
+        with:
+          path: /opt/onnxruntime
+          key: ort-linux-${{ env.ORT_VERSION }}
+
+      - name: Download ONNX Runtime
+        if: steps.cache-ort.outputs.cache-hit != 'true'
+        run: |
+          curl -sSL -o ort.tgz \
+            "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-${ORT_VERSION}.tgz"
+          sudo mkdir -p "${ORT_ROOT}"
+          sudo tar xf ort.tgz -C "${ORT_ROOT}" --strip-components=1
+          sudo chown -R "$(id -u):$(id -g)" "${ORT_ROOT}"
+
+      - name: Install pybind11
+        run: python -m pip install --upgrade pip pybind11 numpy pytest
+
+      - name: Configure
+        run: |
+          cmake -S . -B build/ci -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DOpenCV_DIR="${OPENCV_PREFIX}/lib/cmake/opencv4" \
+            -DORT_ROOT="${ORT_ROOT}" \
+            -DWME_WITH_ONNXRUNTIME=ON \
+            -DWME_BUILD_BENCHMARKS=ON \
+            -DWME_BUILD_PYTHON=ON
+
+      - name: Build
+        run: cmake --build build/ci
+
+      # Unlike Windows, nothing copies libonnxruntime.so next to the binaries
+      # (wme_stage_runtime_dlls is a WIN32-only workaround for the System32
+      # copy), so the loader needs the path.
+      - name: Test
+        run: |
+          export LD_LIBRARY_PATH="${OPENCV_PREFIX}/lib:${ORT_ROOT}/lib:${LD_LIBRARY_PATH}"
+          ctest --test-dir build/ci --output-on-failure --no-tests=error
+
+      # The C++/Python differential tests are the point of building the
+      # bindings: they are skipped entirely when _core is absent, which is what
+      # happens in the pure-python job.
+      - name: Differential tests (C++ vs Python reference)
+        working-directory: python
+        run: |
+          export LD_LIBRARY_PATH="${OPENCV_PREFIX}/lib:${ORT_ROOT}/lib:${LD_LIBRARY_PATH}"
+          python -c "from wme import HAS_NATIVE; assert HAS_NATIVE, '_core not importable'"
+          python -m pytest tests/test_differential.py -q

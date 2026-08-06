@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wme"
+version = "0.1.0"
+description = "World Model Engine - Python layer (reference oracle, evaluation, YOLO bridge)"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24"]
+
+[project.optional-dependencies]
+yolo = ["onnxruntime>=1.17", "opencv-python>=4.8"]
+ultralytics = ["ultralytics>=8.1"]
+dev = ["pytest>=7.4", "pytest-cov>=4.1"]
+plot = ["matplotlib>=3.7"]
+
+[tool.setuptools.packages.find]
+include = ["wme*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+filterwarnings = ["error::RuntimeWarning"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

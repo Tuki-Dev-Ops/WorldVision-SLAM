@@ -1,0 +1,152 @@
+# Windows / MSVC.
+#
+# Mirrors build_msvc.bat: locate vcvars64.bat, put the VS-bundled CMake/Ninja on
+# PATH, then configure and build with the Ninja generator. build_msvc.bat itself
+# hard-codes the BuildTools path, so it cannot be reused verbatim on a runner
+# that ships the Enterprise SKU; vswhere finds whichever edition is installed.
+#
+# -G Ninja is passed explicitly rather than left to CMake's default. build_msvc.bat
+# only puts Ninja on PATH, so with no CMAKE_GENERATOR in the environment CMake
+# picks "Visual Studio 17 2022" instead. That generator is multi-config, which
+# leaves CMAKE_BUILD_TYPE empty, which makes `cmake --build` default to Debug,
+# which then fails to link against the release-only prebuilt OpenCV with a wall
+# of cv::debug_build_guard LNK2019s. Single-config keeps that from happening.
+#
+# Two configurations are built:
+#   minimal - no OpenCV, no ONNX Runtime. Exercises the graceful-degradation
+#             path in cmake/WmeDependencies.cmake (wme_math + test_math only).
+#   full    - OpenCV 4.10 + ONNX Runtime 1.22, i.e. what the author builds locally.
+name: windows-msvc
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: windows-msvc-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  OPENCV_VERSION: 4.10.0
+  ORT_VERSION: 1.22.0
+
+jobs:
+  build:
+    name: msvc-${{ matrix.flavour }}
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        flavour: [minimal, full]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Locate MSVC
+        id: msvc
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $root = & $vswhere -latest -products * `
+                    -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+                    -property installationPath
+          if (-not $root) { throw "no MSVC toolset found on this runner" }
+          $vcvars = Join-Path $root "VC\Auxiliary\Build\vcvars64.bat"
+          if (-not (Test-Path $vcvars)) { throw "vcvars64.bat missing under $root" }
+          "vcvars=$vcvars"  | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "vsroot=$root"    | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      # OpenCV has no usable package manager story on Windows. The official
+      # release is a self-extracting archive with prebuilt vc16 binaries, which
+      # is exactly what the local dev setup uses (C:/opencv-dl/opencv/build).
+      - name: Cache OpenCV
+        if: matrix.flavour == 'full'
+        id: cache-opencv
+        uses: actions/cache@v4
+        with:
+          path: C:\opencv-dl
+          key: opencv-win-${{ env.OPENCV_VERSION }}
+
+      - name: Download OpenCV
+        if: matrix.flavour == 'full' && steps.cache-opencv.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $url = "https://github.com/opencv/opencv/releases/download/$env:OPENCV_VERSION/opencv-$env:OPENCV_VERSION-windows.exe"
+          Invoke-WebRequest -Uri $url -OutFile opencv.exe
+          New-Item -ItemType Directory -Force C:\opencv-dl | Out-Null
+          Start-Process -FilePath .\opencv.exe -ArgumentList '-oC:\opencv-dl', '-y' -Wait
+          Remove-Item opencv.exe
+
+      # WmeDependencies.cmake already hints at third_party/onnxruntime-win-x64-<ver>,
+      # so unpacking there needs no extra CMake argument.
+      - name: Cache ONNX Runtime
+        if: matrix.flavour == 'full'
+        id: cache-ort
+        uses: actions/cache@v4
+        with:
+          path: third_party/onnxruntime-win-x64-${{ env.ORT_VERSION }}
+          key: ort-win-${{ env.ORT_VERSION }}
+
+      - name: Download ONNX Runtime
+        if: matrix.flavour == 'full' && steps.cache-ort.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $url = "https://github.com/microsoft/onnxruntime/releases/download/v$env:ORT_VERSION/onnxruntime-win-x64-$env:ORT_VERSION.zip"
+          Invoke-WebRequest -Uri $url -OutFile ort.zip
+          New-Item -ItemType Directory -Force third_party | Out-Null
+          Expand-Archive -Path ort.zip -DestinationPath third_party -Force
+          Remove-Item ort.zip
+
+      - name: Toolchain versions
+        shell: cmd
+        run: |
+          call "${{ steps.msvc.outputs.vcvars }}" >nul
+          set "PATH=${{ steps.msvc.outputs.vsroot }}\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin;${{ steps.msvc.outputs.vsroot }}\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja;%PATH%"
+          cl 2>&1 | findstr /C:"19."
+          cmake --version
+          ninja --version
+
+      - name: Configure (minimal - no OpenCV, no ORT)
+        if: matrix.flavour == 'minimal'
+        shell: cmd
+        run: |
+          call "${{ steps.msvc.outputs.vcvars }}" >nul
+          set "PATH=${{ steps.msvc.outputs.vsroot }}\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin;${{ steps.msvc.outputs.vsroot }}\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja;%PATH%"
+          cmake -S . -B build/ci -G Ninja ^
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo ^
+            -DWME_WITH_ONNXRUNTIME=OFF ^
+            -DWME_BUILD_BENCHMARKS=OFF ^
+            -DCMAKE_DISABLE_FIND_PACKAGE_OpenCV=ON
+
+      - name: Configure (full - OpenCV + ORT)
+        if: matrix.flavour == 'full'
+        shell: cmd
+        run: |
+          call "${{ steps.msvc.outputs.vcvars }}" >nul
+          set "PATH=${{ steps.msvc.outputs.vsroot }}\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin;${{ steps.msvc.outputs.vsroot }}\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja;%PATH%"
+          cmake -S . -B build/ci -G Ninja ^
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo ^
+            -DOpenCV_DIR=C:/opencv-dl/opencv/build ^
+            -DWME_WITH_ONNXRUNTIME=ON ^
+            -DWME_BUILD_BENCHMARKS=ON
+
+      - name: Build
+        shell: cmd
+        run: |
+          call "${{ steps.msvc.outputs.vcvars }}" >nul
+          set "PATH=${{ steps.msvc.outputs.vsroot }}\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin;${{ steps.msvc.outputs.vsroot }}\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja;%PATH%"
+          cmake --build build/ci
+
+      # The OpenCV DLLs are not on PATH by default. The ONNX Runtime DLL is
+      # staged next to each executable by wme_stage_runtime_dlls, deliberately,
+      # because System32 ships a different-ABI onnxruntime.dll that wins the
+      # search order otherwise.
+      - name: Test
+        shell: pwsh
+        run: |
+          if ("${{ matrix.flavour }}" -eq "full") {
+            $env:PATH = "C:\opencv-dl\opencv\build\x64\vc16\bin;$env:PATH"
+          }
+          ctest --test-dir build/ci --output-on-failure --no-tests=error
