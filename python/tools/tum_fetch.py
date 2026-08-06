@@ -48,7 +48,14 @@ def main() -> int:
     ap.add_argument("--data", default="../data")
     ap.add_argument("--seconds", type=float, default=9.0, help="추출할 구간 길이")
     ap.add_argument("--skip", type=float, default=0.0, help="시작에서 건너뛸 시간")
+    ap.add_argument("--all", action="store_true",
+                    help="구간이 아니라 시퀀스 전체를 받는다")
+    ap.add_argument("--force", action="store_true",
+                    help="이미 완전한 시퀀스도 다시 받는다")
     args = ap.parse_args()
+    if args.all:
+        args.seconds = float("inf")
+        args.skip = 0.0
 
     name = args.name
     group = _group_of(name)
@@ -112,6 +119,38 @@ def main() -> int:
                     got_img += 1
                     if got_img % 200 == 0:
                         print(f"  영상 {got_img}  {written/1e6:.0f} MB")
+
+    # 3) 인덱스를 **실제로 있는 파일만** 가리키도록 줄인다.
+    #
+    # 이것이 이 도구에서 제일 중요한 한 걸음이다. tar 안의 rgb.txt 는 시퀀스
+    # 전체 목록이고, 구간만 받으면 그 목록의 대부분이 없는 파일을 가리킨다.
+    # 도구들은 imread 가 빈 Mat 를 주면 그 프레임을 조용히 건너뛰므로, 결과는
+    # "1419 프레임 시퀀스" 라고 적힌 165 프레임짜리 숫자가 된다. 실제로 그
+    # 상태로 16 시퀀스를 측정했다.
+    #
+    # 원본은 <kind>.full.txt 로 남긴다 - 무엇을 잘랐는지 사후에 물어볼 수 있어야 한다.
+    for kind in ("rgb", "depth"):
+        idx = root / f"{kind}.txt"
+        if not idx.exists():
+            continue
+        lines = idx.read_text(encoding="utf-8", errors="replace").splitlines()
+        kept, dropped = [], 0
+        for line in lines:
+            if not line.strip() or line.startswith("#"):
+                kept.append(line)
+                continue
+            parts = line.split()
+            if len(parts) >= 2 and (root / parts[1]).exists():
+                kept.append(line)
+            else:
+                dropped += 1
+        if dropped:
+            full = root / f"{kind}.full.txt"
+            if not full.exists():
+                full.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            idx.write_text("\n".join(kept) + "\n", encoding="utf-8")
+            print(f"  {kind}.txt: 없는 파일 {dropped} 줄을 잘라 냈다 "
+                  f"(원본은 {kind}.full.txt)")
 
     print(f"완료: 영상 {got_img}, txt {got_txt}, {written/1e6:.1f} MB")
     return 0 if got_img > 0 else 1

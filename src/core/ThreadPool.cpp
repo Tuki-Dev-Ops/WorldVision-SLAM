@@ -17,6 +17,13 @@ struct ParallelSync {
     const std::function<void(std::size_t, std::size_t)>* body{nullptr};
     std::atomic<std::size_t> remaining{0};
 
+    // 덩어리 경계를 여기 둔다. 클로저가 lo/hi 를 캡처하면 캡처가 32 B 가 되고,
+    // 그러면 libstdc++ 에서 std::function 이 힙으로 넘어간다 (아래 참조).
+    // k 번째 덩어리는 (begin, chunk) 로부터 유도되므로 k 만 넘기면 된다.
+    std::size_t begin{0}, chunk{0};
+    std::mutex*              wake_mutex{nullptr};
+    std::condition_variable* wake_cv{nullptr};
+
     // 예외는 드물다. 여기서만 락을 잡으므로 정상 경로에는 비용이 없다.
     std::mutex         err_mutex;
     std::exception_ptr err;
@@ -158,7 +165,11 @@ void ThreadPool::parallelFor(std::size_t begin, std::size_t end,
     // shared_ptr 제어블록이 생겨 덩어리마다 두 번씩 할당됐다. 남는 것은
     // "몇 개 남았나" 뿐이므로 스택 카운터 하나로 충분하다.
     ParallelSync sync;
-    sync.body = &body;
+    sync.body       = &body;
+    sync.begin      = begin;
+    sync.chunk      = chunk;
+    sync.wake_mutex = &parallel_mutex_;
+    sync.wake_cv    = &parallel_cv_;
 
     // 아래 루프가 도는 횟수. 조건이 (c + chunk < end) 이므로 k 번째 덩어리는
     // (k+1)*chunk < total 일 때만 던져진다 -> 횟수 = floor((total-1)/chunk).
@@ -168,25 +179,51 @@ void ThreadPool::parallelFor(std::size_t begin, std::size_t end,
     sync.remaining.store(posted, std::memory_order_relaxed);
 
     ParallelSync* const s = &sync;
-    std::size_t cursor = begin;
-    for (; cursor + chunk < end; cursor += chunk) {
-        const std::size_t lo = cursor, hi = cursor + chunk;
-        // 캡처는 포인터 2개 + size_t 2개 = 32 B. std::function 의 내부 버퍼에
-        // 들어가므로 클로저 자체로는 할당이 생기지 않는다.
-        post([this, s, lo, hi] {
+
+    // 캡처를 **포인터 하나 + 인덱스 하나 (16 B)** 로 묶는다.
+    //
+    // 왜 이렇게까지 하는가. std::function 은 작은 콜러블만 내부 버퍼에 담고
+    // 넘치면 힙을 쓴다. 그 버퍼 크기가 구현마다 다르다:
+    //   MSVC        64 B   -> 32 B 캡처가 들어간다
+    //   libstdc++   16 B   -> 32 B 캡처는 **덩어리마다 힙 할당**
+    // 예전 코드는 (this, s, lo, hi) = 32 B 를 캡처하면서 "내부 버퍼에 들어가므로
+    // 할당이 없다" 고 적어 두었다. 그 문장은 MSVC 에서만 참이었고, 리눅스 CI 가
+    // 처음 돌자마자 핫패스에서 프레임당 462 회 할당으로 드러났다
+    // (docs/01-architecture.md 7.2 의 "핫패스 할당 0" 요구 위반).
+    //
+    // k 번째 덩어리의 경계는 (begin, chunk) 에서 유도되므로 k 만 넘기면 된다.
+    // 깨우기에 쓰는 뮤텍스/조건변수도 sync 를 통해 잡아 this 캡처를 없앤다.
+    // 캡처 크기를 컴파일 타임에 잠근다. libstdc++ 의 std::function 내부 버퍼는
+    // 16 B 이고, 이 클로저가 그것을 넘기는 순간 덩어리마다 힙 할당이 돌아온다.
+    // 주석으로만 적어 두면 다음 사람이 캡처를 하나 더 넣는 순간 조용히 깨진다 -
+    // 실제로 그렇게 깨져 있었고, 리눅스 CI 가 처음 돌 때까지 아무도 몰랐다.
+    static_assert(sizeof(decltype([s = static_cast<ParallelSync*>(nullptr),
+                                   k = std::size_t{0}] { (void)s; (void)k; })) <= 16,
+                  "parallelFor 작업 클로저가 16 B 를 넘으면 libstdc++ 에서 "
+                  "덩어리마다 힙 할당이 생긴다");
+
+    for (std::size_t k = 0; k < posted; ++k) {
+        post([s, k] {
+            // 깨우기용 포인터는 **감소 전에** 읽어 둔다. 감소로 remaining 이 0 이
+            // 되는 순간 호출 스레드가 깨어나 sync 를 스택에서 걷어낼 수 있으므로,
+            // 그 뒤에 s 를 다시 읽으면 해제된 메모리를 읽는다. 두 포인터는 첫
+            // 작업이 던져지기 전에 한 번 쓰이고 그 뒤로 바뀌지 않는다.
+            std::mutex* const              wm = s->wake_mutex;
+            std::condition_variable* const wc = s->wake_cv;
+            const std::size_t lo = s->begin + k * s->chunk;
+            const std::size_t hi = lo + s->chunk;
             try {
                 (*s->body)(lo, hi);
             } catch (...) {
                 s->record(lo);
             }
             if (s->remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-                // 깨우기는 풀 소유 객체로만 한다. 여기서 s 를 다시 읽으면
-                // 호출 스레드가 이미 스택을 걷어낸 뒤일 수 있다.
-                std::lock_guard lk(parallel_mutex_);
-                parallel_cv_.notify_all();
+                std::lock_guard lk(*wm);
+                wc->notify_all();
             }
         });
     }
+    const std::size_t cursor = begin + posted * chunk;
 
     // 마지막 덩어리는 호출 스레드가 직접. 여기서 던져도 나머지 덩어리가
     // body 를 참조하고 있으므로 먼저 전부 끝난 것을 확인한 뒤에 되던진다.

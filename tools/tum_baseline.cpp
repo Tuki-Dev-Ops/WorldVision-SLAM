@@ -156,39 +156,17 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // 내부 파라미터/왜곡 - tum_odometry.cpp 와 값까지 동일해야 한다.
-    double fx, fy, cx, cy;
-    cv::Vec<double, 5> dist;
-    if (root.find("freiburg2") != std::string::npos) {
-        fx = 520.908620; fy = 521.007327; cx = 325.141442; cy = 249.701764;
-        dist = {0.2312, -0.7849, -0.0033, -0.0001, 0.9172};
-        std::cout << "내부파라미터: freiburg2\n";
-    } else if (root.find("freiburg3") != std::string::npos) {
-        fx = 535.4; fy = 539.2; cx = 320.1; cy = 247.6;
-        dist = {0.0, 0.0, 0.0, 0.0, 0.0};
-        std::cout << "내부파라미터: freiburg3 (왜곡 보정본)\n";
-    } else {
-        fx = 517.306408; fy = 516.469215; cx = 318.643040; cy = 255.313989;
-        dist = {0.2624, -0.9531, -0.0054, 0.0026, 1.1633};
-        std::cout << "내부파라미터: freiburg1\n";
-    }
-    double kDepthScale = 5000.0;
-    int    kW = 640, kH = 480;
-    double depth_min = 0.1, depth_max = 8.0;
-
-    // calib.txt 가 있으면 그것이 이긴다. 경로 문자열로 데이터셋을 맞히는 방식은
-    // TUM 밖에서 조용히 틀린다 - wme_tum_odometry 와 같은 규칙을 쓴다.
-    {
-        wme_tools::DatasetCalib dc;
-        dc.K.fx = fx; dc.K.fy = fy; dc.K.cx = cx; dc.K.cy = cy;
-        dc.K.width = kW; dc.K.height = kH;
-        dc.dist = dist; dc.depth_scale = kDepthScale;
-        if (!wme_tools::loadDatasetCalib(root, dc)) return 1;
-        fx = dc.K.fx; fy = dc.K.fy; cx = dc.K.cx; cy = dc.K.cy;
-        kW = dc.K.width; kH = dc.K.height;
-        dist = dc.dist; kDepthScale = dc.depth_scale;
-        depth_min = dc.depth_min; depth_max = dc.depth_max;
-    }
+    // 내부 파라미터/왜곡/깊이 범위. 값은 dataset_calib.hpp 한 곳에만 있고
+    // wme_tum_odometry 도 같은 함수를 부른다 - 두 도구가 같은 값을 쓴다는 것이
+    // 이 비교의 전제이므로, 그 전제를 복사본 두 개가 지키게 두지 않는다.
+    // calib.txt 가 있으면 그것이 이긴다.
+    wme_tools::DatasetCalib dc;
+    if (!wme_tools::resolveCalib(root, dc)) return 1;
+    double fx = dc.K.fx, fy = dc.K.fy, cx = dc.K.cx, cy = dc.K.cy;
+    cv::Vec<double, 5> dist = dc.dist;
+    double kDepthScale = dc.depth_scale;
+    int    kW = dc.K.width, kH = dc.K.height;
+    double depth_min = dc.depth_min, depth_max = dc.depth_max;
     if (depth_min_cli > 0.0) depth_min = depth_min_cli;
     if (depth_max_cli > 0.0) depth_max = depth_max_cli;
     std::cout << "깊이 유효 범위: [" << depth_min << ", " << depth_max << "] m\n";

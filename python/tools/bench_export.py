@@ -54,6 +54,7 @@ def main() -> int:
     rows.append("# SEQ\tname\tdataset\tseq_dir\tgt_file\tidentity_ate_cm")
     rows.append("# RUN\tname\tsystem\tlabel\tkind\tate_cm\trpe_mm\tms_per_frame"
                 "\tframes\tstatus\ttraj_file")
+    rows.append("# ERR\tname\tsystem\t<per-frame ATE error, cm, thinned to <=512>")
 
     n_seq = n_run = 0
     for e in report.get("sequences", []):
@@ -81,6 +82,19 @@ def main() -> int:
                 run.get("status", "ok"),
                 traj.as_posix()]))
             n_run += 1
+
+            # 프레임별 ATE 오차 계열. 두 시스템의 점군은 짧은 구간에서 거의
+            # 같아 보이므로, **언제** 갈라지는지는 이 계열로만 보인다.
+            # 값 자체는 bench_run.py 가 계산한 것을 그대로 옮긴다.
+            errs = run.get("ate_errors_cm") or []
+            if errs:
+                # 화면 폭이 1000 px 이 안 되므로 512 점으로 줄인다. 최대값을
+                # 유지하도록 구간 최대로 뽑는다 - 평균을 쓰면 스파이크가 사라지고,
+                # 스파이크가 바로 이 그래프가 보여 줘야 하는 것이다.
+                k = max(1, len(errs) // 512)
+                thin = [max(errs[i:i + k]) for i in range(0, len(errs), k)]
+                rows.append("\t".join(["ERR", name, key]
+                                      + [f"{v:.3f}" for v in thin]))
 
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text("\n".join(rows) + "\n", encoding="utf-8")
