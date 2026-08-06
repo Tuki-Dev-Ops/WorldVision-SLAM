@@ -47,6 +47,46 @@ struct DatasetCalib {
     bool                  from_file{false};
 };
 
+// TUM freiburg 그룹별 기본 내부파라미터/왜곡.
+//
+// 한 곳에만 둔다. 이 값들이 tum_odometry.cpp 와 tum_baseline.cpp 에 각각
+// 복사되어 있었고, 두 도구가 같은 값을 쓴다는 것이 비교의 전제인데 그 전제를
+// 복사본 두 개가 지키고 있었다. 세 번째 소비자(bench_viewer)가 생기는 김에
+// 합친다.
+//
+// 왜곡 계수도 그룹마다 다르다. TUM 이 배포하는 fr1/fr2 영상은 보정되어 있지
+// 않고 계수가 작지 않아서(fr1 k1=0.2624, k2=-0.9531), 보정 없이 핀홀을 쓰면
+// 가장자리가 수 픽셀 어긋나고 그 오차가 매 프레임 같은 방향으로 쌓인다.
+// 실측: 보정 전 ATE 67 cm -> 보정 후 24 cm. fr3 은 TUM 이 이미 보정해 배포한다.
+inline DatasetCalib defaultCalibForPath(const std::string& root, bool announce = true) {
+    DatasetCalib c;
+    c.K.width = 640;
+    c.K.height = 480;
+    const char* which = nullptr;
+
+    if (root.find("freiburg2") != std::string::npos) {
+        c.K.fx = 520.908620; c.K.fy = 521.007327;
+        c.K.cx = 325.141442; c.K.cy = 249.701764;
+        c.dist = {0.2312, -0.7849, -0.0033, -0.0001, 0.9172};
+        which = "freiburg2";
+    } else if (root.find("freiburg3") != std::string::npos) {
+        c.K.fx = 535.4; c.K.fy = 539.2;
+        c.K.cx = 320.1; c.K.cy = 247.6;
+        c.dist = {0.0, 0.0, 0.0, 0.0, 0.0};
+        which = "freiburg3 (왜곡 보정본)";
+    } else {
+        c.K.fx = 517.306408; c.K.fy = 516.469215;
+        c.K.cx = 318.643040; c.K.cy = 255.313989;
+        c.dist = {0.2624, -0.9531, -0.0054, 0.0026, 1.1633};
+        which = "freiburg1";
+    }
+    if (announce) std::cout << "내부파라미터: " << which << "\n";
+    return c;
+}
+
+// 기본값 + calib.txt 덮어쓰기를 한 번에. 정의는 loadDatasetCalib 뒤에 있다.
+inline bool resolveCalib(const std::string& root, DatasetCalib& out, bool announce = true);
+
 // root/calib.txt 가 있으면 읽어 덮어쓴다. 없으면 인자를 그대로 돌려준다.
 // 파일이 있는데 파싱이 깨지면 조용히 넘어가지 않고 실패시킨다.
 inline bool loadDatasetCalib(const std::string& root, DatasetCalib& io) {
@@ -96,6 +136,11 @@ inline bool loadDatasetCalib(const std::string& root, DatasetCalib& io) {
               << " depth_scale=" << io.depth_scale
               << " depth=[" << io.depth_min << "," << io.depth_max << "] m\n";
     return true;
+}
+
+inline bool resolveCalib(const std::string& root, DatasetCalib& out, bool announce) {
+    out = defaultCalibForPath(root, announce);
+    return loadDatasetCalib(root, out);
 }
 
 }  // namespace wme_tools

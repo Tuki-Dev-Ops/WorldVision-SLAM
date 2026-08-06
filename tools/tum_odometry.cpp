@@ -284,48 +284,17 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // TUM 내부 파라미터는 freiburg 그룹마다 다르다. 하나로 고정하면 다른
-    // 그룹에서 조용히 틀린 결과가 나온다 - 실패가 아니라 그럴듯한 오차로.
-    //
-    // 왜곡도 그룹마다 다르다. TUM 이 배포하는 fr1/fr2 영상은 보정되어 있지 않고
-    // 계수가 작지 않아서(fr1 k1=0.2624, k2=-0.9531), 보정 없이 핀홀을 쓰면
-    // 가장자리가 수 픽셀 어긋나고 그 오차가 매 프레임 같은 방향으로 쌓인다.
-    // 실측: 보정 전 ATE 67 cm -> 보정 후 24 cm.
-    // fr3 은 TUM 이 이미 보정해 배포하므로 계수가 0 이다.
-    wme::CameraIntrinsics K;
-    K.width = 640; K.height = 480;
-    cv::Vec<double, 5> dist;
-
-    if (root.find("freiburg2") != std::string::npos) {
-        K.fx = 520.908620; K.fy = 521.007327;
-        K.cx = 325.141442; K.cy = 249.701764;
-        dist = {0.2312, -0.7849, -0.0033, -0.0001, 0.9172};
-        std::cout << "내부파라미터: freiburg2\n";
-    } else if (root.find("freiburg3") != std::string::npos) {
-        K.fx = 535.4; K.fy = 539.2;
-        K.cx = 320.1; K.cy = 247.6;
-        dist = {0.0, 0.0, 0.0, 0.0, 0.0};
-        std::cout << "내부파라미터: freiburg3 (왜곡 보정본)\n";
-    } else {
-        K.fx = 517.306408; K.fy = 516.469215;
-        K.cx = 318.643040; K.cy = 255.313989;
-        dist = {0.2624, -0.9531, -0.0054, 0.0026, 1.1633};
-        std::cout << "내부파라미터: freiburg1\n";
-    }
-    double kDepthScale = 5000.0;   // PNG 값 -> m
-
-    // calib.txt 가 있으면 그것이 이긴다. 위의 경로 문자열 분기는 TUM 안에서만
-    // 맞는다 - KITTI 경로에는 freiburg 가 없으므로 640x480/fx=517 이 1241x376
-    // 영상에 적용되고, 결과는 실패가 아니라 그럴듯한 오차로 나온다.
+    // 내부 파라미터/왜곡/깊이 범위. 값은 dataset_calib.hpp 한 곳에만 있고
+    // wme_tum_baseline 도 같은 함수를 부른다. calib.txt 가 있으면 그것이 이긴다 -
+    // 경로 문자열 분기는 TUM 안에서만 맞는다. KITTI 경로에는 freiburg 가 없으므로
+    // 640x480/fx=517 이 1241x376 영상에 적용되고, 결과는 실패가 아니라 그럴듯한
+    // 오차로 나온다.
+    wme_tools::DatasetCalib dc;
+    if (!wme_tools::resolveCalib(root, dc)) return 1;
+    wme::CameraIntrinsics K = dc.K;
+    cv::Vec<double, 5> dist = dc.dist;
+    double kDepthScale = dc.depth_scale;
     {
-        wme_tools::DatasetCalib dc;
-        dc.K = K;
-        dc.dist = dist;
-        dc.depth_scale = kDepthScale;
-        if (!wme_tools::loadDatasetCalib(root, dc)) return 1;
-        K = dc.K;
-        dist = dc.dist;
-        kDepthScale = dc.depth_scale;
         g_depth_min = dc.depth_min;
         g_depth_max = dc.depth_max;
         // 정렬기의 유효 깊이도 데이터셋을 따라야 한다. DirectAlignerConfig 의
