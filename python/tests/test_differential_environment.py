@@ -25,8 +25,16 @@ import math
 import numpy as np
 import pytest
 
-from wme import _core
+from wme import HAS_NATIVE
 from wme.reference import environment_cues as ref
+
+# 확장이 없으면 모듈 수집 단계에서 죽지 않고 skip 한다. 다른 차분 테스트들과
+# 같은 규약이다 - `python` 워크플로는 확장을 일부러 빌드하지 않고, 그 잡의
+# 계약이 "C++ 없이도 파이썬 층은 혼자 초록" 이기 때문이다.
+pytestmark = pytest.mark.skipif(not HAS_NATIVE, reason="_core 미빌드")
+
+if HAS_NATIVE:
+    from wme import _core
 
 W, H = 160, 120
 

@@ -32,7 +32,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
-#include <malloc.h>
+#if defined(_MSC_VER)
+#include <malloc.h>          // _aligned_malloc / _aligned_free
+#endif
 #include <new>
 
 using namespace wme;
@@ -78,17 +80,44 @@ void operator delete(void* p, const std::nothrow_t&) noexcept { std::free(p); }
 void operator delete[](void* p, const std::nothrow_t&) noexcept { std::free(p); }
 
 // 정렬 지정 판 (C++17). malloc 계열과 섞으면 안 되므로 별도 짝을 유지한다.
+//
+// 정렬 할당/해제는 플랫폼마다 이름이 다르다. MSVC 는 _aligned_malloc/_aligned_free,
+// POSIX 는 std::aligned_alloc + std::free 다. 짝을 어긋나게 쓰면 즉시 UB 이므로
+// 두 함수를 한 자리에서 같이 정의해 둔다.
+//
+// 이 파일이 MSVC 이름을 그대로 쓰고 있어서 리눅스/ASan CI 가 컴파일조차 되지
+// 않았다. 로컬 236 개 테스트가 전부 초록인 채로였다 - 한 플랫폼에서만
+// 컴파일되는 소스는 초록이어도 아무 것도 뜻하지 않는다.
+namespace {
+inline void* alignedAlloc(std::size_t n, std::size_t a) {
+#if defined(_MSC_VER)
+    return _aligned_malloc(n, a);
+#else
+    // aligned_alloc 은 크기가 정렬의 배수여야 한다 (C11/C++17).
+    const std::size_t rounded = ((n + a - 1) / a) * a;
+    return std::aligned_alloc(a, rounded);
+#endif
+}
+inline void alignedFree(void* p) noexcept {
+#if defined(_MSC_VER)
+    _aligned_free(p);
+#else
+    std::free(p);
+#endif
+}
+}  // namespace
+
 void* operator new(std::size_t n, std::align_val_t a) {
     countNew(n);
-    void* p = _aligned_malloc(n != 0 ? n : 1, static_cast<std::size_t>(a));
+    void* p = alignedAlloc(n != 0 ? n : 1, static_cast<std::size_t>(a));
     if (p == nullptr) throw std::bad_alloc();
     return p;
 }
 void* operator new[](std::size_t n, std::align_val_t a) { return ::operator new(n, a); }
-void operator delete(void* p, std::align_val_t) noexcept { _aligned_free(p); }
-void operator delete[](void* p, std::align_val_t) noexcept { _aligned_free(p); }
-void operator delete(void* p, std::size_t, std::align_val_t) noexcept { _aligned_free(p); }
-void operator delete[](void* p, std::size_t, std::align_val_t) noexcept { _aligned_free(p); }
+void operator delete(void* p, std::align_val_t) noexcept { alignedFree(p); }
+void operator delete[](void* p, std::align_val_t) noexcept { alignedFree(p); }
+void operator delete(void* p, std::size_t, std::align_val_t) noexcept { alignedFree(p); }
+void operator delete[](void* p, std::size_t, std::align_val_t) noexcept { alignedFree(p); }
 
 // ---------------------------------------------------------------------------
 // cv::Mat 버퍼 계수 - OpenCV 측 할당

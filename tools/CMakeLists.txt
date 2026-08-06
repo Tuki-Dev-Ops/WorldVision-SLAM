@@ -132,3 +132,16 @@ target_link_libraries(wme_kitti_convert PRIVATE
     opencv_imgproc)
 set_target_properties(wme_kitti_convert PROPERTIES FOLDER "wme/tools")
 wme_stage_runtime_dlls(wme_kitti_convert)
+
+
+# 벤치마크 뷰어 (실행 파일). 왼쪽 = 고전 기술자 파이프라인, 오른쪽 = WME.
+# highgui 외에 새 의존성을 들이지 않는다. 지표는 results/bench/viewer.tsv 에서
+# 읽고 여기서 다시 계산하지 않는다 - bench_viewer.cpp 머리말 참조.
+add_executable(wme_bench_viewer bench_viewer.cpp)
+target_link_libraries(wme_bench_viewer PRIVATE
+    wme::wme_core
+    opencv_highgui
+    opencv_imgcodecs
+    opencv_imgproc)
+set_target_properties(wme_bench_viewer PROPERTIES FOLDER "wme/tools")
+wme_stage_runtime_dlls(wme_bench_viewer)
