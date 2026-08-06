@@ -71,6 +71,40 @@ SYSTEMS = {
 }
 
 
+# 데이터셋마다 필요한 인자가 다르다. 이것을 코드에 박지 않고 여기 모아 두는
+# 이유는 25.20 이 기록한 사고 때문이다 - `z > 8.0` 이라는 TUM 전용 상수가 두
+# 도구에 박혀 있어서, KITTI 에서 기준선이 프레임당 대응 35 개로 굶고 400 중
+# 371 프레임을 놓쳤다. 그대로 발표했으면 WME 의 78 배 승리로 읽혔을 것이다.
+#
+#   kf-dist    TUM 0.03 m 는 손에 든 카메라 기준이다. 차량은 프레임당 1.5 m 를
+#              움직이므로 그 값이면 매 프레임 키프레임이 바뀐다.
+#   depth-max  KITTI 스테레오 깊이의 실제 상한은 ~48 m.
+#   depth-sigma-rel  sigma_Z = c*Z^2 의 c. 스테레오는 c = sigma_d/(f*B) 로
+#              **유도**된다. KITTI gray: 0.3 px / (718.856 * 0.537) = 7.8e-4.
+#              튜닝값이 아니라는 점이 중요하다 (25.21).
+DATASET_ARGS = {
+    "kitti": {
+        "common": ["--kf-dist", "1.0", "--depth-max", "60"],
+        "wme_only": ["--depth-sigma-rel", "7.8e-4"],
+        "skip_systems": ("wme_masked",),   # YOLO 는 TUM 쪽에서만 비교되어 있다
+    },
+}
+
+
+def dataset_of(seq: Path) -> str:
+    return "kitti" if seq.name.startswith("kitti_") else "tum"
+
+
+def extra_args(seq: Path, system_key: str) -> list[str]:
+    spec = DATASET_ARGS.get(dataset_of(seq))
+    if not spec:
+        return []
+    out = list(spec.get("common", []))
+    if system_key.startswith("wme"):
+        out += spec.get("wme_only", [])
+    return out
+
+
 def find_build() -> Path:
     for c in ("build/win/tools", "build/msvc/tools"):
         p = ROOT / c
@@ -102,11 +136,18 @@ def rel_errors(est: Trajectory, gt_stamps, gt_poses) -> dict:
 
     Frame-to-frame rather than against a keyframe, so the two systems are
     compared on a quantity neither of them chose.
+
+    보간 허용 간격은 시퀀스 자신의 표본 간격에서 정한다. `interpolate` 의
+    기본 50 ms 는 30 Hz TUM 기준이고, KITTI 를 stride 2 로 쓰면 표본 간격이
+    200 ms 라 **모든** 보간이 거부된다 - RPE 열이 통째로 비고, 뷰어에는 실패가
+    아니라 빈칸으로 나타난다. 25.20 의 깊이 상한과 같은 종류의 상수다.
     """
+    step = float(np.median(np.diff(gt_stamps))) if len(gt_stamps) > 1 else 0.0
+    gap = max(0.05, 3.0 * step)
     trans, rot, stamps = [], [], []
     for i in range(1, len(est.poses)):
-        g1 = interpolate(gt_stamps, gt_poses, est.stamps[i - 1])
-        g2 = interpolate(gt_stamps, gt_poses, est.stamps[i])
+        g1 = interpolate(gt_stamps, gt_poses, est.stamps[i - 1], max_gap=gap)
+        g2 = interpolate(gt_stamps, gt_poses, est.stamps[i], max_gap=gap)
         if g1 is None or g2 is None:
             continue
         gt_rel = g1.inverse() @ g2
@@ -161,6 +202,10 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="results/bench")
     ap.add_argument("--max-frames", type=int, default=0)
+    ap.add_argument("--only", nargs="*", default=None,
+                    help="시퀀스 이름 또는 데이터셋(tum/kitti) 으로 거른다")
+    ap.add_argument("--merge", action="store_true",
+                    help="기존 benchmark.json 의 다른 시퀀스를 보존한 채 합친다")
     ap.add_argument("--skip-run", action="store_true",
                     help="재추정 없이 기존 궤적만 다시 채점한다")
     args = ap.parse_args()
@@ -169,10 +214,18 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     build = find_build()
 
-    seqs = sorted(p for p in (ROOT / "data").glob("rgbd_dataset_*")
-                  if (p / "rgb.txt").exists() and (p / "groundtruth.txt").exists())
+    seqs = sorted(
+        (p for pat in ("rgbd_dataset_*", "kitti_*")
+         for p in (ROOT / "data").glob(pat)
+         if (p / "rgb.txt").exists() and (p / "groundtruth.txt").exists()),
+        key=lambda p: (dataset_of(p), p.name))
+    if args.only:
+        want = set(args.only)
+        seqs = [p for p in seqs
+                if p.name in want or p.name.replace("rgbd_dataset_", "") in want
+                or dataset_of(p) in want]
     if not seqs:
-        raise SystemExit("data/ 에 TUM 시퀀스가 없다")
+        raise SystemExit("data/ 에 실행할 시퀀스가 없다")
 
     # 재채점(--skip-run)에는 벽시계가 없다. 이전 실행의 측정값을 이어받지 않으면
     # 타이밍이 통째로 사라지고, 그 자리를 0 으로 채우면 "무한히 빠르다" 가 된다.
@@ -186,6 +239,17 @@ def main() -> int:
             prev = {}
 
     report = {"sequences": [], "systems": SYSTEMS}
+    # --only 로 일부만 돌릴 때 나머지를 지우지 않는다. 지우면 뷰어가 조용히
+    # 축소되고, 그것은 "그 시퀀스에서 아무 일도 없었다" 로 읽힌다.
+    keep: list[dict] = []
+    if args.merge and prev_p.exists():
+        try:
+            old = json.loads(prev_p.read_text(encoding="utf-8"))
+            ran = {s.name.replace("rgbd_dataset_", "") for s in seqs}
+            keep = [e for e in old.get("sequences", []) if e["name"] not in ran]
+        except Exception:
+            keep = []
+
     for seq in seqs:
         name = seq.name.replace("rgbd_dataset_", "")
         gt_stamps, gt_poses = load_groundtruth(seq)
@@ -199,8 +263,13 @@ def main() -> int:
             if args.skip_run and traj_p.exists():
                 run = {"ok": True, "wall_s": None}
             else:
+                if key in DATASET_ARGS.get(dataset_of(seq), {}).get("skip_systems", ()):
+                    entry["runs"][key] = {"ok": False, "skipped": True}
+                    print(f"  {key:9} 건너뜀 ({dataset_of(seq)})")
+                    continue
                 run = run_system(build / meta["exe"], seq, traj_p, diag_p,
-                                 args.max_frames, meta.get("args"))
+                                 args.max_frames,
+                                 list(meta.get("args") or []) + extra_args(seq, key))
             if not run["ok"]:
                 print(f"  {key:9} 실패: {run.get('stderr','')[:120]}")
                 entry["runs"][key] = {"ok": False}
@@ -274,7 +343,15 @@ def main() -> int:
                 gtp.append([float(g.t[0]), float(g.t[1]), float(g.t[2])] if g else None)
             entry["gt_traj"] = gtp
             print(f"  {'identity':9} ATE {entry['identity_ate_cm']:7.2f} cm  (do-nothing floor)")
+        entry["dataset"] = dataset_of(seq)
         report["sequences"].append(entry)
+
+    if keep:
+        for e in keep:
+            e.setdefault("dataset", "tum")
+        report["sequences"] = keep + report["sequences"]
+        report["sequences"].sort(key=lambda e: (e.get("dataset", "tum"), e["name"]))
+        print(f"\n기존 {len(keep)} 시퀀스를 보존해 합쳤다")
 
     p = out_dir / "benchmark.json"
     p.write_text(json.dumps(report), encoding="utf-8")

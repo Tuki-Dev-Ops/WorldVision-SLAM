@@ -1,265 +1,290 @@
-# World Model Engine (WME)
+<div align="center">
 
-A perception engine whose central object is a continuously evolving **World State**, not a
-map. Localization is one estimator inside it, not its purpose.
+# WorldVision-SLAM
 
-WME asks five questions where SLAM asks one:
+### WME — World Model Engine
 
-> What exists? · What changed? · What will change? · What is reliable? · Where am I?
+**기술자(descriptor) 없는 SLAM.** 특징점을 기억하는 대신 세계를 기억한다.
 
-**YOLO is the only perception network.** There is no ORB, SIFT, SURF, AKAZE, SuperPoint,
-LoFTR, LightGlue, SAM, DINO, or CLIP anywhere in this codebase — no keypoint detector, no
-descriptor, no descriptor matching. That constraint is not a limitation worked around; it
-is what forces objects to become the primitive of the system, which is the whole thesis.
+<br>
 
-## Start here
+![C++20](https://img.shields.io/badge/C%2B%2B-20-00599C?logo=cplusplus&logoColor=white)
+![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)
+![CMake](https://img.shields.io/badge/CMake-3.24%2B-064F8C?logo=cmake&logoColor=white)
+![OpenCV](https://img.shields.io/badge/OpenCV-4.8%2B-5C3EE8?logo=opencv&logoColor=white)
+![Eigen](https://img.shields.io/badge/Eigen-3.4-1F425F)
+![pybind11](https://img.shields.io/badge/pybind11-2.11-FFD43B)
+![ONNX Runtime](https://img.shields.io/badge/ONNX%20Runtime-1.22-005CED?logo=onnx&logoColor=white)
+![GoogleTest](https://img.shields.io/badge/GoogleTest-236%20passing-brightgreen)
+![pytest](https://img.shields.io/badge/pytest-639%20passing-brightgreen)
 
-| Document | What it covers |
+<br>
+
+**한국어** · [English](docs/readme/README.en.md) · [中文](docs/readme/README.zh-CN.md) · [日本語](docs/readme/README.ja.md)
+
+</div>
+
+---
+
+## 프로젝트 배경
+
+고전 시각 SLAM은 30년 가까이 같은 전제 위에 서 있다. **화소 주변을 숫자 벡터로 요약(기술자)하고, 그 벡터가 비슷하면 같은 점이라고 본다.** ORB, SIFT, BRIEF가 모두 이 전제를 공유한다.
+
+이 전제는 조건이 좋을 때 매우 잘 동작하고, 조건이 나빠지면 **조용히** 무너진다. 안개가 끼면 기술자는 "매칭 실패"를 보고하지 않는다. 그럴듯한 오답을 낸다. 밤이 되면, 비가 오면, 카메라가 흔들리면 같은 일이 벌어진다. 실패가 시끄럽지 않기 때문에 상위 계층은 그것을 알아차릴 방법이 없다.
+
+WME는 다른 질문에서 출발한다. **사람은 기술자를 매칭하지 않는다.** 어두운 방에 들어가도 책상이 어디 있는지 안다. 화소를 대조해서가 아니라, 그 방의 **모델**을 갖고 있어서다. 대응(correspondence) 문제를 화소 수준에서 풀지 않고, 세계 모델 수준에서 푼다.
+
+그래서 이 저장소가 만드는 것은 "더 나은 기술자"가 아니라 **기술자를 쓰지 않는 파이프라인**이고, 그 파이프라인이 정말 기술자 파이프라인보다 나은지를 같은 데이터에서 나란히 재는 장치다.
+
+### 이 프로젝트가 스스로에게 건 조건
+
+주장은 쉽고 검증은 어렵다. 그래서 규칙을 먼저 정했다.
+
+| 규칙 | 이유 |
 |---|---|
-| [docs/06-results.md](docs/06-results.md) | **Start here.** Every measured result, with its control and its limitation |
-| [results/bench/index.html](results/bench/index.html) | **Run the comparison.** Side-by-side viewer: classical ORB+PnP on the left, WME on the right, 12 TUM sequences |
-| [docs/00-manifesto.md](docs/00-manifesto.md) | Why a World State instead of a map; the six commitments; what would falsify the approach |
-| [docs/02-correspondence-problem.md](docs/02-correspondence-problem.md) | **The core research argument.** How you estimate pose with no descriptors, and why that is better |
-| [docs/04-unified-objective.md](docs/04-unified-objective.md) | Is "one objective function" the right unification? Verdict and the correct formulation |
-| [docs/05-research-program.md](docs/05-research-program.md) | The plan to get from engine to publishable result |
-| [docs/01-architecture.md](docs/01-architecture.md) | Layer map, execution model, concurrency discipline |
-| [docs/03-roadmap.md](docs/03-roadmap.md) | Exactly what is implemented vs. designed vs. not started |
+| **모든 C++ 구현에 독립 numpy 오라클을 붙인다** | 두 구현이 같은 답을 내야 그 답을 믿는다. 한 코드가 자기를 검증하면 버그가 자기를 가린다 |
+| **추정과 채점을 다른 코드가 한다** | 추정은 C++, ATE/RPE 채점은 Python. 같은 코드로 둘 다 하면 두 버그가 서로를 상쇄한다 |
+| **대조군은 "우리가 안 쓴다"고 선언한 바로 그 기술자 파이프라인이다** | 임의의 약한 상대를 이기는 것은 의미가 없다 |
+| **측정이 판별하는지를 먼저 확인한다** | 모든 입력에서 같은 값이 나오는 지표는 통과해도 아무것도 증명하지 않는다 |
+| **실패는 시끄러워야 한다** | "저장했다"고 찍고 파일을 안 쓴 도구, 초록으로 끝나는 도달 불가 테스트 — 전부 결함으로 취급한다 |
 
-### The one result to read
+이 규칙들이 실제로 무엇을 잡아냈는지는 [docs/06-results.md](docs/06-results.md)에 전부 기록되어 있다. 성공한 실험만이 아니라 **거부된 가설 다섯 개와 내가 만든 결함들**까지 남아 있다.
 
-Fusing all three correspondence tiers helps **more as conditions degrade** — 6.8 % → 15.1 % →
-27.4 % → **53.6 %** ATE improvement over photometric-only as haze goes 0 → 0.9. There is no
-branch on weather anywhere in the fusion code; the behaviour comes entirely from the
-environment scaling the information matrices. Details and caveats in
-[docs/06-results.md](docs/06-results.md) §1.
+---
 
-**That result is simulation. On real data the slope is real and the magnitude is not.**
-Degraded real data was manufactured by applying the scattering equation to TUM frames using
-their *measured* depth (§23), and across that sweep the fusion gain does grow with haze without
-any weather branch — but **53.6 % becomes 11 %**, and it only turns positive after Tier 0 has
-already diverged to 44–105 cm. At haze = 0 fusion is net *harmful* on four of five sequences
-(§18), and fitting the weight schedule does not rescue it: the fit chooses to switch the other
-tiers off (§21). Read §1, §18, §21 and §23 together or not at all.
+## 프로젝트 목적
 
-## The idea in one page
+### 1. 세 계층으로 대응 문제를 푼다
 
-Removing descriptors removes the entire classical correspondence pipeline. WME replaces it
-with three tiers fused in one factor graph, weighted by an explicit model of the
-environment:
+```
+Λ_total = α₀(E)·Λ_ECDA + α₁(E)·Λ_TCG + α₂(E)·Λ_SPA
+```
 
-| Tier | Name | Basis | Role |
+| 계층 | 이름 | 하는 일 |
+|---|---|---|
+| **Tier 0** | ECDA | 직접 측광 정렬. 화소 밝기 잔차를 최소화한다. 기술자 없음 |
+| **Tier 1** | TCG | 토큰 성좌 기하. 물체(YOLO 검출)의 상대 배치로 위치를 잡는다 |
+| **Tier 2** | SPA | 구조 정렬. 평면의 법선/거리로 퇴화 축을 메운다 |
+
+`α_k(E)`는 손으로 쓴 분기가 아니다. **환경 증거 E**(어둠, 안개, 모션블러, 텍스처 빈곤 …)에서 계산된다. 야간용 코드도, 우천용 코드도 존재하지 않는다 — 열화는 각 정보원이 기여하는 **정보량의 감소**로만 표현된다.
+
+### 2. 그 주장을 같은 데이터에서 나란히 잰다
+
+`results/bench/index.html`은 **왼쪽에 기존 방식, 오른쪽에 WME**를 놓고 궤적·ATE·RPE·속도를 한 화면에서 비교하는 뷰어다. 20개 시퀀스가 들어 있다.
+
+<div align="center">
+
+| 데이터셋 | 시퀀스 | 대조군 | 결과 |
 |---|---|---|---|
-| 0 | **ECDA** | photometric field alignment, dynamic pixels masked by YOLO | frame-rate relative pose |
-| 1 | **TCG** | object constellations — class multiset + pairwise distance spectrum + chirality | relocalization, loop closure, unbounded baseline |
-| 2 | **SPA** | planes, lines, gravity | degeneracy repair in textureless scenes |
+| **TUM RGB-D** (실내, 손) | 16 | ORB+PnP, `cv2.Odometry` | **9 – 6** (둘 중 나은 쪽 기준) |
+| **KITTI odometry** (실외, 차량) | 4 | ORB+PnP | **4 – 0** |
+
+</div>
+
+TUM만 있었을 때 이 비교는 9–6이었다. KITTI를 붙이자 **2–2로 뒤집혔다.** 원인을 찾아보니 ECDA가 스테레오 깊이를 참값으로 믿고 있었다 — 60 m 지점의 깊이 오차는 ±4 m인데 6 m 지점(±4 cm)과 같은 무게로 들어가고 있었다. 불확실성을 잔차 분산으로 옮기고(계수는 `c = σ_d/(f·B)`로 **유도**, 튜닝 아님) 다시 재니 4–0이 되었다.
+
+> **그전까지 "WME가 더 낫다"고 적혀 있던 문장은 알고리즘의 성질이 아니라 TUM의 성질이었다.** 이 사건의 전말은 [§25.20–25.21](docs/06-results.md)에 있다.
+
+### 3. 무엇이 아닌지도 분명히 한다
+
+- **ORB-SLAM3가 아니다.** 대조군은 ORB 검출 → 해밍 매칭 → RANSAC PnP까지다. 루프 클로저도 번들 조정도 없다. 비교는 **오도메트리 대 오도메트리**로만 유효하다
+- 양쪽 모두 **번들 조정이 없다**. 포즈 그래프까지다
+- 열화(안개) 실험은 실제 TUM 프레임에 **실측 깊이**로 산란 방정식을 적용해 만든 것이지, 자연 열화 데이터가 아니다
+
+무엇이 확립되지 않았는지는 [docs/06-results.md §26](docs/06-results.md)에 목록으로 있다.
+
+---
+
+## 저장소 구조
 
 ```
-Λ_total = α₀(E)·Λ_ECDA + α₁(E)·Λ_TCG + α₂(E)·Λ_SPA + Λ_prior(E)
+WorldVision-SLAM/
+├── include/wme/              공개 헤더 (27)
+│   ├── core/                 SE3, Frame, Result, ThreadPool, Assignment
+│   ├── localization/         DirectAligner            ← Tier 0 (ECDA)
+│   ├── token/                TokenStore, ConstellationIndex, WorldToken
+│   │                                                  ← Tier 1 (TCG)
+│   ├── geometry/             StructuralAligner, PlaneExtractor
+│   │                                                  ← Tier 2 (SPA)
+│   ├── fusion/               PoseFusion, TierInformation
+│   ├── perception/           ImageQualityEngine, EnvironmentAnalyzer,
+│   │                         StereoDepth, YoloRuntime{Cv,Ort}
+│   └── confidence/           ConfidenceEngine
+│
+├── src/                      구현 (20 파일, ~17 kLOC)
+│
+├── tools/                    실행 가능한 실험 바이너리 (10)
+│   ├── tum_odometry.cpp      WME 오도메트리
+│   ├── tum_baseline.cpp      ORB+PnP 대조군 ← "안 쓴다"고 선언한 바로 그것
+│   ├── kitti_convert.cpp     KITTI → TUM 배치 + StereoSGBM 깊이
+│   ├── tum_loopclose.cpp     대칭 루프 클로저 (ORB vs TCG)
+│   ├── tum_degrade.cpp       실측 깊이 기반 산란 열화
+│   ├── tum_fusion.cpp        3계층 융합 실행
+│   └── …                     relocalize, tcg_density, plane_density, env_probe
+│
+├── tests/                    C++ 테스트 (16 파일, 236 케이스)
+│
+├── python/
+│   ├── wme/
+│   │   ├── reference/        ★ C++ 과 대조되는 numpy 오라클
+│   │   │                       assignment, confidence, constellation,
+│   │   │                       environment, environment_cues, geometry, tokens
+│   │   ├── localization/     ecda.py — DirectAligner 의 오라클
+│   │   ├── geometry/         spa.py, planes.py
+│   │   ├── eval/             ATE / RPE / Umeyama, TUM 로더  ← 채점 전담
+│   │   ├── graph/            포즈그래프, 팩터, 측광 SLAM
+│   │   ├── sim/ world/       합성 장면, 세계 모델 상태/예측/변화탐지
+│   │   ├── association/ calib/ planner/
+│   │   └── yolo.py
+│   ├── bindings/             pybind11 → wme._core
+│   ├── tools/                실험·벤치 스크립트 (30)
+│   │   ├── bench_run.py      두 시스템 실행 + 채점 → benchmark.json
+│   │   ├── bench_report.py   → results/bench/index.html  (좌/우 비교 뷰어)
+│   │   ├── fetch_kitti.py    KITTI 내려받기 (이어받기 지원)
+│   │   └── …
+│   └── tests/                Python 테스트 (27 파일, 639 케이스)
+│
+├── docs/
+│   ├── 00-manifesto.md       왜 기술자를 버리는가
+│   ├── 01-architecture.md    계층 구조
+│   ├── 02-correspondence-problem.md   이론적 근거
+│   ├── 03-roadmap.md
+│   ├── 04-unified-objective.md
+│   ├── 05-research-program.md
+│   └── 06-results.md         ★ 모든 실측 결과와 실패 기록
+│
+├── results/bench/index.html  ★ 좌: 기존 모델 / 우: WME  비교 뷰어
+├── cmake/                    의존성·경고 정책
+└── .github/workflows/        linux, windows-msvc, sanitizers, python
 ```
 
-Adaptation to night, rain, fog, and motion blur is this single equation. Degrading a
-sensing modality reduces the information it contributes; the estimator does the rest.
-There is no `if (night)` branch anywhere.
+---
 
-**Token Constellation Geometry** is the primary original contribution. A place is not a bag
-of visual words — it is a set of objects in a specific arrangement. That signature is
-rigid-invariant by construction, survives darkness and fog (YOLO still fires on large
-objects when texture is gone), and yields pose in closed form via Kabsch. It also returns
-something a descriptor match never can: *this chair is the same chair*, which is a world-model
-update rather than just a pose.
+## 데이터셋
 
-## Repository layout
+두 데이터셋 모두 저장소에 **포함되어 있지 않다** (합계 51 GB). 스크립트로 재현한다.
 
-```
-include/wme/          public headers — contracts, thread-safety, complexity documented
-  core/               Types, SE3, Result, Frame, ThreadPool, Assignment
-  perception/         EnvironmentState, ImageQuality, Detection, their engines
-  confidence/         ConfidenceEngine — Bayesian existence/identity/static beliefs
-  token/              WorldToken, TokenStore, ConstellationIndex
-  localization/       DirectAligner (ECDA, Tier 0)
-src/                  implementations, mirroring include/
-tests/                GoogleTest — analytic cases + property tests
-benchmarks/           Google Benchmark — p99 latency, scaling curves
-tools/                wme_env_probe — live environment readout
-python/
-  wme/reference/      numpy reimplementation of the core algorithms (test oracle)
-  wme/eval/           ATE / RPE / Umeyama, TUM-RGBD loader
-  wme/yolo.py         YOLO bridge — decode + NMS in pure numpy, ONNX/ultralytics backends
-  bindings/           pybind11 module exposing the C++ engine as wme._core
-  tests/              pytest, incl. C++ ↔ Python differential tests
-docs/                 design rationale and research argument
-cmake/                toolchain, dependencies, helpers
-```
+### TUM RGB-D — 실내, 손에 든 카메라, 측정된 깊이
 
-## Run the benchmark
+Kinect 구조광 센서라 깊이가 **측정값**이다. 16개 시퀀스를 쓴다.
 
 ```bash
-cmake --build build/win                      # needs OpenCV on PATH at run time
-cd python
-python tools/bench_run.py                    # both systems, 12 sequences -> benchmark.json
-python tools/bench_report.py                 # -> results/bench/index.html
+python python/tools/tum_fetch.py
 ```
 
-`bench_run.py` drives `wme_tum_baseline` (ORB + descriptor matching + RANSAC PnP) and
-`wme_tum_odometry` (WME) over the same frames with the same intrinsics, undistortion, depth
-scale and keyframe rule, then scores both. Estimation is C++, scoring is Python, deliberately
-split. Over 16 TUM sequences against the ORB control the tally is 12–4; against **the better of
-two independent controls** — adding `cv2.Odometry`, OpenCV's published dense RGB-D odometry,
-which nobody here wrote — it is **9–6** ([docs/06-results.md](docs/06-results.md) §22.4). A
-second control moved the verdict without a single WME number changing; the count of controls is
-itself an experimental parameter.
+| 그룹 | 시퀀스 | 성격 |
+|---|---|---|
+| `freiburg1` | xyz, desk, room, 360, plant, teddy | 왜곡 큼(k1=0.26), 일반 실내 |
+| `freiburg2` | desk, desk_with_person | 다른 카메라 — 일반화 확인용 |
+| `freiburg3` | structure/nostructure × texture/notexture | 퇴화 조건 격리 |
+| `freiburg3` | sitting_*, walking_* | 동적 물체 |
 
-What survives both: WME wins **decisively on dynamic content** (6.48 cm vs 19.34 / 52.89 on
-`walking_xyz`) and on long traverses, and loses on clean short static scenes and on textureless
-structure. Two sequences are unscorable because one system diverged or produced nothing —
-winning against a failure is not winning (§22.5).
+> 내부 파라미터와 왜곡 계수는 freiburg 그룹마다 다르다. 하나로 고정하면 다른 그룹에서 **실패가 아니라 그럴듯한 오차**가 나온다.
 
-**Then a second dataset family arrived and the tally moved.** A stereo depth front-end
-(`StereoDepth`, OpenCV SGBM) and `wme_kitti_convert` let the same two binaries run on KITTI
-odometry. Over four sequences (394–589 m each) it came out **2–2**, not 9–6
-([docs/06-results.md](docs/06-results.md) §25.20) — the indoor result was not a property of the
-algorithms, it was a property of TUM.
+### KITTI odometry — 실외, 차량, 스테레오
 
-The gap KITTI exposed was concrete: ECDA treated stereo depth as exact, so a 60 m point with
-±4 m of error was weighted like a 6 m point with ±4 cm. Moving that uncertainty into the residual
-variance — one coefficient, `σ_Z = c·Z²`, **derived** from `c = σ_d/(f·B)` rather than tuned —
-takes KITTI to **4–0** (§25.21). It is off by default (`depth_sigma_rel = 0`), it does nothing
-indoors where `Z ≤ 8 m`, and it makes the highway sequence 2.5× worse because that scene has no
-near structure at all.
+깊이가 없다. **우리가 만들어야 한다** — 그래서 `StereoDepth`(OpenCV SGBM) 프런트엔드가 여기서 처음 필요해진다. 깊이는 측정값이 아니라 **추정값**이고, 그 구분이 §25.21의 핵심이다.
 
 ```bash
-python tools/fetch_kitti.py                                   # 21.6 GB, resumable
+python python/tools/fetch_kitti.py        # 21.6 GB, 이어받기 지원
+```
+
+변환 시 시차 탐색 범위는 장면의 최근접 거리에서 **유도**한다. 이 값을 대충 두면 SGBM은 "범위 밖"이라고 말하지 않고 **그럴듯한 오답**을 낸다 (실측: 깊이 스케일 2.42배).
+
+```bash
 build/win/tools/wme_kitti_convert data/kitti/dataset 00 data/kitti_00 --stride 2
-build/win/tools/wme_tum_odometry data/kitti_00 out.txt --kf-dist 1.0
 ```
 
-```bash
-python tools/baseline_cv2.py                 # third-party control, same data path
-```
+| 항목 | 값 |
+|---|---|
+| 내려받는 시퀀스 | 00–21 (22개, 정답 궤적은 00–10) |
+| 현재 변환·평가된 시퀀스 | 00, 04, 05, 07 |
+| 해상도 / 초점거리 / 베이스라인 | 1241×376 / 718.86 px / 0.537 m |
+| 유효 깊이 비율 (SGBM) | 67 – 74 % |
+
+---
+
+## 실행 방법
+
+### 1. 사전 준비
+
+| 항목 | 버전 |
+|---|---|
+| 컴파일러 | MSVC 2022 / GCC 11+ / Clang 14+ (C++20) |
+| CMake | 3.24 이상 |
+| OpenCV | 4.8 이상 — `core imgproc imgcodecs videoio calib3d highgui dnn features2d` |
+| Python | 3.10 이상 + `numpy scipy pytest pybind11` |
+| (선택) ONNX Runtime | 1.22 — YOLO 토큰 마스킹용 |
+
+> OpenCV 컴포넌트에서 `features2d`를 빼면 링크 단계에서만 터진다. `cmake/WmeDependencies.cmake`에 이 함정이 주석으로 적혀 있다.
+
+### 2. 빌드
 
 ```bash
-# degradation sweep — scattering applied to real frames using real depth
-python tools/bench_degrade.py                # 23: neither system degrades gracefully
-
-# loop closure — same back-end, ORB vs TCG place recognition
-python tools/loop_optimize.py <seq> <odom.txt> <edges.csv> <out.txt>   # 24
-```
-
-**What the whole comparison says.** WME's descriptor-free front-end is the real result — 2.2×
-better than the classical front-end over a full 45 s traverse. What sits on top of it is not yet
-earning its place: three-tier fusion is net harmful except where everything has already failed
-(§23.4), and the degradation robustness that motivated dropping descriptors does not appear
-(§23.3). The object tier *does* close loops (+30.7 %), but finds 15× fewer than the descriptor
-control and locates them 7× less precisely (§24.2).
-
-**Does the engine know when it is wrong?** Not from the photometric channel — a residual is
-bounded by the intensity range and an inlier ratio by [0,1], so neither can report a failure
-that grows without limit. `depth_consistency` compares the estimate against the depth map
-alignment never reads, and tracks a divergence of 11.6× the do-nothing floor at **10.4×** where
-the photometric signals saturate at 4.3× (§25). `align()` now degrades its own result on
-geometric inconsistency, with a threshold fitted across 3 cameras.
-
-**Acting on it by reweighting fusion makes things worse on 8 of 15 configurations** (§25.7):
-down-weighting Tier 0 does not create accuracy, it hands weight to tiers that are 3–15× less
-accurate. Acting on it by **replacing the keyframe** — which needs no second estimator — is net
-positive: 4 better, 2 worse, 2 tied, helping on the four hardest sequences and costing on the two
-easiest (§25.8). Adding map-anchored **relocalization** on top reaches 15.72 cm on
-`fr3_walking_xyz` from a 20.72 cm base — 24 % for the whole chain.
-
-**With loop closure, the WME full system reaches 15.06 cm against the classical 20.67 cm**
-(§24.1) — though that lead comes from the front-end: ORB's loop closure finds 44 loops to TCG's
-3 and locates them 7× more precisely. §24 originally reported TCG *degrading* ATE; that was two
-defects of mine (chirality silently disabled, match transform inverted) and is corrected in
-§25.11.
-
-**Under haze, relocalization succeeds 0 times in 358 attempts** (§25.9): it matches descriptors
-against map keyframes captured in the same haze, so both sides of the comparison are degraded by
-the same cause. Detection and recovery are separate problems — an independent channel for
-*detecting* failure does not give you one for *recovering* from it. The only recovery path in
-this architecture that does not live in the photometric channel is the object constellation, and
-§24.2 measures that one as unable to relocalize indoors.
-
-## Build
-
-```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
-ctest --test-dir build --output-on-failure
-./build/benchmarks/bench_constellation
 ```
 
-Requires a C++20 compiler, CMake ≥ 3.24, OpenCV ≥ 4.8. Eigen, spdlog, GoogleTest, and
-Google Benchmark are fetched automatically if not found. CUDA, TensorRT, ONNX Runtime,
-Open3D, and PCL are optional and off by default.
+Windows (MSVC BuildTools):
 
-> **The C++ has not been compiled.** The machine it was authored on has no C++ toolchain
-> (`cmake`, `cl`, `g++`, `nvcc` all absent). Expect to fix compile errors on first build.
-> Standing up CI is the first task in
-> [the roadmap](docs/03-roadmap.md#cross-cutting-requirements-not-yet-met).
+```powershell
+& "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+cmake -S . -B build/win -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build/win
+```
 
-## Python layer — and why it exists
-
-Since the C++ could not be run, the core algorithms were reimplemented in numpy and
-executed. `wme.reference` is not a convenience wrapper; it is a **differential-testing
-oracle**. Two independent implementations of the same algorithm must agree on the same
-input — if they disagree, one is wrong, and a third source (an analytic answer or synthetic
-ground truth) decides which.
+### 3. 테스트 — 먼저 이것부터
 
 ```bash
-cd python
-pip install -e ".[dev]"
-pytest -q                      # 130 tests, no C++ needed
-
-# build the bindings to also run the 41 C++ ↔ Python differential tests
-cmake -S .. -B ../build -DWME_BUILD_PYTHON=ON && cmake --build ../build
-pytest -q
+ctest --test-dir build --output-on-failure     # C++  236 케이스
+cd python && python -m pytest -q               # Python 639 케이스
 ```
 
-This immediately found **three real defects in the C++** that a clean compile would not have
-caught — most importantly, chirality checking that measured heights in two differently
-rotated frames against the same gravity vector, which silently returned poses ~0.15 m off on
-noise-free data. Full write-up in [docs/03-roadmap.md](docs/03-roadmap.md#phase-2b--python-layer-done).
+Python 쪽 상당수는 **C++ ↔ numpy 차분 테스트**다. 여기가 초록이라는 것은 두 개의 독립 구현이 같은 답을 냈다는 뜻이고, 이 저장소에서 숫자를 믿는 근거는 그것뿐이다.
 
-The layer also carries the evaluation harness (ATE/RPE, TUM-RGBD loader) and the YOLO
-bridge — decoding, letterbox inversion, and class-wise NMS in pure numpy, so detections can
-be produced before the TensorRT backend exists.
-
-## Try the environment engine
+### 4. 벤치마크 실행 → 좌/우 비교 뷰어
 
 ```bash
-./build/tools/wme_env_probe /path/to/video.mp4 --show --csv env.csv
-./build/tools/wme_env_probe 0 --show          # webcam
+python python/tools/bench_run.py               # 두 시스템 실행 + 채점
+python python/tools/bench_report.py            # → results/bench/index.html
 ```
 
-Prints, per frame: image quality score, noise σ, blur extent, the environment labels, and
-the live tier weights `α₀ α₁ α₂`. Point it at a dark or hazy clip and watch the photometric
-weight collapse while the constellation weight holds — that is the adaptation mechanism,
-visible directly.
+일부만 다시 돌릴 때:
 
-## Current state
+```bash
+python python/tools/bench_run.py --only kitti --merge        # KITTI 만, 나머지 보존
+python python/tools/bench_run.py --skip-run                  # 재추정 없이 재채점
+```
 
-**Implemented and tested:** core + Lie group math, thread pool, image quality, environment
-analyzer, **ECDA** (Tier 0 direct alignment), **TCG** (Tier 1 constellation index), Hungarian
-association, confidence engine, and the token store with its full lifecycle.
+그리고 `results/bench/index.html`을 브라우저로 연다. **왼쪽 = 기존 모델(ORB+PnP), 오른쪽 = WME**, 아래에 궤적·ATE 시계열·RPE·프레임당 시간.
 
-**Not yet built:** the YOLO backend (all token tests feed synthetic detections), the factor
-graph that fuses the three tiers, SPA (Tier 2), dense geometry, semantics, memory,
-prediction, planner, and Unity.
+### 5. 단일 시퀀스 실행
 
-Two things are deliberately *not* claimed:
+```bash
+# TUM
+build/tools/wme_tum_odometry data/rgbd_dataset_freiburg1_xyz out.txt
+build/tools/wme_tum_baseline data/rgbd_dataset_freiburg1_xyz orb.txt
+python python/tools/tum_eval.py data/rgbd_dataset_freiburg1_xyz out.txt
 
-1. **ECDA is verified only on synthetic planar warps.** That proves the Jacobians, pyramid,
-   affine brightness model, and dynamic-mask benefit are correct. It does not prove
-   behaviour on real depth noise. TUM-RGBD is the next milestone.
-2. **The fusion weights `α_k(E)` have now been fitted on real data, and fitting them does
-   not help.** Every leave-one-out fit lands at `α₁, α₂ ≤ 0.01` — the fit chooses to stop
-   fusing ([docs/06-results.md](docs/06-results.md) §21). What repairs fusion instead is a
-   one-parameter χ² consistency gate, which beats Tier-0-only on 4 of 5 held-out sequences —
-   but by reducing the *signed* component of the error, not by filling degenerate directions.
-   The complementarity mechanism this architecture claims remains unsupported outside
-   simulation.
+# KITTI — 깊이 상한과 불확실성 계수는 데이터셋에서 온다
+build/tools/wme_tum_odometry data/kitti_00 out.txt \
+    --kf-dist 1.0 --depth-max 60 --depth-sigma-rel 7.8e-4
+```
 
-[docs/03-roadmap.md](docs/03-roadmap.md) has the per-component status table and the full list
-of what is not verified.
+### 6. 그 밖의 실험
 
-Code comments are in Korean; documentation is in English.
+```bash
+python python/tools/baseline_cv2.py       # 제3자 대조군 (cv2.Odometry)
+python python/tools/bench_degrade.py      # 안개 스윕
+python python/tools/stereo_validate.py    # 스테레오 깊이를 TUM 실측 깊이에 대고 검증
+python python/tools/loop_optimize.py      # 포즈그래프 루프 클로저
+build/tools/wme_tum_loopclose data/rgbd_dataset_freiburg1_room out.txt
+```
+
+---
+
+<div align="center">
+
+**결과 전문 · 실패 기록 · 거부된 가설 → [docs/06-results.md](docs/06-results.md)**
+
+</div>

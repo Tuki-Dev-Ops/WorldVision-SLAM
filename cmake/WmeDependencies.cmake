@@ -12,13 +12,32 @@ find_package(Threads REQUIRED)
 
 find_package(Eigen3 3.4 QUIET NO_MODULE)
 if(NOT Eigen3_FOUND)
+    # SOURCE_SUBDIR 를 CMakeLists.txt 가 없는 디렉터리로 지정하면 CMake 는
+    # add_subdirectory 를 아예 호출하지 않는다(문서화된 동작, 3.18+). 즉
+    # **내려받기만 하고 Eigen 프로젝트를 구성하지 않는다.**
+    #
+    # 왜 그래야 하는가. Eigen 3.4.0 의 최상위 CMakeLists 는 blas/lapack 를
+    # 무조건 add_subdirectory 하고, blas 는 check_language(Fortran) 이 성공하면
+    # enable_language(Fortran) 을 부른다. GitHub Windows 러너에는 MSVC 와
+    # 함께 쓸 수 없는 mingw gfortran 이 깔려 있어서 check_language 는 통과하고
+    # enable_language 가 터진다 - 우리 코드와 무관한 자리에서 구성이 실패한다.
+    # BUILD_TESTING/EIGEN_BUILD_DOC 로는 막을 수 없다. blas 는 옵션 뒤에 있지
+    # 않기 때문이다.
+    #
+    # 우리는 Eigen 을 헤더로만 쓰므로 프로젝트를 구성할 이유 자체가 없다.
     FetchContent_Declare(eigen
         GIT_REPOSITORY https://gitlab.com/libeigen/eigen.git
         GIT_TAG 3.4.0
-        GIT_SHALLOW ON)
-    set(EIGEN_BUILD_DOC OFF CACHE BOOL "" FORCE)
-    set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+        GIT_SHALLOW ON
+        SOURCE_SUBDIR  cmake)   # CMakeLists.txt 가 없는 디렉터리 = 구성 생략
     FetchContent_MakeAvailable(eigen)
+
+    if(NOT TARGET Eigen3::Eigen)
+        add_library(wme_eigen_headers INTERFACE)
+        target_include_directories(wme_eigen_headers SYSTEM INTERFACE
+            "${eigen_SOURCE_DIR}")
+        add_library(Eigen3::Eigen ALIAS wme_eigen_headers)
+    endif()
 endif()
 
 find_package(spdlog 1.12 QUIET)
