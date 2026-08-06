@@ -332,7 +332,7 @@ TEST(StructuralAligner, RecoversRotationInARoom) {
     EXPECT_LT(err.y(), 0.01) << "회전 오차 " << err.y() << " rad";
     EXPECT_EQ(r.value().rotation_rank, 3);
     std::cout << "[측정] 방(3평면) 회전: 참 0.060 rad, 오차 " << err.y()
-              << " rad / 병진 오차 " << err.x() << " m\n";
+              << " rad / 병진 오차 " << err.x() << " m\n";
 }
 
 TEST(StructuralAligner, RecoversTranslationWithNonIdentityMotion) {
@@ -354,7 +354,7 @@ TEST(StructuralAligner, RecoversTranslationWithNonIdentityMotion) {
     EXPECT_LT(r.value().offset_rms, 0.02);
     std::cout << "[측정] 방(3평면) 병진: 참 " << truth.translation().norm()
               << " m, 오차 " << err.x() << " m / 회전 오차 " << err.y()
-              << " rad / offset_rms " << r.value().offset_rms << " m\n";
+              << " rad / offset_rms " << r.value().offset_rms << " m\n";
 }
 
 TEST(StructuralAligner, TranslationSignIsNotInverted) {
@@ -418,7 +418,7 @@ TEST(StructuralAligner, SinglePlaneReportsThreeDofNotSix) {
     EXPECT_FALSE(r.value().fullRank());
     std::cout << "[측정] 단일 평면: rot rank " << r.value().rotation_rank << "/3, trans rank "
               << r.value().translation_rank << "/3, observable "
-              << r.value().observable_dof << "/6, reliability " << r.reliability() << "\n";
+              << r.value().observable_dof << "/6, reliability " << r.reliability() << "\n";
 
     // 카메라가 +z 로 0.2 m 전진했으므로 t = (0, 0, -0.2)
     const Vec3 t = r.value().T_cur_ref.translation();
@@ -464,7 +464,7 @@ TEST(StructuralAligner, CorridorAlongAxisTranslationIsUnobservable) {
     std::cout << "[측정] 복도: rot rank " << r.value().rotation_rank << "/3, trans rank "
               << r.value().translation_rank << "/3, observable "
               << r.value().observable_dof << "/6, eig="
-              << r.value().eigenvalues.transpose() << "\n";
+              << r.value().eigenvalues.transpose() << "\n";
     EXPECT_GT(std::abs(rho.normalized().z()), 0.9) << "약한 축이 복도 축이 아니다: "
                                                    << rho.transpose();
 }
@@ -481,7 +481,7 @@ TEST(StructuralAligner, RoomCornerViewpointIsFullRank) {
     EXPECT_EQ(r.value().observable_dof, 6);
     EXPECT_FALSE(r.degraded());
     std::cout << "[측정] 방 모서리 시점: observable " << r.value().observable_dof
-              << "/6, eig=" << r.value().eigenvalues.transpose() << "\n";
+              << "/6, eig=" << r.value().eigenvalues.transpose() << "\n";
     EXPECT_TRUE(unobservableDirections(r.value()).empty());
 }
 
@@ -620,7 +620,7 @@ TEST(StructuralAligner, NearNullDirectionIsTruncatedNotAmplified) {
     }
     const Vec3 naive = ATA.fullPivLu().solve(ATb);
     std::cout << "[측정] 절단 해 |t| = " << r.value().T_cur_ref.translation().norm()
-              << " m vs 비절단 |t| = " << naive.norm() << " m\n";
+              << " m vs 비절단 |t| = " << naive.norm() << " m\n";
     EXPECT_GT(naive.norm(), 10.0) << "대조군이 발산하지 않아 이 테스트는 판별력이 없다";
 }
 
@@ -652,7 +652,7 @@ TEST(StructuralAligner, WrongCorrespondenceShowsUpInResidual) {
     EXPECT_LT(good.value().offset_rms, 1e-12);
     EXPECT_GT(bad.value().offset_rms, 0.05) << "모순된 대응이 잔차에 나타나지 않는다";
     std::cout << "[측정] 일관 offset_rms " << good.value().offset_rms
-              << " m vs 모순 " << bad.value().offset_rms << " m\n";
+              << " m vs 모순 " << bad.value().offset_rms << " m\n";
 }
 
 TEST(StructuralAligner, TooFewMatchesDoesNotClaimSuccess) {

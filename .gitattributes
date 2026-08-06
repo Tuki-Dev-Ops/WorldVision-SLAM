@@ -1,0 +1,21 @@
+# 줄 끝은 저장소에서 LF 로 정규화한다.
+#
+# 왜 필요한가. tests/test_spa.cpp 에 문자열 리터럴 **안쪽** 으로 생 CR 바이트가
+# 7 개 섞여 들어간 적이 있다. MSVC 는 lone CR 을 줄바꿈으로 보지 않아 조용히
+# 통과했고, GCC/Clang 은 줄바꿈으로 보기 때문에 "missing terminating \" character"
+# 로 터졌다. 즉 **한 플랫폼에서만 컴파일되는 소스** 가 만들어졌고, CI 가 처음
+# 도는 순간까지 아무도 몰랐다.
+#
+# eol=lf 로 정규화하면 CRLF 는 사라지지만 리터럴 안의 lone CR 은 그대로 남는다.
+# 그것까지 막는 것은 tools/check_source_hygiene.py 다.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.onnx binary
+*.pyd binary
+*.dll binary
+*.lib binary
+*.zip binary
+*.pdb binary
+*.ilk binary

@@ -52,8 +52,20 @@ jobs:
 
       # pyproject sets testpaths=tests and pythonpath=. , so this is the same
       # invocation the author uses locally.
+      # 이 잡은 확장을 **일부러** 빌드하지 않는다. 그 사실을 선언해야
+      # wme/__init__.py 가 RuntimeWarning 대신 로그 한 줄로 낮춘다 -
+      # pyproject 의 filterwarnings=error 는 그대로 살아 있어야 하므로,
+      # "확장 없음" 만 예외로 두고 나머지 경고는 계속 실패로 만든다.
       - name: pytest
+        env:
+          WME_NATIVE_OPTIONAL: "1"
         run: python -m pytest -q --durations=10
+
+      # 플랫폼 하나에서만 컴파일되는 소스를 만들지 않았는지 검사한다.
+      # 근거: tests/test_spa.cpp 의 문자열 안 생 CR 7 개. MSVC 통과, GCC 실패.
+      - name: Source hygiene
+        working-directory: .
+        run: python python/tools/check_source_hygiene.py
 
       # The lazy-import contract, asserted rather than assumed.
       - name: Assert optional imports stay lazy
