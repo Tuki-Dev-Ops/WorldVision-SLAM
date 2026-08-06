@@ -1,0 +1,128 @@
+# ASan + UBSan over the C++ test suite.
+#
+# WME_ASAN=ON makes cmake/WmeCompilerFlags.cmake attach
+# -fsanitize=address,undefined to the wme::settings interface target, which every
+# library and every test executable inherits.
+#
+# Two runs, because they cover different code:
+#   minimal - no OpenCV. Covers SE3, the Hungarian solver and the work-stealing
+#             thread pool. The pool is the highest-value target here: it mixes
+#             atomics with per-queue mutexes and is the only concurrent code in
+#             the repo, so TSan-shaped bugs show up as ASan reports.
+#   full    - OpenCV present, so ECDA / TokenStore / TCG run too. This is where
+#             the raw pointer arithmetic over cv::Mat rows lives.
+#
+# halt_on_error=1 matters: UBSan defaults to printing and continuing, so without
+# it an undefined-behaviour report would be invisible to ctest.
+#
+# Note for the first green run: UBSan's vptr check needs every polymorphic type
+# to be instrumented. OpenCV here is not, so if vptr false positives appear,
+# -fno-sanitize=vptr belongs in wme_apply_sanitizers, not in this file.
+name: sanitizers
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: sanitizers-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  OPENCV_VERSION: 4.10.0
+  CC: clang-18
+  CXX: clang++-18
+  UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+
+jobs:
+  asan-ubsan:
+    name: asan+ubsan (${{ matrix.flavour }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        flavour: [minimal, full]
+
+    env:
+      OPENCV_PREFIX: /opt/opencv
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build clang-18 llvm-18
+          clang++-18 --version
+
+      # Same cache entry the linux/full job populates - a hit here costs nothing.
+      - name: Cache OpenCV
+        if: matrix.flavour == 'full'
+        id: cache-opencv
+        uses: actions/cache@v4
+        with:
+          path: /opt/opencv
+          key: opencv-linux-${{ env.OPENCV_VERSION }}-clang
+
+      - name: Build OpenCV
+        if: matrix.flavour == 'full' && steps.cache-opencv.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config zlib1g-dev libjpeg-dev libpng-dev libtiff-dev
+          curl -sSL -o opencv.tar.gz \
+            "https://github.com/opencv/opencv/archive/refs/tags/${OPENCV_VERSION}.tar.gz"
+          tar xf opencv.tar.gz
+          cmake -S "opencv-${OPENCV_VERSION}" -B ocv-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="${OPENCV_PREFIX}" \
+            -DBUILD_LIST=core,imgproc,imgcodecs,videoio,calib3d,highgui,dnn \
+            -DBUILD_TESTS=OFF -DBUILD_PERF_TESTS=OFF -DBUILD_EXAMPLES=OFF \
+            -DBUILD_DOCS=OFF -DBUILD_opencv_apps=OFF -DBUILD_JAVA=OFF \
+            -DBUILD_opencv_python2=OFF -DBUILD_opencv_python3=OFF \
+            -DWITH_CUDA=OFF -DWITH_GTK=OFF -DWITH_QT=OFF -DWITH_IPP=OFF \
+            -DOPENCV_GENERATE_PKGCONFIG=OFF
+          sudo cmake --build ocv-build --target install
+          sudo chown -R "$(id -u):$(id -g)" "${OPENCV_PREFIX}"
+
+      # Debug, not RelWithDebInfo: ASan reports are only readable with
+      # unoptimised frames, and the sanitizers are the product of this job.
+      # ONNX Runtime stays off - it is a prebuilt uninstrumented .so and its
+      # interceptor interactions would only add noise.
+      - name: Configure
+        run: |
+          EXTRA="-DCMAKE_DISABLE_FIND_PACKAGE_OpenCV=ON"
+          if [ "${{ matrix.flavour }}" = "full" ]; then
+            EXTRA="-DOpenCV_DIR=${OPENCV_PREFIX}/lib/cmake/opencv4"
+          fi
+          cmake -S . -B build/asan -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DWME_ASAN=ON \
+            -DWME_WITH_ONNXRUNTIME=OFF \
+            -DWME_BUILD_BENCHMARKS=OFF \
+            -DWME_BUILD_TOOLS=OFF \
+            ${EXTRA}
+
+      - name: Build
+        run: cmake --build build/asan
+
+      # Timeouts are 180 s in tests/CMakeLists.txt; ASan is roughly 2-3x slower,
+      # and ECDA is the one that gets close, hence the generous ctest timeout.
+      #
+      # Leak detection is on for the minimal run - wme_math owns the thread pool
+      # and its global instance is the one place a leak would be ours. It is off
+      # for the OpenCV run because OpenCV's own thread pool and allocator caches
+      # hold one-time allocations that are reported and are not ours to fix.
+      # Memory errors and undefined behaviour stay fatal in both.
+      - name: Test under sanitizers
+        run: |
+          export LD_LIBRARY_PATH="${OPENCV_PREFIX}/lib:${LD_LIBRARY_PATH}"
+          if [ "${{ matrix.flavour }}" = "full" ]; then
+            export ASAN_OPTIONS=detect_leaks=0:strict_string_checks=1:detect_stack_use_after_return=1
+          else
+            export ASAN_OPTIONS=detect_leaks=1:strict_string_checks=1:detect_stack_use_after_return=1
+          fi
+          ctest --test-dir build/asan --output-on-failure --no-tests=error \
+                --timeout 900

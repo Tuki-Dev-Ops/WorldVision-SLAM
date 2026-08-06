@@ -1,0 +1,134 @@
+[
+  {
+    "sequence": "rgbd_dataset_freiburg1_desk",
+    "frames": 20,
+    "baseline_m": 0.1,
+    "min_valid_disparity_px": 11.372185453992563,
+    "gt_depth_coverage": 0.596337890625,
+    "stereo_coverage_of_gt": 0.9001137734479072,
+    "median_abs_err_m": 0.021648406982421875,
+    "median_rel_err": 0.016314594075083733,
+    "median_scale_ratio": 1.0029181241989136
+  },
+  {
+    "sequence": "rgbd_dataset_freiburg1_desk",
+    "frames": 20,
+    "baseline_m": 0.2,
+    "min_valid_disparity_px": 16.082698902858315,
+    "gt_depth_coverage": 0.596337890625,
+    "stereo_coverage_of_gt": 0.8158956303392559,
+    "median_abs_err_m": 0.03734475374221802,
+    "median_rel_err": 0.03519469127058983,
+    "median_scale_ratio": 1.005990982055664
+  },
+  {
+    "sequence": "rgbd_dataset_freiburg1_desk",
+    "frames": 20,
+    "baseline_m": 0.54,
+    "min_valid_disparity_px": 26.426570923977255,
+    "gt_depth_coverage": 0.596337890625,
+    "stereo_coverage_of_gt": 0.1311710660972277,
+    "median_abs_err_m": 1.3059706687927246,
+    "median_rel_err": 1.3417696952819824,
+    "median_scale_ratio": 2.3417696952819824
+  },
+  {
+    "sequence": "rgbd_dataset_freiburg1_room",
+    "frames": 20,
+    "baseline_m": 0.1,
+    "min_valid_disparity_px": 11.372185453992563,
+    "gt_depth_coverage": 0.5895849609374999,
+    "stereo_coverage_of_gt": 0.9183223330565092,
+    "median_abs_err_m": 0.028783053159713745,
+    "median_rel_err": 0.018980718217790127,
+    "median_scale_ratio": 1.009337842464447
+  },
+  {
+    "sequence": "rgbd_dataset_freiburg1_room",
+    "frames": 20,
+    "baseline_m": 0.2,
+    "min_valid_disparity_px": 16.082698902858315,
+    "gt_depth_coverage": 0.5895849609374999,
+    "stereo_coverage_of_gt": 0.8563102756558973,
+    "median_abs_err_m": 0.05555218458175659,
+    "median_rel_err": 0.03653876669704914,
+    "median_scale_ratio": 1.0194758176803589
+  },
+  {
+    "sequence": "rgbd_dataset_freiburg1_room",
+    "frames": 20,
+    "baseline_m": 0.54,
+    "min_valid_disparity_px": 26.426570923977255,
+    "gt_depth_coverage": 0.5895849609374999,
+    "stereo_coverage_of_gt": 0.2700049506059861,
+    "median_abs_err_m": 0.9396709203720093,
+    "median_rel_err": 0.6788791120052338,
+    "median_scale_ratio": 1.6788791418075562
+  },
+  {
+    "sequence": "rgbd_dataset_freiburg3_structure_texture_far",
+    "frames": 20,
+    "baseline_m": 0.1,
+    "min_valid_disparity_px": 11.372185453992563,
+    "gt_depth_coverage": 0.6885611979166667,
+    "stereo_coverage_of_gt": 0.9786320952916016,
+    "median_abs_err_m": 0.02855658531188965,
+    "median_rel_err": 0.01307541411370039,
+    "median_scale_ratio": 0.9969204664230347
+  },
+  {
+    "sequence": "rgbd_dataset_freiburg3_structure_texture_far",
+    "frames": 20,
+    "baseline_m": 0.2,
+    "min_valid_disparity_px": 16.082698902858315,
+    "gt_depth_coverage": 0.6885611979166667,
+    "stereo_coverage_of_gt": 0.9847961952667758,
+    "median_abs_err_m": 0.06123518943786621,
+    "median_rel_err": 0.024343781173229218,
+    "median_scale_ratio": 0.996423602104187
+  },
+  {
+    "sequence": "rgbd_dataset_freiburg3_structure_texture_far",
+    "frames": 20,
+    "baseline_m": 0.54,
+    "min_valid_disparity_px": 26.426570923977255,
+    "gt_depth_coverage": 0.6885611979166667,
+    "stereo_coverage_of_gt": 0.6157190128092083,
+    "median_abs_err_m": 0.2941267490386963,
+    "median_rel_err": 0.11717148125171661,
+    "median_scale_ratio": 1.037049651145935
+  },
+  {
+    "sequence": "rgbd_dataset_freiburg3_nostructure_notexture_far",
+    "frames": 19,
+    "baseline_m": 0.1,
+    "min_valid_disparity_px": 11.372185453992563,
+    "gt_depth_coverage": 0.69365234375,
+    "stereo_coverage_of_gt": 0.9980421144053349,
+    "median_abs_err_m": 0.014522910118103027,
+    "median_rel_err": 0.007466842886060476,
+    "median_scale_ratio": 0.9985839128494263
+  },
+  {
+    "sequence": "rgbd_dataset_freiburg3_nostructure_notexture_far",
+    "frames": 19,
+    "baseline_m": 0.2,
+    "min_valid_disparity_px": 16.082698902858315,
+    "gt_depth_coverage": 0.69365234375,
+    "stereo_coverage_of_gt": 0.9981956623586595,
+    "median_abs_err_m": 0.010481715202331543,
+    "median_rel_err": 0.005223045824095607,
+    "median_scale_ratio": 0.9966099560260773
+  },
+  {
+    "sequence": "rgbd_dataset_freiburg3_nostructure_notexture_far",
+    "frames": 19,
+    "baseline_m": 0.54,
+    "min_valid_disparity_px": 26.426570923977255,
+    "gt_depth_coverage": 0.69365234375,
+    "stereo_coverage_of_gt": 0.6458989924858545,
+    "median_abs_err_m": 0.13164472579956055,
+    "median_rel_err": 0.06204499490559101,
+    "median_scale_ratio": 1.0620450377464294
+  }
+]

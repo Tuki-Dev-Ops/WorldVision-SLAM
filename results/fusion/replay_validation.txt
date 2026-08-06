@@ -1,0 +1,51 @@
+D:\Program Files\Slam-Model\python\tools\fusion_replay.py:29: RuntimeWarning: wme._core 를 임포트하지 못했다 - 차등 테스트가 전부 skip 된다: ImportError: DLL load failed while importing _core: 지정된 모듈을 찾을 수 없습니다.
+  from wme.eval.trajectory import Trajectory, evaluate_ate  # noqa: E402
+====================================================================================
+fusion replay validation   (C++ tum_fusion vs numpy replay)
+====================================================================================
+                  sequence         ablation    C++ (cm)  replay (cm)      rel
+             freiburg1_360               t0       10.37        10.37   0.000%
+             freiburg1_360               t1       16.44        16.44   0.000%
+             freiburg1_360               t2      205.30       205.30   0.000%
+             freiburg1_360             t0t1       10.37        10.37   0.000%
+             freiburg1_360             t0t2       48.78        48.78   0.000%
+             freiburg1_360             t1t2      205.30       205.30   0.000%
+             freiburg1_360           t0t1t2       48.78        48.78   0.000%
+             freiburg1_360   t0t1t2_uniform       39.31        39.31   0.000%
+            freiburg1_desk               t0        2.53         2.53   0.000%
+            freiburg1_desk               t1       39.35        39.35   0.000%
+            freiburg1_desk               t2       31.42        31.42   0.000%
+            freiburg1_desk             t0t1        2.96         2.96   0.000%
+            freiburg1_desk             t0t2        2.81         2.81   0.000%
+            freiburg1_desk             t1t2       25.72        25.72   0.000%
+            freiburg1_desk           t0t1t2        3.26         3.26   0.000%
+            freiburg1_desk   t0t1t2_uniform        2.94         2.94   0.000%
+             freiburg1_xyz               t0        1.56         1.56   0.000%
+             freiburg1_xyz               t1        7.72         7.72   0.000%
+             freiburg1_xyz               t2       30.18        30.18   0.000%
+             freiburg1_xyz             t0t1        3.65         3.65   0.000%
+             freiburg1_xyz             t0t2        2.71         2.71   0.000%
+             freiburg1_xyz             t1t2       22.84        22.84   0.000%
+             freiburg1_xyz           t0t1t2        4.23         4.23   0.000%
+             freiburg1_xyz   t0t1t2_uniform        3.27         3.27   0.000%
+     freiburg3_sitting_xyz               t0        1.01         1.01   0.000%
+     freiburg3_sitting_xyz               t1       79.75        79.75   0.000%
+     freiburg3_sitting_xyz               t2      142.41       142.41   0.000%
+     freiburg3_sitting_xyz             t0t1        7.22         7.22   0.000%
+     freiburg3_sitting_xyz             t0t2        7.19         7.19   0.000%
+     freiburg3_sitting_xyz             t1t2       31.56        31.56   0.000%
+     freiburg3_sitting_xyz           t0t1t2        9.46         9.46   0.000%
+     freiburg3_sitting_xyz   t0t1t2_uniform        5.96         5.96   0.000%
+     freiburg3_walking_xyz               t0       20.72        20.72   0.001%
+     freiburg3_walking_xyz               t1       79.24        79.24   0.000%
+     freiburg3_walking_xyz               t2      131.02       131.02   0.000%
+     freiburg3_walking_xyz             t0t1       38.40        38.40   0.001%
+     freiburg3_walking_xyz             t0t2       15.52        15.52   0.002%
+     freiburg3_walking_xyz             t1t2       56.23        56.23   0.000%
+     freiburg3_walking_xyz           t0t1t2       21.13        21.13   0.002%
+     freiburg3_walking_xyz   t0t1t2_uniform       19.49        19.49   0.002%
+
+worst relative disagreement: 0.002 %   over 40 trajectories
+discrimination guard: 5/5 sequences respond to a changed weight
+
+GATE: PASS - replay reproduces the engine

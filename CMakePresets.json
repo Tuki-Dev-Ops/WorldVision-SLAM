@@ -1,0 +1,70 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 24, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "WME_BUILD_TESTS": "ON",
+        "WME_BUILD_BENCHMARKS": "ON"
+      }
+    },
+    {
+      "name": "debug",
+      "inherits": "base",
+      "displayName": "Debug + sanitizers",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "WME_ASAN": "ON"
+      }
+    },
+    {
+      "name": "release",
+      "inherits": "base",
+      "displayName": "Release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "WME_NATIVE_ARCH": "ON"
+      }
+    },
+    {
+      "name": "gpu",
+      "inherits": "release",
+      "displayName": "Release + CUDA/TensorRT",
+      "cacheVariables": {
+        "WME_WITH_CUDA": "ON",
+        "WME_WITH_TENSORRT": "ON"
+      }
+    },
+    {
+      "name": "jetson",
+      "inherits": "gpu",
+      "displayName": "Jetson Orin (aarch64)",
+      "cacheVariables": {
+        "CMAKE_CUDA_ARCHITECTURES": "87",
+        "WME_BUILD_BENCHMARKS": "OFF"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "debug", "configurePreset": "debug" },
+    { "name": "release", "configurePreset": "release" },
+    { "name": "gpu", "configurePreset": "gpu" }
+  ],
+  "testPresets": [
+    {
+      "name": "debug",
+      "configurePreset": "debug",
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error", "stopOnFailure": false }
+    },
+    {
+      "name": "release",
+      "configurePreset": "release",
+      "output": { "outputOnFailure": true }
+    }
+  ]
+}
