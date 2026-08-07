@@ -1134,6 +1134,48 @@ public:
     }
 
     // 화면에 투영. f 는 초점거리(px), 카메라는 orbit 중심을 바라본다.
+    // 기준 바닥 격자.
+    //
+    // 노면을 칸마다 사각형으로 그리던 것을 대신한다. 관측된 지면 칸을 하나씩
+    // 그리면 관측이 성긴 곳은 구멍이 나고 잡음이 있는 곳은 타일이 어긋나서,
+    // 평평해야 할 바닥이 누더기로 보인다. 바닥은 **재현할 대상이 아니라 척도**
+    // 다 - 3D 뷰어가 예외 없이 균일한 격자를 까는 이유가 그것이다.
+    //
+    // 높이는 관측된 지면에서 받아 오므로 지도와 따로 놀지는 않는다.
+    void groundPlane(const Eigen::Vector3d& at, double height,
+                     const Eigen::Vector3d& up_d, const Orbit& orb, double f,
+                     double step, double reach) {
+        const Eigen::Vector3d up = up_d.normalized();
+        Eigen::Vector3d a = up.cross(Eigen::Vector3d::UnitZ());
+        if (a.norm() < 1e-6) a = up.cross(Eigen::Vector3d::UnitX());
+        a.normalize();
+        const Eigen::Vector3d b = up.cross(a).normalized();
+
+        // 격자를 자차와 함께 미끄러뜨리지 않는다. 월드에 고정된 간격에
+        // 스냅해야 선이 흐르지 않고 바닥이 정지해 보인다.
+        const double ca = std::floor(at.dot(a) / step) * step;
+        const double cb = std::floor(at.dot(b) / step) * step;
+        const Eigen::Vector3d o = a * ca + b * cb + up * height;
+
+        const int n = std::max(1, static_cast<int>(reach / step));
+        // 격자는 **배경**이다. 지도보다 밝으면 눈이 먼저 격자로 가고, 척도로
+        // 쓰라고 깐 것이 정작 보여 줄 것을 가린다.
+        const cv::Scalar thin(30, 26, 22), thick(52, 45, 38);
+        for (int i = -n; i <= n; ++i) {
+            // 다섯 칸마다 굵게. 균일한 선만 있으면 거리가 안 읽힌다.
+            const cv::Scalar& col = (((static_cast<int>(std::llround(ca / step)) + i) % 5) == 0)
+                                  ? thick : thin;
+            const Eigen::Vector3d p0 = o + a * (i * step) - b * reach;
+            const Eigen::Vector3d p1 = o + a * (i * step) + b * reach;
+            line3(p0, p1, orb, f, col, 1);
+            const cv::Scalar& col2 = (((static_cast<int>(std::llround(cb / step)) + i) % 5) == 0)
+                                   ? thick : thin;
+            const Eigen::Vector3d q0 = o + b * (i * step) - a * reach;
+            const Eigen::Vector3d q1 = o + b * (i * step) + a * reach;
+            line3(q0, q1, orb, f, col2, 1);
+        }
+    }
+
     // Eye-Dome Lighting.
     //
     // Boucheny (2009) 가 만들고 CloudCompare / Potree / ArcGIS 가 쓰는 기법이다.
@@ -1551,41 +1593,10 @@ public:
             // 무엇이 길이고 무엇이 허공인지 구분되지 않는다. 격자칸을 칸
             // 크기대로 채우면 도로가 도로로 보이고, 그 위에 선 구조의
             // 발치가 어디인지도 읽힌다.
-            if (c.cls == Stuff::Ground) {
-                // **노면은 지면 높이에 그린다.** rep 은 그 칸에서 관측된 가장
-                // 높은 것이라, 도로 위 잡음이나 연석이 있으면 그 높이로 판이
-                // 뜬다. 평평한 도로가 계단처럼 보이던 이유다. 지면 높이는
-                // 이웃 중앙값이므로 잡음에 흔들리지 않는다.
-                const Eigen::Vector3f gp =
-                    c.rep + g.up * (c.ground - c.rep.dot(g.up));
-                const Eigen::Vector3f q[4] = {
-                    gp - g.a * (cell * 0.5f) - g.b * (cell * 0.5f),
-                    gp + g.a * (cell * 0.5f) - g.b * (cell * 0.5f),
-                    gp + g.a * (cell * 0.5f) + g.b * (cell * 0.5f),
-                    gp - g.a * (cell * 0.5f) + g.b * (cell * 0.5f)};
-                cv::Point poly[4];
-                bool ok = true;
-                for (int i = 0; i < 4 && ok; ++i) {
-                    ok = project3(q[i].cast<double>(), orb, f, poly[i]);
-                }
-                if (!ok) continue;
-                // 칸이 화면에서 너무 크면 투영이 튄 것이다 - 지평선 근처의
-                // 칸 하나가 화면 절반을 덮는 일을 막는다.
-                const double w = std::max({std::abs(poly[0].x - poly[2].x),
-                                           std::abs(poly[0].y - poly[2].y)});
-                if (w > img_.cols * 0.5) continue;
-                // **채우지 않고 격자로 긋는다.**
-                //
-                // 칸을 불투명하게 채웠더니 노면이 지도 전체를 덮어, 정작 그
-                // 위에 선 구조가 하나도 안 보였다. 지면은 배경이고 척도이지
-                // 주인공이 아니다. 테두리만 그으면 노면의 결이 보이면서도
-                // 그 위의 것을 가리지 않는다 - 라이다 시각화의 바닥 격자가
-                // 하는 일이 정확히 이것이다.
-                const cv::Scalar gcol{col[0] * 0.55, col[1] * 0.55, col[2] * 0.55};
-                cv::polylines(img_, std::vector<cv::Point>(poly, poly + 4), true,
-                              gcol, 1, cv::LINE_AA);
-                continue;
-            }
+            // **지면 칸은 그리지 않는다.** 바닥은 아래에 깔린 기준 격자가
+            // 맡는다 - 관측 칸을 하나씩 그리면 성긴 곳은 구멍이, 잡음이 있는
+            // 곳은 어긋난 타일이 생겨 평평한 바닥이 누더기가 된다.
+            if (c.cls == Stuff::Ground) continue;
 
             // **형상이 클래스를 말한다.**
             //
@@ -2671,11 +2682,17 @@ int main(int argc, char** argv) {
                     // 것은 한 시점으로 세어진다 - 그것이 요점이다. 스테레오
                     // 유령은 같은 오매칭이 인접 프레임에서 그대로 재현되므로
                     // 관측 횟수로는 안 걸리고, **시점이 바뀌어야** 사라진다.
+                    //
+                    // **격자 크기는 장면 규모에서 나온다.** 5 m 는 도로에서
+                    // 맞지만 방 안에서는 전 구간이 한 섹터가 되어, 서로 다른
+                    // 시점 조건을 영영 못 채우고 지도가 통째로 사라진다 -
+                    // TUM 에서 실제로 그랬다.
+                    const double sec_m = (s.dataset == "kitti") ? 5.0 : 0.4;
                     const Eigen::Vector3d epos =
                         run.aligned[static_cast<std::size_t>(pi)].translation();
                     const int sector = static_cast<int>(
-                        (static_cast<long long>(std::floor(epos.x() / 5.0)) * 7 +
-                         static_cast<long long>(std::floor(epos.z() / 5.0)) * 13) & 15);
+                        (static_cast<long long>(std::floor(epos.x() / sec_m)) * 7 +
+                         static_cast<long long>(std::floor(epos.z() / sec_m)) * 13) & 15);
                     const Eigen::Vector3f up_f = ob.world_up.cast<float>();
                     const float ego_h = static_cast<float>(ego_k.dot(ob.world_up));
                     for (auto& p : pts) {
@@ -2832,6 +2849,33 @@ int main(int argc, char** argv) {
                         near_pts.push_back(sp);
                     }
                 }
+                // **바닥 격자를 먼저 깐다.** 지도보다 나중에 그리면 격자선이
+                // 구조 위를 가로질러 지나간다.
+                {
+                    // 높이는 관측된 지면에서 받는다. 자차 주변 지면 칸들의
+                    // 중앙값이라 잡음 하나에 흔들리지 않고, 언덕에서도 지도와
+                    // 따로 놀지 않는다.
+                    std::vector<float> gh;
+                    if (show_stuff) {
+                        const Eigen::Vector3f e = ego_k.cast<float>();
+                        const float rr = static_cast<float>(map_r * map_r) * 0.25f;
+                        for (const auto& [ck, c] : stuff[k]) {
+                            if (c.cls != Stuff::Ground) continue;
+                            if ((c.rep - e).squaredNorm() > rr) continue;
+                            gh.push_back(c.ground);
+                        }
+                    }
+                    double h0;
+                    if (!gh.empty()) {
+                        std::nth_element(gh.begin(), gh.begin() + gh.size() / 2, gh.end());
+                        h0 = gh[gh.size() / 2];
+                    } else {
+                        // 관측된 지면이 없으면 센서 높이만큼 아래로 둔다.
+                        h0 = ego_k.dot(ob.world_up) - ((s.dataset == "kitti") ? 1.65 : 0.8);
+                    }
+                    cloud[k].groundPlane(ego_k, h0, ob.world_up, ob, vp.width * 0.9,
+                                         (s.dataset == "kitti") ? 5.0 : 0.5, map_r);
+                }
                 const bool L_map = (layer == 0 || layer == 1);
                 if (L_map) cloud[k].draw(near_pts, ob, vp.width * 0.9, 0.62);
                 if (show_cubes && L_map) {
@@ -2861,7 +2905,11 @@ int main(int argc, char** argv) {
                         // 지면 격자칸은 장면 규모에서 정한다. 도로변 건물은
                         // 1 m 칸이면 벽면이 여러 칸에 걸쳐 이어지고, 실내는
                         // 0.25 m 라야 가구와 벽이 갈린다.
-                        const float ccell = (s.dataset == "kitti") ? 1.0f : 0.25f;
+                        // **격자칸은 복셀보다 커야 한다.** 0.25 m 칸에 0.3 m
+                        // 복셀이면 칸마다 복셀이 하나뿐이라, 구조 텐서가 요구
+                        // 하는 점 수가 영영 안 모이고 전부 미상이 된다 - TUM
+                        // 에서 라벨 240 개 중 236 개가 미상이었다.
+                        const float ccell = (s.dataset == "kitti") ? 1.0f : 0.5f;
                         const auto t_lbl = std::chrono::steady_clock::now();
                         // 작업 반경. 자차가 지금 보고 있는 범위만 새로
                         // 분류하고 나머지는 이전 라벨을 재사용한다.
