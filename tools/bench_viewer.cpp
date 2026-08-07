@@ -2188,7 +2188,8 @@ void spark(cv::Mat& c, cv::Rect r, const std::vector<double>& v, int upto,
 // 매니페스트
 // ===========================================================================
 
-bool loadManifest(const fs::path& p, std::vector<Seq>& seqs) {
+bool loadManifest(const fs::path& p, std::vector<Seq>& seqs,
+                  bool drive_only) {
     std::ifstream f(p);
     if (!f) return false;
     std::map<std::string, std::size_t> idx;
@@ -2198,6 +2199,13 @@ bool loadManifest(const fs::path& p, std::vector<Seq>& seqs) {
         auto c = split(line, '\t');
         if (c.empty()) continue;
         if (c[0] == "SEQ" && c.size() >= 6) {
+            // **차량 주행 시퀀스만 싣는다.**
+            //
+            // 이 뷰어의 화면은 도로 장면을 전제로 맞춰져 있다 - 자차를 차로
+            // 그리고, 노면 텍스처를 깔고, 회랑을 외삽하고, 높이 상한을 지붕에
+            // 맞춘다. 손에 든 카메라로 방 안을 도는 TUM 을 같은 화면에 넣으면
+            // 그 전제가 전부 어긋난 그림이 나온다. --all 로 되돌릴 수 있다.
+            if (drive_only && c[2] != "kitti") continue;
             Seq s;
             s.name = c[1]; s.dataset = c[2]; s.dir = c[3]; s.gt_file = c[4];
             s.identity_ate_cm = toD(c[5]);
@@ -2343,6 +2351,8 @@ int main(int argc, char** argv) {
     bool autoplay = true;
     std::string shot_path;
     std::string dump_feat;
+    // 기본은 차량 주행 시퀀스만. --all 이면 전부 싣는다.
+    bool drive_only = true;
     int shot_frame = 0;
     // 복셀 상한. 넘으면 복셀을 키워 다시 합치므로 지도가 사라지지는
     // 않고 성겨진다. 260k 는 KITTI 00 에서 0.3 m -> 1.2 m 까지 두 번
@@ -2359,12 +2369,13 @@ int main(int argc, char** argv) {
         else if (k == "--frame") shot_frame = std::atoi(argv[i + 1]);
         else if (k == "--cloud-cap") cloud_cap = std::atoi(argv[i + 1]);
         else if (k == "--dump-features") dump_feat = argv[i + 1];
+        else if (k == "--all") drive_only = false;
         else if (k == "--cam") start_cam = std::atoi(argv[i + 1]);
     }
 
     const fs::path scene_dir = fs::path(manifest).parent_path();
     std::vector<Seq> seqs;
-    if (!loadManifest(manifest, seqs)) {
+    if (!loadManifest(manifest, seqs, drive_only)) {
         std::cerr <<
             "매니페스트를 읽지 못했다: " << manifest << "\n"
             "  python tools/bench_run.py     (두 시스템 실행 + 채점)\n"
@@ -3061,8 +3072,21 @@ int main(int argc, char** argv) {
                         // 시간: 세 번 이상, 서로 다른 두 시점 이상에서 봐야
                         // 인정한다. 유령은 한 시점에서만 재현되므로 이 조건이
                         // 공간 판정이 못 잡는 밀집 덩어리를 걷어낸다.
-                        if (sp.nbr < 3) continue;
-                        if (!sp.confirmed()) continue;
+                        // **기억이 없는 쪽에는 증거를 요구할 수 없다.**
+                        //
+                        // 시간 게이트는 "세 번, 두 시점" 을 요구하는데, 왼쪽
+                        // 패널은 설계상 매 프레임 지도를 비운다. 지워지는
+                        // 지도는 그 증거를 영영 못 쌓으므로 게이트가 패널을
+                        // 통째로 지워 버렸다 - 화면이 비는 것이 "ORB 가 아무
+                        // 것도 못 봤다" 로 읽히지만 사실은 내가 만든 조건이
+                        // 그 파이프라인에는 성립할 수 없었던 것이다.
+                        //
+                        // 누적하는 쪽에만 건다. 대조군을 불리하게 만드는 잣대는
+                        // 비교를 망가뜨린다.
+                        if (has_memory) {
+                            if (sp.nbr < 3) continue;
+                            if (!sp.confirmed()) continue;
+                        }
 
                         // **노면인가.** 라벨에 기대지 않는다 - 실내에서는
                         // 라벨의 대부분이 미상이라 노면 판정이 통째로 빠지고,
