@@ -585,6 +585,9 @@ struct Column {
     // 판별자가 틀렸는지 알아야 하기 때문이다.
     float planarity{0.0f}, linearity{0.0f}, scatter{0.0f};
     float vert{0.0f};        // 법선이 수평에 가까운 정도 (1 = 수직면)
+    // 구조 텐서가 준 평면 법선. 건물 벽면을 평면으로 그릴 때 쓴다 -
+    // 잡음을 펴는 것과 원래 평면인 것을 평면으로 그리는 것은 다르다.
+    Eigen::Vector3f normal{Eigen::Vector3f::Zero()};
     Stuff cls{Stuff::Unknown};
 
     // 최고 점유 칸. 이상치 하나에 그대로 끌려간다.
@@ -817,6 +820,7 @@ inline void labelScene(const std::unordered_map<std::int64_t, Splat>& cells,
         const Eigen::Vector3d nrm = es.eigenvectors().col(0).normalized();
         // 법선이 "위" 와 이루는 각. 수직면이면 법선이 수평이라 내적이 0 이다.
         c.vert = static_cast<float>(1.0 - std::abs(nrm.dot(g.up.cast<double>())));
+        c.normal = nrm.cast<float>();
         c.cls = classifyColumn(c);
     }
 
@@ -966,7 +970,9 @@ using DensField = std::unordered_map<std::int64_t, std::uint8_t>;
 
 inline DensField buildDensity(const std::unordered_map<std::int64_t, Splat>& cells,
                               float voxel, const Eigen::Vector3f& e, float r2,
-                              const Eigen::Vector3f& up, float hmin) {
+                              const Eigen::Vector3f& up, float hmin,
+                              const std::unordered_map<std::int64_t, Column>& labels,
+                              const GroundGrid& lg) {
     DensField d;
     d.reserve(cells.size() * 3);
     const float inv = 1.0f / voxel;
@@ -976,6 +982,18 @@ inline DensField buildDensity(const std::unordered_map<std::int64_t, Splat>& cel
         // 같은 것을 메시로 또 만들면, 평평해야 할 노면이 스테레오 잡음을 따라
         // 울퉁불퉁한 바위 덩어리가 된다 - 실제로 그렇게 나왔다.
         if (v.p.dot(up) < hmin) continue;
+        // **라벨이 구조물인 칸만 메시로 만든다.**
+        //
+        // 도로 한가운데 떠 있던 회색 암석 덩어리는 라벨이 미상인 잡음이었다.
+        // 미상은 "점이 부족해 판정을 못 했다" 이므로 구조물이라는 근거가 없고,
+        // 근거 없는 것을 표면으로 만들면 없는 바위가 생긴다. 분류가 이미
+        // 끝나 있으니 그 답을 쓰면 된다.
+        {
+            const auto lit = labels.find(lg.key(v.p));
+            if (lit == labels.end()) continue;
+            const Stuff sc = lit->second.cls;
+            if (sc == Stuff::Unknown || sc == Stuff::Ground) continue;
+        }
         for (int dx = -1; dx <= 1; ++dx) {
             for (int dy = -1; dy <= 1; ++dy) {
                 for (int dz = -1; dz <= 1; ++dz) {
@@ -1003,7 +1021,9 @@ inline float sdfAt(const DensField& dens, const Eigen::Vector3f& p,
 inline void surfaceNets(const std::unordered_map<std::int64_t, Splat>& cells,
                         float voxel, const Eigen::Vector3d& ego, double radius,
                         const Eigen::Vector3d& up_d, double ground_h,
-                        double min_above, SurfMesh& out) {
+                        double min_above,
+                        const std::unordered_map<std::int64_t, Column>& labels,
+                        const GroundGrid& lg, SurfMesh& out) {
     out.clear();
     if (cells.empty()) return;
     const float inv = 1.0f / voxel;
@@ -1013,7 +1033,8 @@ inline void surfaceNets(const std::unordered_map<std::int64_t, Splat>& cells,
     // 밀도장을 먼저 한 패스로 만든다. 이후 모든 조회가 O(1) 이 된다.
     const Eigen::Vector3f upf = up_d.cast<float>().normalized();
     const float hmin = static_cast<float>(ground_h + min_above);
-    const DensField dens = buildDensity(cells, voxel, e, r2, upf, hmin);
+    const DensField dens = buildDensity(cells, voxel, e, r2, upf, hmin,
+                                        labels, lg);
 
     // 셀 -> 정점 인덱스. 셀마다 정점 하나이므로 중복 제거가 필요 없다.
     std::unordered_map<std::int64_t, int> vidx;
@@ -1025,6 +1046,12 @@ inline void surfaceNets(const std::unordered_map<std::int64_t, Splat>& cells,
     for (const auto& [k, v] : cells) {
         if ((v.p - e).squaredNorm() > r2) continue;
         if (v.p.dot(upf) < hmin) continue;      // 노면 제외
+        {
+            const auto lit = labels.find(lg.key(v.p));
+            if (lit == labels.end()) continue;
+            const Stuff sc = lit->second.cls;
+            if (sc == Stuff::Unknown || sc == Stuff::Ground) continue;
+        }
         // **표면 복셀만 후보로 삼는다.**
         //
         // 복셀마다 여덟 칸을 후보로 넣으면 70 만 복셀에서 후보가 560 만 개가
@@ -2097,15 +2124,53 @@ public:
             const float half = cell * 0.5f;
 
             if (c.cls == Stuff::Building) {
-                // 건물: 지면부터 꼭대기까지 속이 찬 덩어리. 벽면이 덩어리가
-                // 되어야 건물로 읽힌다.
+                // **건물은 평면으로 그린다.**
+                //
+                // 벽면은 원래 평면이다. 일반 아이소서피스는 스테레오 잡음을
+                // 그대로 표면으로 옮기므로 벽이 각진 바위가 되는데, 이미
+                // 구조 텐서에서 그 칸의 **법선** 을 구해 두었으므로 그 법선에
+                // 수직인 평면 조각을 세우면 잡음과 무관하게 평평한 벽이 된다.
+                //
+                // 잡음을 매끄럽게 만드는 것과, 애초에 평면인 것을 평면으로
+                // 그리는 것은 다른 이야기다. 후자가 여기서는 맞다.
+                Eigen::Vector3f n = c.normal;
+                // 법선을 지면에 눕힌다. 벽은 수직이므로 법선은 수평이어야 한다.
+                n -= up * n.dot(up);
+                if (n.norm() > 1e-3f) {
+                    n.normalize();
+                    const Eigen::Vector3f tang = up.cross(n).normalized();
+                    const Eigen::Vector3f mid = 0.5f * (c.rep + foot);
+                    const Eigen::Vector3f q[4] = {
+                        mid - tang * half - up * (h * 0.5f),
+                        mid + tang * half - up * (h * 0.5f),
+                        mid + tang * half + up * (h * 0.5f),
+                        mid - tang * half + up * (h * 0.5f)};
+                    cv::Point pp[4];
+                    bool ok2 = true;
+                    for (int i = 0; i < 4 && ok2; ++i) {
+                        ok2 = project3(q[i].cast<double>(), orb, f, pp[i]);
+                    }
+                    if (ok2) {
+                        const double ww = std::max({std::abs(pp[0].x - pp[2].x),
+                                                    std::abs(pp[0].y - pp[2].y)});
+                        if (ww < img_.cols * 0.5) {
+                            // 법선이 시선을 향할수록 밝다. 벽의 방향이 색으로 읽힌다.
+                            const Eigen::Vector3d fwd = orb.basis().row(2).transpose();
+                            const double lam = 0.45 + 0.55 * std::abs(
+                                n.cast<double>().dot(fwd));
+                            cv::fillConvexPoly(img_, pp, 4,
+                                cv::Scalar(col[0] * lam, col[1] * lam, col[2] * lam),
+                                cv::LINE_AA);
+                        }
+                    }
+                    continue;   // 평면을 그렸으면 이웃 면은 그리지 않는다
+                }
+                // 법선이 수평이 아니면 평면으로 볼 수 없다. 덩어리로 남긴다.
                 solidBox((0.5 * (c.rep + foot)).cast<double>(),
                          (g.a * half).cast<double>(),
                          (up * (h * 0.5f)).cast<double>(),
                          (g.b * half).cast<double>(),
                          orb, f, col, 1.0);
-                // continue 하지 않는다 - 아래에서 이웃과의 면을 마저 채워야
-                // 덩어리 사이의 틈이 메워지고 벽이 이어져 보인다.
             }
             if (c.cls == Stuff::Fence) {
                 // 담장: 낮고 얇은 판. 건물과 같은 형태로 그리면 구분이 사라진다.
@@ -3480,7 +3545,7 @@ int main(int argc, char** argv) {
                         // 도로는 밝기 텍스처가 이미 맡고 있다.
                         surfaceNets(acc[k].cells, acc[k].voxel, ego_k,
                                     std::min(map_r, 22.0), ob.world_up,
-                                    plane_h, 0.40, surf[k]);
+                                    plane_h, 0.40, stuff[k], gg, surf[k]);
                         surf_at[k] = ego_k;
                     }
                     cloud[k].surface(surf[k], ob, vp.width * 0.9,
