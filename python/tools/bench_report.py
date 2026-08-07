@@ -289,9 +289,9 @@ The only difference is how a proposed loop is verified.</p>
 
 <script>
 const DATA = __DATA__;
-const SY = {baseline:{label:"ORB + PnP (classical)",c:"var(--s1)",short:"ORB+PnP"},
-            wme:{label:"WME ECDA (Tier 0)",c:"var(--s2)",short:"WME"},
-            wme_masked:{label:"WME + token mask",c:"var(--s3)",short:"WME+mask"}};
+const SY = {baseline:{label:"Classical SLAM  /  ORB + PnP",c:"var(--s1)",short:"ORB+PnP"},
+            wme:{label:"WorldVision  /  WME Tier 0",c:"var(--s2)",short:"WME"},
+            wme_masked:{label:"WorldVision  /  + token mask",c:"var(--s3)",short:"WME+mask"}};
 const KEYS = ["baseline","wme","wme_masked"];
 const tt = document.getElementById("tt");
 const NS = "http://www.w3.org/2000/svg";
