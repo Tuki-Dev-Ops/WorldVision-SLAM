@@ -138,6 +138,22 @@ struct Run {
     std::vector<double> err_cm;             // 프레임별 ATE 오차 (bench_run.py 계산)
 };
 
+// 의미 구조. wme_scene_export 가 만든 파일에서 읽는다. 좌표는 카메라계이므로
+// 뷰어가 각 시스템의 추정 포즈로 옮긴다 - 같은 관측이 두 시스템에서 어디로
+// 가는지가 곧 드리프트다.
+struct ScenePlane {
+    int frame{0};
+    Eigen::Vector3d normal{Eigen::Vector3d::UnitZ()}, centroid{Eigen::Vector3d::Zero()};
+    double extent{0.0}, conf{0.0};
+};
+
+struct SceneBox {
+    int frame{0};
+    std::string cls;
+    double conf{0.0};
+    Eigen::Vector3d center{Eigen::Vector3d::Zero()}, size{Eigen::Vector3d::Ones()};
+};
+
 struct Seq {
     std::string name, dataset, dir, gt_file;
     double identity_ate_cm{std::nan("")};
@@ -146,6 +162,8 @@ struct Seq {
     std::map<std::string, Run> runs;
     std::vector<std::string> systems;       // 표시 순서 고정
     wme_tools::DatasetCalib calib;
+    std::vector<ScenePlane> planes;
+    std::vector<SceneBox>   boxes;
     bool loaded{false};
 };
 
@@ -355,6 +373,41 @@ public:
         cv::line(img_, pa, pb, col, th, cv::LINE_AA);
     }
 
+    // 3D 상자 (차량/사람). 12 개 모서리를 그린다.
+    void box3(const Eigen::Isometry3d& T, const Eigen::Vector3d& c,
+              const Eigen::Vector3d& s, const Orbit& orb, double f,
+              const cv::Scalar& col, int th = 1) {
+        const Eigen::Vector3d h = 0.5 * s;
+        Eigen::Vector3d v[8];
+        int k = 0;
+        for (int sx = -1; sx <= 1; sx += 2)
+            for (int sy = -1; sy <= 1; sy += 2)
+                for (int sz = -1; sz <= 1; sz += 2)
+                    v[k++] = T * (c + Eigen::Vector3d(sx * h.x(), sy * h.y(), sz * h.z()));
+        // 위 루프의 비트 순서: idx = (sx+1)/2*4 + (sy+1)/2*2 + (sz+1)/2
+        static const int E[12][2] = {{0,1},{0,2},{0,4},{1,3},{1,5},{2,3},
+                                     {2,6},{3,7},{4,5},{4,6},{5,7},{6,7}};
+        for (const auto& e : E) line3(v[e[0]], v[e[1]], orb, f, col, th);
+    }
+
+    // 평면 사각형 (건물 벽 / 지면 / 상판). 법선에 수직한 두 축으로 폭을 만든다.
+    void planeQuad(const Eigen::Isometry3d& T, const Eigen::Vector3d& c,
+                   const Eigen::Vector3d& n, double half, const Orbit& orb,
+                   double f, const cv::Scalar& col) {
+        Eigen::Vector3d a = n.cross(Eigen::Vector3d::UnitY());
+        if (a.norm() < 1e-6) a = n.cross(Eigen::Vector3d::UnitX());
+        a.normalize();
+        const Eigen::Vector3d b = n.cross(a).normalized();
+        const Eigen::Vector3d q[4] = {
+            T * (c + (a + b) * half), T * (c + (a - b) * half),
+            T * (c - (a + b) * half), T * (c - (a - b) * half)};
+        for (int i = 0; i < 4; ++i) line3(q[i], q[(i + 1) % 4], orb, f, col, 1);
+        // 대각선은 긋지 않는다. 화면에서는 면의 표시가 아니라 장면을 가로지르는
+        // 긴 선으로 읽혀서, 있지도 않은 구조를 보태는 것처럼 보인다.
+        // 법선을 짧게 세워 방향만 표시한다 - 벽인지 바닥인지는 그것으로 갈린다.
+        line3(T * c, T * (c + n * (half * 0.35)), orb, f, col, 1);
+    }
+
     // 자차 주변 거리 링. 점군만 있으면 크기를 알 수 없다 - 라이다 시각화가
     // 늘 이 링을 그리는 이유이고, 여기서는 그것이 곧 축척이다.
     void rangeRings(const Eigen::Vector3d& at, const Eigen::Vector3d& up,
@@ -491,6 +544,38 @@ bool loadManifest(const fs::path& p, std::vector<Seq>& seqs) {
     return !seqs.empty();
 }
 
+// wme_scene_export 의 출력. 없으면 조용히 비운다 - 의미 구조는 선택 사항이고,
+// 없다는 사실 자체는 화면에 "scene: none" 으로 적는다.
+void loadScene(Seq& s, const fs::path& dir) {
+    const fs::path p = dir / ("scene_" + s.name + ".tsv");
+    std::ifstream f(p);
+    if (!f) return;
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        auto c = split(line, '\t');
+        if (c[0] == "PLANE" && c.size() >= 13) {
+            ScenePlane q;
+            q.frame = std::atoi(c[1].c_str());
+            q.normal = {toD(c[2]), toD(c[3]), toD(c[4])};
+            q.centroid = {toD(c[6]), toD(c[7]), toD(c[8])};
+            q.extent = toD(c[9]);
+            q.conf = toD(c[12]);
+            s.planes.push_back(q);
+        } else if (c[0] == "BOX" && c.size() >= 10) {
+            SceneBox b;
+            b.frame = std::atoi(c[1].c_str());
+            b.cls = c[2];
+            b.conf = toD(c[3]);
+            b.center = {toD(c[4]), toD(c[5]), toD(c[6])};
+            b.size = {toD(c[7]), toD(c[8]), toD(c[9])};
+            s.boxes.push_back(b);
+        }
+    }
+    std::cout << p.filename().string() << ": 평면 " << s.planes.size()
+              << ", 상자 " << s.boxes.size() << "\n";
+}
+
 void loadSeq(Seq& s) {
     if (s.loaded) return;
     s.gt = readTum(s.gt_file);
@@ -565,6 +650,7 @@ int main(int argc, char** argv) {
         else if (k == "--cloud-cap") cloud_cap = std::atoi(argv[i + 1]);
     }
 
+    const fs::path scene_dir = fs::path(manifest).parent_path();
     std::vector<Seq> seqs;
     if (!loadManifest(manifest, seqs)) {
         std::cerr <<
@@ -602,7 +688,9 @@ int main(int argc, char** argv) {
 
     while (true) {
         Seq& s = seqs[static_cast<std::size_t>(si)];
+        const bool first_load = !s.loaded;
         loadSeq(s);
+        if (first_load) loadScene(s, scene_dir);
         if (s.systems.empty()) { si = (si + 1) % static_cast<int>(seqs.size()); continue; }
         for (int k = 0; k < 2; ++k) {
             pick[k] = std::clamp(pick[k], 0, static_cast<int>(s.systems.size()) - 1);
@@ -771,6 +859,71 @@ int main(int argc, char** argv) {
                                    run.aligned[static_cast<std::size_t>(i)].translation(),
                                    orb, f3, accent, 2);
                 }
+                // --- 의미 구조 ---
+                // 평면(건물 벽/지면)과 물체 상자(차량/사람)를 **이 시스템의
+                // 추정 포즈** 로 옮겨 그린다. 같은 관측이므로 두 패널의 차이는
+                // 곧 포즈 차이다 - 점군보다 훨씬 읽기 쉽다.
+                if (upto > 0 && (!s.planes.empty() || !s.boxes.empty())) {
+                    const Eigen::Isometry3d& T = run.aligned[static_cast<std::size_t>(upto - 1)];
+
+                    // **지금 프레임 하나만** 그린다. 여러 프레임을 겹쳐 그리면
+                    // 같은 차가 궤적을 따라 줄줄이 늘어서서 장면이 뭉개진다 -
+                    // 누적 표현은 점군이 이미 하고 있고, 상자는 "지금 무엇이
+                    // 보이는가" 를 말해야 한다.
+                    //
+                    // scene 파일은 stride 로 듬성듬성하므로 가장 가까운
+                    // 내보내진 프레임으로 스냅한다.
+                    int snap = -1, best = 1 << 30;
+                    for (const auto& b : s.boxes) {
+                        const int d = std::abs(b.frame - frame);
+                        if (d < best) { best = d; snap = b.frame; }
+                    }
+                    for (const auto& q : s.planes) {
+                        const int d = std::abs(q.frame - frame);
+                        if (d < best) { best = d; snap = q.frame; }
+                    }
+
+                    // 상자/평면은 **snap 프레임의 카메라 좌표계** 에 있다.
+                    // 현재 프레임의 포즈로 옮기면 그 사이 이동만큼 어긋난다
+                    // (stride 4, 프레임당 1.4 m 면 최대 3 m). 관측이 놓인
+                    // 자리를 틀리게 그리면 드리프트를 보여 주려던 그림이
+                    // 스스로 드리프트를 만든다.
+                    Eigen::Isometry3d Tsnap = T;
+                    if (snap >= 0 && snap < static_cast<int>(s.rgb.size())) {
+                        const double st = s.rgb[static_cast<std::size_t>(snap)].first;
+                        double bd = 0.25;
+                        for (std::size_t j = 0; j < run.traj.size(); ++j) {
+                            const double d = std::abs(run.traj[j].t - st);
+                            if (d < bd) { bd = d; Tsnap = run.aligned[j]; }
+                        }
+                    }
+
+                    if (snap >= 0) {
+                        for (const auto& q : s.planes) {
+                            if (q.frame != snap || q.conf < 0.25) continue;
+                            // extent 는 평면 위 점들의 **평균 산포** 다. 그대로
+                            // 반지름으로 쓰면 실제 패치보다 훨씬 커 보인다.
+                            const double half = std::clamp(q.extent, 0.3, 5.0);
+                            cloud[k].planeQuad(Tsnap, q.centroid, q.normal, half, orb, f3,
+                                               cv::Scalar(122, 100, 82));
+                        }
+                        for (const auto& b : s.boxes) {
+                            if (b.frame != snap) continue;
+                            // 물리적으로 말이 되는 크기만. 검출 상자 안이 배경이면
+                            // 깊이 중앙값이 엉뚱해져 50 m 짜리 자동차가 나온다.
+                            const double mx = b.size.maxCoeff();
+                            if (!(mx > 0.2) || mx > 14.0) continue;
+                            const bool vehicle = (b.cls == "car" || b.cls == "truck" ||
+                                                  b.cls == "bus" || b.cls == "motorcycle" ||
+                                                  b.cls == "bicycle" || b.cls == "train");
+                            const bool person = (b.cls == "person");
+                            const cv::Scalar col = vehicle ? accent
+                                                 : (person ? C_WARN : C_INK3);
+                            cloud[k].box3(Tsnap, b.center, b.size, orb, f3, col, 2);
+                        }
+                    }
+                }
+
                 // 현재 카메라 프러스텀
                 if (upto > 0) {
                     const Eigen::Isometry3d& T = run.aligned[static_cast<std::size_t>(upto - 1)];
@@ -813,7 +966,8 @@ int main(int argc, char** argv) {
 
             // 범례. 점군 위에 그냥 얹으면 배경색이 제각각이라 읽히지 않는다.
             {
-                const cv::Rect scrim(vp.x, vp.y, 430, 74);
+                const cv::Rect scrim(vp.x, vp.y, 470,
+                                     (s.boxes.empty() && s.planes.empty()) ? 74 : 94);
                 cv::Mat roi = canvas(scrim & cv::Rect(0, 0, canvas.cols, canvas.rows));
                 roi *= 0.35;
                 label(canvas, "ground truth", {vp.x + 14, vp.y + 24}, C_GT, T_MICRO, 1);
@@ -821,6 +975,11 @@ int main(int argc, char** argv) {
                       {vp.x + 14, vp.y + 44}, accent, T_MICRO, 1);
                 label(canvas, "cloud = depth back-projected by this system's pose",
                       {vp.x + 14, vp.y + 64}, C_INK2, T_MICRO, 1);
+                if (!s.boxes.empty() || !s.planes.empty()) {
+                    std::ostringstream ss;
+                    ss << "boxes = detected objects (tier 1)   quads = planes (tier 2)";
+                    label(canvas, ss.str(), {vp.x + 14, vp.y + 84}, C_INK3, T_MICRO, 1);
+                }
             }
 
             // ---- 지표 ----

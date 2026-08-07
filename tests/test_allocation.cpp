@@ -169,13 +169,30 @@ struct AllocScope {
 //   std::vector 를 잡으므로 0 이 될 수 없다 - 우리 코드를 아무리 고쳐도.
 //
 // 그래서 요구사항(01-architecture.md 7.2, "핫패스 할당 0")은 **우리 코드**에
-// 대한 것이고, OpenCV 를 거치는 경로에서는 "프레임 수에 비례해 늘지 않는다"
-// 로 검사한다. 그 편이 실제로 지키려는 성질에 더 가깝다.
+// 대한 것이고, OpenCV 를 거치는 경로에서는 "프레임당 할당이 **늘지 않는다**"
+// 로 검사한다.
+//
+// 왜 "같다" 가 아니라 "늘지 않는다" 인가. 실측하면 두 번째 배치에서 값이
+// 떨어진다 - EnvironmentAnalyzer 는 프레임당 132 -> 0, DirectAligner(품질맵)는
+// 33 -> 11. 즉 첫 배치의 몫은 버퍼가 정상 크기에 도달하는 **예열 비용**이고,
+// 정상 상태에서는 그만큼 들지 않는다. 예열은 요구사항 위반이 아니다. 위반은
+// 프레임을 더 돌릴수록 할당이 **늘어나는** 것이고, 그것만 잡으면 된다.
 #if defined(_MSC_VER)
 constexpr bool kCounterSeesThirdParty = false;
 #else
 constexpr bool kCounterSeesThirdParty = true;
 #endif
+
+// 정상 상태 할당이 예열 구간보다 늘지 않았는지. 늘었다면 버퍼가 자라고 있다.
+void expectNoAllocationGrowth(const char* what, double per_warm, double per_steady) {
+    EXPECT_LE(per_steady, per_warm + std::max(1.0, 0.05 * per_warm))
+        << what << ": 프레임당 할당이 " << per_warm << " -> " << per_steady
+        << " 로 늘었다 - 재사용 버퍼가 자라고 있다";
+    // 정상 상태 값 자체도 기록해 둔다. 0 이 아니어도 되지만, 조용히 커지면
+    // 위 검사만으로는 몇 배가 되어도 통과한다.
+    std::printf("  %-42s 정상상태 %.1f new/frame (예열 %.1f)\n",
+                what, per_steady, per_warm);
+}
 
 void report(const char* what, std::uint64_t n, std::uint64_t wme, std::uint64_t bytes,
             std::uint64_t mats) {
@@ -314,11 +331,9 @@ TEST(AllocationHotPath, DirectAlignerWithQualityAndMask) {
         for (int i = 0; i < 2 * kFrames; ++i) {
             (void)aligner.align(scene.ref, scene.cur, SE3::identity(), &q, &envs);
         }
-        const double per1 = static_cast<double>(s.news()) / kFrames;
-        const double per2 = static_cast<double>(s2.news()) / (2 * kFrames);
-        EXPECT_NEAR(per2, per1, std::max(1.0, 0.05 * per1))
-            << "프레임당 할당이 일정하지 않다 - 재사용 버퍼가 자라고 있다 "
-            << "(" << per1 << " -> " << per2 << ")";
+        expectNoAllocationGrowth("DirectAligner (quality+mask)",
+                                 static_cast<double>(s.news()) / kFrames,
+                                 static_cast<double>(s2.news()) / (2 * kFrames));
     }
 }
 
@@ -431,10 +446,9 @@ TEST(AllocationHotPath, ImageQualityEvaluate) {
         for (int i = 0; i < 2 * kFrames; ++i) {
             (void)iq.evaluate(frames[static_cast<std::size_t>(70 + (i % kFrames))]);
         }
-        const double per1 = static_cast<double>(warm_news) / kFrames;
-        const double per2 = static_cast<double>(s3.news()) / (2 * kFrames);
-        EXPECT_NEAR(per2, per1, std::max(1.0, 0.05 * per1))
-            << "프레임당 할당이 일정하지 않다 (" << per1 << " -> " << per2 << ")";
+        expectNoAllocationGrowth("ImageQualityEngine::evaluate",
+                                 static_cast<double>(warm_news) / kFrames,
+                                 static_cast<double>(s3.news()) / (2 * kFrames));
     }
 }
 
@@ -484,9 +498,8 @@ TEST(AllocationHotPath, EnvironmentAnalyzerUpdate) {
             const std::size_t j = 30 + static_cast<std::size_t>(i % kFrames);
             (void)env.update(frames[j], quality[j]);
         }
-        const double per1 = static_cast<double>(warm) / kFrames;
-        const double per2 = static_cast<double>(s2.news()) / (2 * kFrames);
-        EXPECT_NEAR(per2, per1, std::max(1.0, 0.05 * per1))
-            << "프레임당 할당이 일정하지 않다 (" << per1 << " -> " << per2 << ")";
+        expectNoAllocationGrowth("EnvironmentAnalyzer::update",
+                                 static_cast<double>(warm) / kFrames,
+                                 static_cast<double>(s2.news()) / (2 * kFrames));
     }
 }
