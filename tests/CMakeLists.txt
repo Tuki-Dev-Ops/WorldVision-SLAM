@@ -1,5 +1,23 @@
 include(GoogleTest)
 
+# 테스트 시간 상한.
+#
+# 180 은 최적화된 빌드에서 잰 값이다. 새니타이저 + Debug 조합에서는 같은
+# 코드가 10 배 가까이 느려진다 (실측: ECDA 정렬 12 초 -> 172 초). 같은 숫자를
+# 그대로 쓰면 재는 것이 알고리즘이 아니라 계측 오버헤드가 된다.
+#
+# **명령줄에서는 못 고친다.** `ctest --timeout` 은 TIMEOUT 속성이 **없는**
+# 테스트의 기본값일 뿐이라, 아래에서 속성을 붙이는 순간 무시된다.
+# sanitizers.yml 의 `--timeout 900` 은 그래서 아무 일도 하지 않았고,
+# DirectAligner.PyramidDepthExtendsConvergenceRadius 는 900 이 아니라
+# 180.13 초에 죽었다 - 죽은 손잡이를 돌리고 있었던 것이다.
+if(WME_ASAN)
+    set(WME_TEST_TIMEOUT 900)
+else()
+    set(WME_TEST_TIMEOUT 180)
+endif()
+message(STATUS "테스트 시간 상한: ${WME_TEST_TIMEOUT} 초 (WME_ASAN=${WME_ASAN})")
+
 function(wme_add_test name)
     cmake_parse_arguments(ARG "" "" "SOURCES;DEPS" ${ARGN})
     add_executable(${name} ${ARG_SOURCES})
@@ -11,7 +29,7 @@ function(wme_add_test name)
     gtest_discover_tests(${name}
         DISCOVERY_MODE PRE_TEST
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
-        PROPERTIES TIMEOUT 180 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+        PROPERTIES TIMEOUT ${WME_TEST_TIMEOUT} WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 endfunction()
 
 # OpenCV 없이도 도는 테스트. SE3 규약과 헝가리안이 여기서 검증된다 -

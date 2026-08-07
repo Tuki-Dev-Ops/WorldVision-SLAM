@@ -108,8 +108,12 @@ jobs:
       - name: Build
         run: cmake --build build/asan
 
-      # Timeouts are 180 s in tests/CMakeLists.txt; ASan is roughly 2-3x slower,
-      # and ECDA is the one that gets close, hence the generous ctest timeout.
+      # Per-test timeouts come from tests/CMakeLists.txt, which raises them to
+      # 900 s when WME_ASAN=ON. They cannot be raised from here: `ctest
+      # --timeout` only supplies a default for tests that carry no TIMEOUT
+      # property, and every test here carries one. This job previously passed
+      # `--timeout 900` and it did nothing - PyramidDepthExtendsConvergenceRadius
+      # died at 180.13 s, not 900. The knob was disconnected.
       #
       # Leak detection is on for the minimal run - wme_math owns the thread pool
       # and its global instance is the one place a leak would be ours. It is off
@@ -124,5 +128,4 @@ jobs:
           else
             export ASAN_OPTIONS=detect_leaks=1:strict_string_checks=1:detect_stack_use_after_return=1
           fi
-          ctest --test-dir build/asan --output-on-failure --no-tests=error \
-                --timeout 900
+          ctest --test-dir build/asan --output-on-failure --no-tests=error
