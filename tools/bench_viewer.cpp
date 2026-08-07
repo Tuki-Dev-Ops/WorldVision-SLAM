@@ -69,6 +69,10 @@ namespace {
 // ===========================================================================
 // OpenCV 는 BGR 이다. 아래 주석의 #RRGGBB 가 진짜 값이고 Scalar 는 그 BGR 배열.
 const cv::Scalar C_BG      ( 16,  12,  10);   // #0A0C10
+// 3D 뷰포트는 **순수 검정** 이다. 라이다 지도가 늘 검은 바탕인 것은
+// 취향이 아니라 대비 때문이다 - 어두운 남색 위에서는 낮은 밝기의 점이
+// 배경에 묻혀, 성긴 곳과 아무 것도 없는 곳이 구분되지 않는다.
+const cv::Scalar C_VOID    (  0,   0,   0);
 const cv::Scalar C_PANEL   ( 29,  22,  18);   // #12161D
 const cv::Scalar C_RAISED  ( 41,  32,  26);   // #1A2029
 const cv::Scalar C_LINE    ( 54,  43,  35);   // #232B36
@@ -429,6 +433,7 @@ inline cv::Scalar stuffColor(Stuff s) {
 //
 // 나무와 건물을 가르는 것은 **프로파일에 구멍이 있는가** 이고, 그것은 개수가
 // 아니라 어느 높이가 찼는지를 알아야 나온다. 0.5 m 씩 32 칸, 지면 위 16 m.
+constexpr double kPiV = 3.14159265358979323846;
 constexpr float kBinH = 0.5f;
 constexpr int   kBins = 32;
 
@@ -937,11 +942,98 @@ public:
             img_.create(h, w, CV_8UC3);
             zbuf_.create(h, w, CV_32F);
         }
-        img_.setTo(C_BG);
+        img_.setTo(C_VOID);
         zbuf_.setTo(std::numeric_limits<float>::max());
     }
 
     // 화면에 투영. f 는 초점거리(px), 카메라는 orbit 중심을 바라본다.
+    // 복셀을 **속이 찬 육면체** 로 그린다. OctoMap / RViz 가 보여 주는 그 그림이다.
+    //
+    // 점으로 찍으면 같은 지도가 성기게 보인다. 복셀은 부피를 가진 칸인데 그
+    // 중심 하나만 찍으면 칸과 칸 사이가 빈 것처럼 읽히고, 벽이 벽으로 보이지
+    // 않는다. 칸을 칸 크기대로 채우면 그 순간 면이 된다 - 데이터는 그대로이고
+    // 그리는 방법만 바뀐 것인데, 있는 것을 있는 크기로 그린 쪽이 맞다.
+    //
+    // 면마다 밝기를 달리한다. 단색으로 채우면 육면체가 육각형 얼룩이 되어
+    // 입체가 사라진다. 윗면을 밝게, 옆면을 어둡게 하면 같은 색으로도 깊이가
+    // 읽힌다 - 조명 계산이 아니라 면의 방향을 색으로 옮기는 것이다.
+    void voxelCubes(const std::vector<Splat>& pts, float voxel, const Orbit& orb,
+                    double f, const Eigen::Vector3d& up, double fade) {
+        const Eigen::Matrix3d M = orb.basis();
+        const Eigen::Vector3d eye = orb.center - M.row(2).transpose() * orb.dist;
+        const double cx = img_.cols * 0.5, cy = img_.rows * 0.5;
+        const double h = 0.5 * voxel;
+
+        // 화면 좌표 + 카메라 깊이
+        auto proj = [&](const Eigen::Vector3d& p, cv::Point& out, double& z) {
+            const Eigen::Vector3d v = M * (p - eye);
+            z = v.z();
+            if (z < 1e-3) return false;
+            out = {static_cast<int>(cx + f * v.x() / z),
+                   static_cast<int>(cy - f * v.y() / z)};
+            return true;
+        };
+
+        // 뒤에서 앞으로 그린다. 화가 알고리즘이면 z 버퍼 없이도 가려짐이
+        // 맞아떨어지고, 폴리곤마다 픽셀 깊이를 검사하는 것보다 훨씬 싸다.
+        // 정렬은 버킷으로 한다 - 20 만 개를 완전정렬할 이유가 없다.
+        struct Item { const Splat* s; double z; };
+        std::vector<Item> vis;
+        vis.reserve(pts.size());
+        for (const auto& s : pts) {
+            const Eigen::Vector3d v = M * (s.p.cast<double>() - eye);
+            if (v.z() < 1e-3) continue;
+            // 화면에서 2 px 도 안 되는 칸은 큐브로 그릴 이유가 없다.
+            const double px = f * voxel / v.z();
+            // 화면에서 작아지는 칸은 큐브로 그릴 값이 없다. 점은 이미
+            // 깔려 있으므로 사라지지 않는다.
+            if (px < 2.0) continue;
+            const double u = cx + f * v.x() / v.z(), w = cy - f * v.y() / v.z();
+            if (u < -px || w < -px || u > img_.cols + px || w > img_.rows + px) continue;
+            vis.push_back({&s, v.z()});
+        }
+        std::sort(vis.begin(), vis.end(),
+                  [](const Item& a, const Item& b) { return a.z > b.z; });
+
+        // 복셀 격자의 세 축. 월드 축을 그대로 쓰면 큐브가 지면과 어긋나 보인다.
+        Eigen::Vector3d ax = up.normalized();
+        Eigen::Vector3d a1 = ax.cross(Eigen::Vector3d::UnitZ());
+        if (a1.norm() < 1e-6) a1 = ax.cross(Eigen::Vector3d::UnitX());
+        a1.normalize();
+        const Eigen::Vector3d a2 = ax.cross(a1).normalized();
+
+        // 카메라를 향한 세 면만 그린다. 나머지 셋은 어차피 가려진다.
+        for (const auto& it : vis) {
+            const Eigen::Vector3d c = it.s->p.cast<double>();
+            const Eigen::Vector3d to_eye = (eye - c);
+            cv::Scalar base = turbo(it.s->depth_norm);
+            const double age_a = 1.0 - fade * static_cast<double>(it.s->age);
+
+            // 축마다 카메라 쪽 면을 고른다.
+            const Eigen::Vector3d axes[3] = {ax, a1, a2};
+            const double shade[3] = {1.00, 0.72, 0.55};   // 윗면 / 옆면 / 옆면
+            for (int k = 0; k < 3; ++k) {
+                const double sgn = (to_eye.dot(axes[k]) >= 0.0) ? 1.0 : -1.0;
+                const Eigen::Vector3d n = axes[k] * sgn;
+                const Eigen::Vector3d u1 = axes[(k + 1) % 3] * h;
+                const Eigen::Vector3d u2 = axes[(k + 2) % 3] * h;
+                const Eigen::Vector3d fc = c + n * h;
+                const Eigen::Vector3d q[4] = {fc - u1 - u2, fc + u1 - u2,
+                                              fc + u1 + u2, fc - u1 + u2};
+                cv::Point poly[4];
+                bool ok = true;
+                double zz;
+                for (int i = 0; i < 4 && ok; ++i) ok = proj(q[i], poly[i], zz);
+                if (!ok) continue;
+                const double a = age_a * shade[k];
+                const cv::Scalar col{base[0] * a + C_VOID[0] * (1 - a),
+                                     base[1] * a + C_VOID[1] * (1 - a),
+                                     base[2] * a + C_VOID[2] * (1 - a)};
+                cv::fillConvexPoly(img_, poly, 4, col, cv::LINE_8);
+            }
+        }
+    }
+
     void draw(const std::vector<Splat>& pts, const Orbit& orb, double f,
               double fade) {
         const Eigen::Matrix3d M = orb.basis();
@@ -962,9 +1054,9 @@ public:
             cv::Scalar col = turbo(s.depth_norm);
             // 오래된 점은 배경으로 가라앉힌다 - 최신 관측이 앞에 오게.
             const double a = 1.0 - fade * static_cast<double>(s.age);
-            col = {col[0] * a + C_BG[0] * (1 - a),
-                   col[1] * a + C_BG[1] * (1 - a),
-                   col[2] * a + C_BG[2] * (1 - a)};
+            col = {col[0] * a + C_VOID[0] * (1 - a),
+                   col[1] * a + C_VOID[1] * (1 - a),
+                   col[2] * a + C_VOID[2] * (1 - a)};
 
             for (int dy = -r; dy <= r; ++dy) {
                 const int y = iw + dy;
@@ -1106,8 +1198,35 @@ public:
     // 것은 결과대로 색을 바꾼다 - 맞은 예측과 틀린 예측이 자리째로 보인다.
     void predictions(const std::unordered_map<std::int64_t, Prediction>& preds,
                      const Eigen::Vector3d& up, const Orbit& orb, double f,
-                     const Eigen::Vector3d& ego, double draw_radius) {
+                     const Eigen::Vector3d& ego, double draw_radius, float cell) {
         const double r2 = draw_radius * draw_radius;
+        const GroundGrid g(up.cast<float>(), cell);
+
+        // **예측도 면으로 잇는다.**
+        //
+        // 관측만 사각형으로 잇고 예측은 낱개 세로 파선으로 두었더니, 예측이
+        // 공간이 아니라 울타리 말뚝처럼 보였다. 예측한 것도 벽이고 나무줄이면
+        // 이어져 있어야 그 모양이 읽힌다.
+        //
+        // 다만 **선의 종류는 다르게 유지한다.** 예측이 관측과 같은 실선이 되면
+        // 화면이 본 적 없는 세계를 관측이라고 말하게 된다. 이어붙이되 파선이다.
+        auto dashed = [&](const cv::Point& a, const cv::Point& b,
+                          const cv::Scalar& col) {
+            const int m = 4 * std::max(img_.cols, img_.rows);
+            if (std::abs(a.x) > m || std::abs(a.y) > m ||
+                std::abs(b.x) > m || std::abs(b.y) > m) return;
+            const double dx = b.x - a.x, dy = b.y - a.y;
+            const int steps = std::max(1, static_cast<int>(std::hypot(dx, dy) / 5.0));
+            for (int i = 0; i < steps; i += 2) {
+                const double t0 = static_cast<double>(i) / steps;
+                const double t1 = std::min(1.0, static_cast<double>(i + 1) / steps);
+                cv::line(img_,
+                         {static_cast<int>(a.x + dx * t0), static_cast<int>(a.y + dy * t0)},
+                         {static_cast<int>(a.x + dx * t1), static_cast<int>(a.y + dy * t1)},
+                         col, 1, cv::LINE_AA);
+            }
+        };
+
         for (const auto& [k, pr] : preds) {
             // 멀리 있는 예측은 그리지 않는다. 4 만 개를 전부 파선으로 그리면
             // 프레임당 62 ms 가 든다 (실측) - 그 대부분은 화면에서 한 점에
@@ -1124,25 +1243,37 @@ public:
             // 미채점 예측은 신뢰도만큼만 진하다. 100 m 앞은 거의 배경이다.
             const double a = (pr.grade != 0) ? 0.85
                                              : 0.25 + 0.45 * pr.conf;
-            col = {col[0] * a + C_BG[0] * (1 - a),
-                   col[1] * a + C_BG[1] * (1 - a),
-                   col[2] * a + C_BG[2] * (1 - a)};
+            col = {col[0] * a + C_VOID[0] * (1 - a),
+                   col[1] * a + C_VOID[1] * (1 - a),
+                   col[2] * a + C_VOID[2] * (1 - a)};
 
-            // 파선. 관측은 실선이므로 이것만으로도 눈이 먼저 가른다.
-            const int m = 4 * std::max(img_.cols, img_.rows);
-            if (std::abs(pa.x) > m || std::abs(pa.y) > m ||
-                std::abs(pb.x) > m || std::abs(pb.y) > m) continue;
-            const int seg = 5;
-            const double dx = pa.x - pb.x, dy = pa.y - pb.y;
-            const int steps = std::max(1, static_cast<int>(std::hypot(dx, dy) / seg));
-            for (int i = 0; i < steps; i += 2) {
-                const double t0 = static_cast<double>(i) / steps;
-                const double t1 = std::min(1.0, static_cast<double>(i + 1) / steps);
-                cv::line(img_,
-                         {static_cast<int>(pb.x + dx * t0), static_cast<int>(pb.y + dy * t0)},
-                         {static_cast<int>(pb.x + dx * t1), static_cast<int>(pb.y + dy * t1)},
-                         col, 1, cv::LINE_AA);
+            // 세로 파선 - 그 자리에 얼마나 높은 것을 예상하는가.
+            dashed(pb, pa, col);
+
+            // 이웃 예측과 잇는다. 같은 클래스일 때만, 그리고 사각형을 닫고
+            // 대각선을 그어 삼각형으로 만든다 - 관측 쪽과 같은 규칙이다.
+            const Prediction* na = nullptr;
+            const Prediction* nb2 = nullptr;
+            const Prediction* nab = nullptr;
+            {
+                auto get = [&](const Eigen::Vector3f& d) -> const Prediction* {
+                    const auto it = preds.find(g.key(pr.p + d));
+                    return (it != preds.end() && it->second.cls == pr.cls)
+                         ? &it->second : nullptr;
+                };
+                na  = get(g.a * cell);
+                nb2 = get(g.b * cell);
+                nab = get(g.a * cell + g.b * cell);
             }
+            cv::Point q_a, q_b, q_ab;
+            const bool ok_a  = na  && project3(na->p.cast<double>(),  orb, f, q_a);
+            const bool ok_b  = nb2 && project3(nb2->p.cast<double>(), orb, f, q_b);
+            const bool ok_ab = nab && project3(nab->p.cast<double>(), orb, f, q_ab);
+            if (ok_a)  dashed(pa, q_a, col);
+            if (ok_b)  dashed(pa, q_b, col);
+            if (ok_a && ok_ab) dashed(q_a, q_ab, col);
+            if (ok_b && ok_ab) dashed(q_b, q_ab, col);
+            if (ok_ab) dashed(pa, q_ab, col);
         }
     }
 
@@ -1169,9 +1300,9 @@ public:
             if (!toScreen(v.p, pa)) continue;
             cv::Scalar col = turbo(v.depth_norm);
             const double a = 1.0 - fade * static_cast<double>(v.age);
-            col = {col[0] * a + C_BG[0] * (1 - a),
-                   col[1] * a + C_BG[1] * (1 - a),
-                   col[2] * a + C_BG[2] * (1 - a)};
+            col = {col[0] * a + C_VOID[0] * (1 - a),
+                   col[1] * a + C_VOID[1] * (1 - a),
+                   col[2] * a + C_VOID[2] * (1 - a)};
             for (const auto& d : kStep) {
                 const auto it = cells.find(voxKey(v.p + d * voxel, inv));
                 if (it == cells.end()) continue;
@@ -1495,7 +1626,10 @@ int main(int argc, char** argv) {
     std::string shot_path;
     std::string dump_feat;
     int shot_frame = 0;
-    int cloud_cap = 260000;
+    // 복셀 상한. 넘으면 복셀을 키워 다시 합치므로 지도가 사라지지는
+    // 않고 성겨진다. 260k 는 KITTI 00 에서 0.3 m -> 1.2 m 까지 두 번
+    // 거칠어져, 라이다 지도라면 있어야 할 밀도가 남지 않았다.
+    int cloud_cap = 900000;
     int start_cam = 0;      // 0 1인칭 / 1 3인칭 / 2 지도 / 3 항공
 
     for (int i = 1; i + 1 < argc; i += 2) {
@@ -1550,6 +1684,14 @@ int main(int argc, char** argv) {
     // 패널별 시선 중심. 각 패널은 **자기가 추정한** 위치에 걸린다 - 정답에
     // 걸면 드리프트가 큰 쪽의 지도가 화면 밖으로 나간다.
     Eigen::Vector3d pan_center[2] = {Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero()};
+    // 패널별 시선 방향. **그 패널의 추정 궤적에서** 뽑는다 - 정답에서
+    // 뽑으면 드리프트만큼 카메라가 계속 비틀린다.
+    Eigen::Vector3d pan_head[2] = {Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero()};
+    // 운동 유형. 포즈만 내놓는 것과 무엇이 일어났는지 말하는 것은 다르다.
+    std::string mot_kind[2] = {"", ""};
+    double mot_yaw[2] = {0.0, 0.0};      // 누적 요각 (rad)
+    int    mot_turns[2] = {0, 0};        // 완전히 돈 바퀴 수
+    int    mot_at[2] = {-1, -1};         // 마지막으로 판정한 포즈 인덱스
     bool   user_zoomed = false;    // W/S 를 눌렀으면 자동 거리 조정을 멈춘다
     bool   show_mesh = true;       // 표면 격자 (M 으로 토글)
     cv::Mat canvas(WIN_H, WIN_W, CV_8UC3);
@@ -1561,11 +1703,14 @@ int main(int argc, char** argv) {
     std::vector<MemoryObject> mem[2];
     // 지도에서 유도한 장면 라벨 (지면/건물/담장/나무/기둥).
     std::unordered_map<std::int64_t, Column> stuff[2];
-    bool show_stuff = true;        // L 로 토글
+    // 오버레이는 기본 꺼짐. 전부 켜면 지도가 안 보이고, 사람이
+    // 보려던 것은 지도다. L / O 로 필요할 때 켠다.
+    bool show_stuff = false;       // L 로 토글
     // 앞을 내다본 것과 그 성적표.
     std::unordered_map<std::int64_t, Prediction> pred[2];
     PredictScore pscore[2];
-    bool show_pred = true;         // O 로 토글
+    bool show_pred = false;        // O 로 토글
+    bool show_cubes = true;        // C 로 토글 - 복셀을 큐브로 채운다
     // 단계별 소요 시간 (ms). 랙의 원인을 추측하지 않기 위한 계측이다.
     double prof_label[2] = {0, 0}, prof_vec[2] = {0, 0};
     double prof_pred[2] = {0, 0}, prof_pdraw[2] = {0, 0};
@@ -1672,9 +1817,10 @@ int main(int argc, char** argv) {
                 else if (cam_mode == 3) orb.dist = base_dist * 1.1;
                 else                    orb.dist = base_dist;
             }
-            // 1 인칭과 3 인칭만 진행 방향을 따라간다. 지도 뷰에서 시선이
-            // 돌면 코너마다 화면이 통째로 회전해 쌓인 지도가 안 읽힌다.
-            orb.heading = (cam_mode <= 1) ? heading_dir : Eigen::Vector3d::Zero();
+            // 시선 방향은 **패널마다** 자기 추정에서 뽑아 아래에서 넣는다.
+            // 여기서 정답 궤적의 방향을 넣으면 두 패널이 같은 곳을 보게 되고,
+            // 드리프트가 있는 쪽은 자기 지도를 비스듬히 보게 된다.
+            orb.heading = Eigen::Vector3d::Zero();
             // yaw 는 사용자 조작(A/D)에만 반응한다. 진행 방향을 따라
             // 돌리면 코너마다 지도가 통째로 회전해서, 무엇이 쌓였는지가 아니라
             // 차가 어느 쪽을 향하는지만 보이게 된다.
@@ -1763,11 +1909,95 @@ int main(int argc, char** argv) {
                 }
                 if (pj >= 0) {
                     ego_k = run.aligned[static_cast<std::size_t>(pj)].translation();
-                    // 부드럽게 따라간다. 프레임마다 튀면 지도가 읽히지 않는다.
-                    ob.center = (acc_frame[k] < 0)
+
+                    // **1 인칭에서는 눈이 포즈에 정확히 있어야 한다.**
+                    //
+                    // 지도 뷰에서는 중심을 평활해도 된다 - 지도가 조금 늦게
+                    // 따라올 뿐이다. 그런데 1 인칭에서 눈을 평활하면 눈이
+                    // 자기 몸보다 뒤에 있게 되고, 화면이 앞뒤로 미끄러진다.
+                    // 좌표를 읽으려는 사람에게는 그것이 곧 흔들림이다.
+                    ob.center = (cam_mode == 0 || acc_frame[k] < 0)
                               ? ego_k : pan_center[k] * 0.80 + ego_k * 0.20;
+
+                    // **시선은 자세에서 나온다, 이동 방향이 아니라.**
+                    //
+                    // 이동 방향을 시선으로 쓰면 차량처럼 앞으로만 가는 경우에만
+                    // 맞다. 손에 들고 위아래로 흔들거나 제자리에서 360 도 도는
+                    // 시퀀스에서는 이동 벡터가 의미가 없거나 잡음이고, 그것을
+                    // 시선으로 쓰면 카메라가 회전만 해도 시야가 엉뚱한 데를
+                    // 향한다. 화면에서는 **세계가 따라 움직이는 것처럼** 보이고,
+                    // 그러면 이 뷰어는 "세계를 기억한다" 를 보여 주지 못한다.
+                    //
+                    // 추정 포즈의 회전은 카메라가 실제로 어디를 향하는지다.
+                    // 그것을 쓰면 카메라가 어떻게 움직이든 세계는 제자리에
+                    // 있고, 움직이는 것은 시점뿐이다 - 그것이 세계 모델이다.
+                    const Eigen::Matrix3d R =
+                        run.aligned[static_cast<std::size_t>(pj)].rotation();
+                    // 카메라 광축은 카메라 좌표계의 +z 다.
+                    const Eigen::Vector3d look = R * Eigen::Vector3d::UnitZ();
+                    if (look.norm() > 1e-6) {
+                        // 평활은 약하게만. 세게 걸면 회전이 늦게 따라와
+                        // 그것 자체가 미끄러짐으로 보인다.
+                        pan_head[k] = (pan_head[k].squaredNorm() < 1e-12)
+                                    ? look.normalized()
+                                    : (pan_head[k] * 0.55 + look.normalized() * 0.45)
+                                          .normalized();
+                    }
+
+                    // --- 운동 유형 판정 ---
+                    //
+                    // 포즈만 내놓는 것은 기존 SLAM 이 하는 일이다. 무엇이
+                    // 일어났는지 - 전진인지, 옆걸음인지, 제자리 회전인지,
+                    // 한 바퀴를 돌았는지 - 를 말할 수 있어야 세계 모델이다.
+                    // 판정은 **직전 포즈와의 상대 변환** 에서 나온다.
+                    if (pj > 0 && pj != mot_at[k]) {
+                        const Eigen::Isometry3d& Tp =
+                            run.aligned[static_cast<std::size_t>(pj - 1)];
+                        const Eigen::Isometry3d& Tc =
+                            run.aligned[static_cast<std::size_t>(pj)];
+                        const Eigen::Isometry3d rel = Tp.inverse() * Tc;
+                        // 상대 이동을 **카메라 좌표계에서** 본다. 월드에서 보면
+                        // "앞으로" 가 시퀀스마다 다른 축이 된다.
+                        const Eigen::Vector3d t = rel.translation();
+                        const Eigen::AngleAxisd aa(rel.rotation());
+                        const double ang = std::abs(aa.angle());
+
+                        // 누적 요각. 월드 up 둘레로 돈 각을 부호까지 더한다 -
+                        // 360 도 회전은 이 값으로만 알 수 있다.
+                        const double dyaw = aa.angle() * aa.axis().dot(orb.world_up);
+                        mot_yaw[k] += dyaw;
+                        if (std::abs(mot_yaw[k]) >= 2.0 * kPiV) {
+                            mot_turns[k] += (mot_yaw[k] > 0 ? 1 : -1);
+                            mot_yaw[k] -= (mot_yaw[k] > 0 ? 1 : -1) * 2.0 * kPiV;
+                        }
+
+                        // 회전이 지배적인가. 시야 한 화면(약 0.9 rad)에 견줘
+                        // 판단한다 - 각도와 거리를 그냥 비교할 수는 없다.
+                        const double rot_px = ang / 0.9;
+                        const double tr_m = t.norm();
+                        if (rot_px < 0.02 && tr_m < 0.005) {
+                            mot_kind[k] = "still";
+                        } else if (rot_px > tr_m * 2.0) {
+                            mot_kind[k] = "rotating in place";
+                        } else {
+                            // 카메라계 축: x 오른쪽, y 아래, z 앞
+                            const double ax = std::abs(t.x()), ay = std::abs(t.y()),
+                                         az = std::abs(t.z());
+                            if (az >= ax && az >= ay) {
+                                mot_kind[k] = (t.z() > 0) ? "forward" : "backward";
+                            } else if (ax >= ay) {
+                                mot_kind[k] = (t.x() > 0) ? "strafe right" : "strafe left";
+                            } else {
+                                mot_kind[k] = (t.y() > 0) ? "down" : "up";
+                            }
+                            // 옆·위아래로 가면서 돌면 대각선이다.
+                            if (rot_px > tr_m * 0.6) mot_kind[k] += " + turning";
+                        }
+                        mot_at[k] = pj;
+                    }
                 }
                 pan_center[k] = ob.center;
+                ob.heading = (cam_mode <= 1) ? pan_head[k] : Eigen::Vector3d::Zero();
             }
 
             // **왼쪽에는 세계 모델이 없다.**
@@ -1843,7 +2073,10 @@ int main(int argc, char** argv) {
                     // 높이는 월드에 고정된 값이라 언제 어디서 봐도 같다. 그래서
                     // 노면은 낮고 건물은 높은, 구조가 읽히는 지도가 된다.
                     const double h0 = (s.dataset == "kitti") ? -1.8 : -0.6;
-                    const double h1 = (s.dataset == "kitti") ?  6.0 :  1.6;
+                    // 상한이 6 m 면 2 층 이상이 전부 같은 빨강으로 뭉쳐 도시가 평평해
+                    // 보인다. 라이다 지도가 높이를 색으로 읽히게 하는 것은
+                    // 범위가 실제 구조 높이를 덮기 때문이다.
+                    const double h1 = (s.dataset == "kitti") ? 14.0 :  2.4;
                     const Eigen::Vector3f up_f = ob.world_up.cast<float>();
                     const float ego_h = static_cast<float>(ego_k.dot(ob.world_up));
                     for (auto& p : pts) {
@@ -1935,7 +2168,15 @@ int main(int argc, char** argv) {
                         std::clamp(1.0 - static_cast<double>(v.seen) / span, 0.0, 1.0));
                 }
                 const auto t_c0 = std::chrono::steady_clock::now();
+                // 먼저 점으로 전부 깔고, 그 위에 가까운 칸을 큐브로 채운다.
+                // 큐브만 그리면 2 px 미만으로 작아지는 먼 구조가 통째로
+                // 사라져 "저기엔 아무 것도 없다" 로 읽힌다 - 없는 것과 너무
+                // 작아 못 그린 것은 다르다.
                 cloud[k].draw(flat, ob, vp.width * 0.9, 0.62);
+                if (show_cubes) {
+                    cloud[k].voxelCubes(flat, acc[k].voxel, ob, vp.width * 0.9,
+                                        ob.world_up, 0.45);
+                }
                 prof_cloud[k] = std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - t_c0).count();
                 // 점 위에 표면 격자를 덧그린다. 순서가 중요하다 - 먼저 그리면
@@ -2010,7 +2251,8 @@ int main(int argc, char** argv) {
                             const auto t_p1 = std::chrono::steady_clock::now();
                             cloud[k].predictions(pred[k], ob.world_up, ob,
                                                  vp.width * 0.9, ego_k,
-                                                 (s.dataset == "kitti") ? 130.0 : 14.0);
+                                                 (s.dataset == "kitti") ? 130.0 : 14.0,
+                                                 ccell);
                             const auto t_p2 = std::chrono::steady_clock::now();
                             prof_pred[k] = std::chrono::duration<double, std::milli>(
                                 t_p1 - t_p0).count();
@@ -2324,6 +2566,19 @@ int main(int argc, char** argv) {
                         }
                         label(canvas, "scene labels from map geometry (not the detector)",
                               {vp.x + 14, vp.y + 126}, C_INK3, T_MICRO, 1);
+                        // **무엇이 일어났는가.** 포즈만 내놓는 것은 기존 SLAM
+                        // 이 하는 일이고, 그 위에 얹히는 것이 이 한 줄이다.
+                        {
+                            std::ostringstream mo;
+                            mo << "motion: " << (mot_kind[k].empty() ? "-" : mot_kind[k])
+                               << "   yaw " << static_cast<int>(mot_yaw[k] * 180.0 / kPiV)
+                               << " deg";
+                            if (mot_turns[k] != 0) {
+                                mo << "   full turns " << mot_turns[k];
+                            }
+                            label(canvas, mo.str(), {vp.x + 14, vp.y + 180},
+                                  (mot_turns[k] != 0) ? C_WARN : C_INK2, T_MICRO, 1);
+                        }
                         // **예측은 채점 결과와 함께만 말한다.** 적중률 없이
                         // "100 m 앞을 예측한다" 만 적으면 그림이 주장을 대신하게
                         // 된다 - 이 저장소가 반복해 기록한 실패다.
@@ -2478,7 +2733,7 @@ int main(int argc, char** argv) {
             label(canvas, "controls", {hx, fy + 72}, C_INK3);
             text(canvas, "SPACE play    , . step    N/P sequence    1/2 swap model",
                  {hx, fy + 100}, T_BODY, C_INK2);
-            text(canvas, "A/D orbit   W/S zoom   V camera (1st/3rd/map/bird)   L labels   O lookahead   R restart   F shot   Q quit",
+            text(canvas, "A/D orbit  W/S zoom  V camera  C cubes  L labels  M mesh  O lookahead  R restart  F shot  Q quit",
                  {hx, fy + 126}, T_BODY, C_INK2);
         }
         {
@@ -2583,6 +2838,9 @@ int main(int argc, char** argv) {
             mem[0].clear(); mem[1].clear(); acc[0].clear(); acc[1].clear();
             pred[0].clear(); pred[1].clear();
             pscore[0].clear(); pscore[1].clear();
+            mot_yaw[0] = mot_yaw[1] = 0.0; mot_turns[0] = mot_turns[1] = 0;
+            mot_at[0] = mot_at[1] = -1; mot_kind[0] = mot_kind[1] = "";
+            pan_head[0].setZero(); pan_head[1].setZero();
             mesh[0].clear(); mesh[1].clear(); }
         else if (key == 'v' || key == 'V') { cam_mode = (cam_mode + 1) % 4; user_zoomed = false; }
         else if (key == 'm' || key == 'M') show_mesh = !show_mesh;
@@ -2591,12 +2849,16 @@ int main(int argc, char** argv) {
         // 토글을 얹으니 아래 분기가 영영 안 닿아 시퀀스 되감기가 통째로
         // 죽었다 - if/else 사슬에서 같은 키를 두 번 쓰면 뒤엣것은 없는 코드다.
         else if (key == 'o' || key == 'O') show_pred = !show_pred;
+        else if (key == 'c' || key == 'C') show_cubes = !show_cubes;
         else if (key == 'n' || key == 'N') {
             si = (si + 1) % static_cast<int>(seqs.size());
             frame = 0; acc_frame[0] = acc_frame[1] = -1; orb.dist = 0.0; user_zoomed = false;
             mem[0].clear(); mem[1].clear(); acc[0].clear(); acc[1].clear();
             pred[0].clear(); pred[1].clear();
             pscore[0].clear(); pscore[1].clear();
+            mot_yaw[0] = mot_yaw[1] = 0.0; mot_turns[0] = mot_turns[1] = 0;
+            mot_at[0] = mot_at[1] = -1; mot_kind[0] = mot_kind[1] = "";
+            pan_head[0].setZero(); pan_head[1].setZero();
             mesh[0].clear(); mesh[1].clear();
         } else if (key == 'p' || key == 'P') {
             si = (si + static_cast<int>(seqs.size()) - 1) % static_cast<int>(seqs.size());
@@ -2604,6 +2866,9 @@ int main(int argc, char** argv) {
             mem[0].clear(); mem[1].clear(); acc[0].clear(); acc[1].clear();
             pred[0].clear(); pred[1].clear();
             pscore[0].clear(); pscore[1].clear();
+            mot_yaw[0] = mot_yaw[1] = 0.0; mot_turns[0] = mot_turns[1] = 0;
+            mot_at[0] = mot_at[1] = -1; mot_kind[0] = mot_kind[1] = "";
+            pan_head[0].setZero(); pan_head[1].setZero();
             mesh[0].clear(); mesh[1].clear();
         } else if (key == '1') {
             pick[0] = (pick[0] + 1) % static_cast<int>(s.systems.size());
