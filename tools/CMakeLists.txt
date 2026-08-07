@@ -145,3 +145,15 @@ target_link_libraries(wme_bench_viewer PRIVATE
     opencv_imgproc)
 set_target_properties(wme_bench_viewer PROPERTIES FOLDER "wme/tools")
 wme_stage_runtime_dlls(wme_bench_viewer)
+
+
+# 의미 구조(평면 = 건물/지면, 상자 = 차량/사람) 내보내기. 뷰어가 읽는다.
+# 검출을 뷰어 안에서 돌리지 않는 이유는 scene_export.cpp 머리말 참조.
+add_executable(wme_scene_export scene_export.cpp)
+target_link_libraries(wme_scene_export PRIVATE
+    wme::wme_geometry
+    wme::wme_perception
+    opencv_imgcodecs
+    opencv_imgproc)
+set_target_properties(wme_scene_export PROPERTIES FOLDER "wme/tools")
+wme_stage_runtime_dlls(wme_scene_export)
