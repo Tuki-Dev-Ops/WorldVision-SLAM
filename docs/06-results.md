@@ -3201,11 +3201,13 @@ be added to a document of published numbers without re-opening all of them.
 
 - **Two dataset families now, and they disagree.** §12–§17 were five 9-second windows; §22 onward
   runs 16 TUM sequences including one full-length 45 s / 17.5 m traverse (`fr1_room`); §25.20 adds
-  **four KITTI odometry sequences** through the new stereo depth front-end. TUM says 9–6 to WME;
-  KITTI says **2–2**. Everything below that is stated as a property of WME may instead be a
-  property of the dataset, and the honest reading of §22 is now "indoors, hand-held, 640×480".
-  Still no EuRoC (host unreachable) and no Robotcar; KITTI sequences 01–03, 06, 08–10 are on disk
-  and unrun.
+  **four KITTI odometry sequences** through the new stereo depth front-end. On complete data
+  (§25.22), one configuration against two controls: **TUM is 8–7 — a tie** — while KITTI is 4–0
+  against ORB, the only control run there. Everything stated below as a property of WME may
+  instead be a property of the dataset, and the honest reading of §22 is now "indoors,
+  hand-held, 640×480". Still no EuRoC (host unreachable) and no Robotcar; KITTI sequences
+  01–03, 06, 08–10 are on disk and unrun, and **cv2.Odometry has never been run on KITTI**, so
+  the 4–0 has half the controls the 8–7 does.
 - **ECDA's depth-uncertainty weighting is off by default and validated on four sequences of one
   dataset** (§25.21). Enabled at the derived `c = σ_d/(f·B)` it takes KITTI from 2–2 to 4–0, but
   it *worsens* sequence 04 by 2.5× — the highway drive where nothing is near — and on TUM it is
@@ -3257,8 +3259,8 @@ be added to a document of published numbers without re-opening all of them.
   (`wsl --status` reports absent), so it needs an elevated install and a reboot. Until that
   happens the published-baseline gap below stands.
 - **No *published* baseline.** §22 and §24 close the "compares only to itself" gap — a classical
-  ORB+PnP front-end and a published `cv2.Odometry` run on all 16 sequences (9–6 to WME against
-  the better of the two) and a symmetric loop-closure back-end
+  ORB+PnP front-end and a published `cv2.Odometry` run on all 16 complete sequences (**8–7** to
+  WME against the better of the two, one configuration) and a symmetric loop-closure back-end
   runs on the full `fr1_room` traverse — but **ORB-SLAM3, DSO and DROID-SLAM have still not been
   run.** A self-implemented control is permanently open to the under-tuning objection no matter
   how carefully its settings are sourced, and there is still no bundle adjustment on either
