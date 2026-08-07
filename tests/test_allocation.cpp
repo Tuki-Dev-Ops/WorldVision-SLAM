@@ -219,17 +219,26 @@ void installMatCounter() {
 
 // 세지 못하는 계수기는 언제나 0 을 보고하고, 0 은 요구사항 충족처럼 보인다.
 // 그래서 먼저 아는 답으로 계수기를 검증한다.
+//
+// **할당을 최적화로 지울 수 없게 만들어야 한다.** C++14(N3664)는 컴파일러가
+// new/delete 쌍을 통째로 제거하는 것을 허용한다. 예전 판은 `volatile int sink`
+// 로 *값* 만 살려 두었는데, 그건 할당을 지우는 것을 막지 못한다 - clang 이
+// 실제로 열 번을 전부 지워 이 대조군이 0 을 보고했다. 그 상태에서는 이 파일의
+// 나머지 수치도 "정말 할당이 없는 것" 인지 "컴파일러가 지운 것" 인지 구분할 수
+// 없다. 포인터 자체를 volatile 전역으로 내보내면 관측 가능한 부수효과가 되어
+// 할당을 지울 수 없다.
+volatile void* g_escape = nullptr;
+
 TEST(AllocationHarness, CounterCountsKnownAllocations) {
     AllocScope s;
-    volatile int sink = 0;
     for (int i = 0; i < 10; ++i) {
         auto* p = new int[64];
         p[0] = i;
-        sink += p[0];
+        g_escape = p;          // volatile 저장 = 제거 불가
         delete[] p;
     }
+    g_escape = nullptr;        // 해제된 포인터를 남겨 두지 않는다
     const std::uint64_t n = s.news();
-    (void)sink;
     EXPECT_EQ(n, 10u) << "operator new 교체가 걸리지 않았다 - 이 파일의 모든 수치는 무의미하다";
 }
 
