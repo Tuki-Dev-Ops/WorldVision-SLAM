@@ -47,13 +47,13 @@ OPENCV_BIN = Path("C:/opencv-dl/opencv/build/x64/vc16/bin")
 SYSTEMS = {
     "baseline": {
         "exe": "wme_tum_baseline.exe",
-        "label": "ORB + PnP (classical)",
+        "label": "Classical SLAM  /  ORB + PnP",
         "kind": "descriptor",
         "args": [],
     },
     "wme": {
         "exe": "wme_tum_odometry.exe",
-        "label": "WME ECDA (Tier 0)",
+        "label": "WorldVision  /  WME Tier 0",
         "kind": "descriptor-free",
         "args": [],
     },
@@ -61,7 +61,7 @@ SYSTEMS = {
     # 그 약점을 메우라고 만든 계층이 이것이므로 빼면 비교가 한쪽으로 기운다.
     "wme_masked": {
         "exe": "wme_tum_odometry.exe",
-        "label": "WME + token mask (YOLO)",
+        "label": "WorldVision  /  + token mask",
         "kind": "descriptor-free",
         # 절대 경로여야 한다. 하위 프로세스의 cwd 는 이 스크립트의 위치이지
         # 저장소 루트가 아니다.
