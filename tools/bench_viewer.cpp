@@ -354,6 +354,14 @@ struct Splat {
     // 다른 것을 잡는다. 스테레오 유령은 같은 오매칭이 인접 프레임에서 반복
     // 재현되므로 관측 횟수만으로는 안 걸러지고, 시점이 바뀌면 사라진다.
     // 공간 판정이 절대 못 잡는 밀집 유령 덩어리가 여기서 걸린다.
+    // **관측된 밝기.**
+    //
+    // 지금까지 지도는 깊이만 쓰고 영상의 밝기를 버렸다. 그런데 노면의 정보는
+    // 거의 전부 밝기에 있다 - 차선, 주차선, 횡단보도는 높이 차이가 0 이라
+    // 기하로는 존재하지 않고, 흰 페인트라는 사실로만 존재한다. 라이다 지도가
+    // intensity 로 차선을 보여 주는 것과 같은 이야기이고, 여기서는 카메라
+    // 밝기가 그 자리를 그대로 대신한다.
+    std::uint8_t  intensity{0};
     std::uint8_t  nbr{0};        // 26 이웃 중 점유 수
     std::uint8_t  hits{0};       // 총 관측 수 (포화 255)
     std::uint16_t view_mask{0};  // 관측한 시점 섹터 비트
@@ -1173,6 +1181,57 @@ public:
             const Eigen::Vector3d q0 = o + b * (i * step) - a * reach;
             const Eigen::Vector3d q1 = o + b * (i * step) + a * reach;
             line3(q0, q1, orb, f, col2, 1);
+        }
+    }
+
+    // 노면. **밝기로 칠한 납작한 판** 이다.
+    //
+    // 큐브로 그리면 도로가 검은 블록 밭이 되고, 안 그리면 차선과 주차선이
+    // 통째로 사라진다. 노면 복셀은 부피가 아니라 **표면** 이므로 세워진 육면체가
+    // 아니라 지면에 누운 사각형으로 그리는 것이 맞고, 색은 높이가 아니라
+    // **관측된 밝기** 여야 한다 - 노면에서 높이는 어디나 같고, 정보는 전부
+    // 밝기에 있다.
+    void roadSurface(const std::vector<Splat>& pts, float voxel, const Orbit& orb,
+                     double f, const Eigen::Vector3d& up_d) {
+        const Eigen::Vector3d up = up_d.normalized();
+        Eigen::Vector3d a = up.cross(Eigen::Vector3d::UnitZ());
+        if (a.norm() < 1e-6) a = up.cross(Eigen::Vector3d::UnitX());
+        a.normalize();
+        const Eigen::Vector3d b = up.cross(a).normalized();
+        const double h = 0.5 * voxel;
+
+        // 밝기 범위를 실제 분포에 맞춘다. 0~255 를 그대로 쓰면 아스팔트가
+        // 전부 어두운 회색 한 덩어리가 되어 흰 선이 안 두드러진다.
+        int lo = 255, hi = 0;
+        for (const auto& s : pts) {
+            lo = std::min(lo, static_cast<int>(s.intensity));
+            hi = std::max(hi, static_cast<int>(s.intensity));
+        }
+        const double span = std::max(24, hi - lo);
+
+        for (const auto& s : pts) {
+            const Eigen::Vector3d c = s.p.cast<double>();
+            const Eigen::Vector3d q[4] = {c - a * h - b * h, c + a * h - b * h,
+                                          c + a * h + b * h, c - a * h + b * h};
+            cv::Point poly[4];
+            bool ok = true;
+            for (int i = 0; i < 4 && ok; ++i) ok = project3(q[i], orb, f, poly[i]);
+            if (!ok) continue;
+            const double w = std::max({std::abs(poly[0].x - poly[2].x),
+                                       std::abs(poly[0].y - poly[2].y)});
+            if (w > img_.cols * 0.5) continue;
+            // 밝기를 정규화해 회색으로. 흰 페인트는 밝게 남고 아스팔트는
+            // 배경으로 가라앉는다.
+            const double t = std::clamp((s.intensity - lo) / span, 0.0, 1.0);
+            const double v = 26.0 + 210.0 * t * t;    // 제곱으로 대비를 세운다
+            cv::fillConvexPoly(img_, poly, 4, cv::Scalar(v, v, v), cv::LINE_8);
+            double zz;
+            const Eigen::Matrix3d M = orb.basis();
+            const Eigen::Vector3d eye = orb.center - M.row(2).transpose() * orb.dist;
+            zz = (M * (c - eye)).z();
+            if (zz > 1e-3) {
+                cv::fillConvexPoly(zbuf_, poly, 4, cv::Scalar(zz), cv::LINE_8);
+            }
         }
     }
 
@@ -2132,7 +2191,8 @@ void loadSeq(Seq& s) {
 }
 
 // 깊이맵을 세계 좌표 점군으로. stride 로 개수를 조절한다.
-void backProject(const cv::Mat& depth16, const wme_tools::DatasetCalib& cal,
+void backProject(const cv::Mat& depth16, const cv::Mat& gray,
+                 const wme_tools::DatasetCalib& cal,
                  const Eigen::Isometry3d& T_world_cam, int stride,
                  double dmin, double dmax, double cmin, double cmax,
                  const Eigen::Vector3d& up, double ego_h,
@@ -2170,6 +2230,11 @@ void backProject(const cv::Mat& depth16, const wme_tools::DatasetCalib& cal,
                 std::clamp((z - cmin) / std::max(1e-6, cmax - cmin), 0.0, 1.0));
             s.age = 0.0f;
             s.range = static_cast<float>(z);   // 관측 당시 거리
+            // 같은 화소의 밝기를 함께 들고 온다. 깊이와 밝기는 같은 화소에서
+            // 나오므로 재투영도 보간도 필요 없다.
+            if (!gray.empty() && v < gray.rows && u < gray.cols) {
+                s.intensity = gray.at<std::uint8_t>(v, u);
+            }
             out.push_back(s);
         }
     }
@@ -2658,7 +2723,13 @@ int main(int argc, char** argv) {
                     // 높이를 자르는 것이 아니고, 그건 StereoDepth 쪽 일이다.
                     const double hlo = (s.dataset == "kitti") ? -3.0 : -2.0;
                     const double hhi = (s.dataset == "kitti") ?  7.5 :  2.2;
-                    backProject(d16, s.calib, run.aligned[static_cast<std::size_t>(pi)],
+                    // 같은 프레임의 회색 영상. 노면 표시는 기하가 아니라
+                    // 밝기로만 존재하므로 이것 없이는 주차선을 그릴 수 없다.
+                    const cv::Mat gimg = cv::imread(
+                        s.rgb[static_cast<std::size_t>(fi)].second,
+                        cv::IMREAD_GRAYSCALE);
+                    backProject(d16, gimg, s.calib,
+                                run.aligned[static_cast<std::size_t>(pi)],
                                 stride,
                                 s.calib.depth_min, s.calib.depth_max, cmin, cmax,
                                 ob.world_up, ego_hh, hlo, hhi, pts);
@@ -2811,17 +2882,37 @@ int main(int argc, char** argv) {
                 // 보여 주는 것이다.
                 const double map_r = (s.dataset == "kitti") ? 55.0 : 7.0;
                 const double map_r2 = map_r * map_r;
-                std::vector<Splat> near_pts;
+                std::vector<Splat> near_pts, ground_pts;
                 near_pts.reserve(flat.size() / 2 + 1);
+                ground_pts.reserve(flat.size() / 2 + 1);
+                const GroundGrid gg(ob.world_up.cast<float>(),
+                                    (s.dataset == "kitti") ? 1.0f : 0.5f);
+                // 기준 지면 높이. **점을 나누기 전에** 정해야 한다 - 라벨이
+                // 없는 칸은 이 값으로 노면 여부를 판정하기 때문이다.
+                double plane_h;
+                {
+                    std::vector<float> gh;
+                    const Eigen::Vector3f e0 = ego_k.cast<float>();
+                    const float rr = static_cast<float>(map_r * map_r) * 0.25f;
+                    for (const auto& [ck, c] : stuff[k]) {
+                        if (c.cls != Stuff::Ground) continue;
+                        if ((c.rep - e0).squaredNorm() > rr) continue;
+                        gh.push_back(c.ground);
+                    }
+                    if (!gh.empty()) {
+                        std::nth_element(gh.begin(), gh.begin() + gh.size() / 2, gh.end());
+                        plane_h = gh[gh.size() / 2];
+                    } else {
+                        plane_h = ego_k.dot(ob.world_up)
+                                - ((s.dataset == "kitti") ? 1.65 : 0.8);
+                    }
+                }
                 {
                     const Eigen::Vector3f e = ego_k.cast<float>();
-                    // **노면에는 점을 찍지 않는다.**
-                    //
-                    // 지면은 라벨 쪽에서 격자면으로 그린다. 같은 자리에 점까지
-                    // 뿌리면 면 위에 잡티가 앉아 평평한 도로가 지저분해지고,
-                    // 정작 도로 위에 선 것들이 그 잡티에 묻힌다.
-                    const GroundGrid gg(ob.world_up.cast<float>(),
-                                        (s.dataset == "kitti") ? 1.0f : 0.25f);
+                    // 노면 복셀은 따로 모은다. 큐브로 그리면 도로가 검은
+                    // 블록 밭이 되고(실제로 그렇게 나왔다), 버리면 차선과
+                    // 주차선이 통째로 사라진다. 밝기로 칠한 납작한 면이 답이다.
+                    ground_pts.clear();
                     for (const auto& sp : flat) {
                         if ((sp.p - e).squaredNorm() > map_r2) continue;
 
@@ -2836,45 +2927,38 @@ int main(int argc, char** argv) {
                         // 공간 판정이 못 잡는 밀집 덩어리를 걷어낸다.
                         if (sp.nbr < 3) continue;
                         if (!sp.confirmed()) continue;
-                        if (show_stuff) {
+
+                        // **노면인가.** 라벨에 기대지 않는다 - 실내에서는
+                        // 라벨의 대부분이 미상이라 노면 판정이 통째로 빠지고,
+                        // 그러면 도로가 검은 큐브 밭이 된다. 그 칸의 지면
+                        // 높이(라벨이 있으면 그것, 없으면 격자면)에서 40 cm
+                        // 안쪽이면 노면이다.
+                        {
                             const auto it = stuff[k].find(gg.key(sp.p));
-                            if (it != stuff[k].end() &&
-                                it->second.cls == Stuff::Ground) {
-                                // 그 칸의 지면 높이 근처면 노면이다. 도로 위에
-                                // 선 물체는 같은 칸이어도 높이가 다르므로 남는다.
-                                const float rel = sp.p.dot(gg.up) - it->second.ground;
-                                if (rel < 0.45f) continue;
-                            }
+                            const float gh = (it != stuff[k].end())
+                                           ? it->second.ground
+                                           : static_cast<float>(plane_h);
+                            const float rel = sp.p.dot(gg.up) - gh;
+                            if (rel < 0.40f) { ground_pts.push_back(sp); continue; }
                         }
                         near_pts.push_back(sp);
                     }
                 }
                 // **바닥 격자를 먼저 깐다.** 지도보다 나중에 그리면 격자선이
                 // 구조 위를 가로질러 지나간다.
-                {
-                    // 높이는 관측된 지면에서 받는다. 자차 주변 지면 칸들의
-                    // 중앙값이라 잡음 하나에 흔들리지 않고, 언덕에서도 지도와
-                    // 따로 놀지 않는다.
-                    std::vector<float> gh;
-                    if (show_stuff) {
-                        const Eigen::Vector3f e = ego_k.cast<float>();
-                        const float rr = static_cast<float>(map_r * map_r) * 0.25f;
-                        for (const auto& [ck, c] : stuff[k]) {
-                            if (c.cls != Stuff::Ground) continue;
-                            if ((c.rep - e).squaredNorm() > rr) continue;
-                            gh.push_back(c.ground);
-                        }
-                    }
-                    double h0;
-                    if (!gh.empty()) {
-                        std::nth_element(gh.begin(), gh.begin() + gh.size() / 2, gh.end());
-                        h0 = gh[gh.size() / 2];
-                    } else {
-                        // 관측된 지면이 없으면 센서 높이만큼 아래로 둔다.
-                        h0 = ego_k.dot(ob.world_up) - ((s.dataset == "kitti") ? 1.65 : 0.8);
-                    }
-                    cloud[k].groundPlane(ego_k, h0, ob.world_up, ob, vp.width * 0.9,
-                                         (s.dataset == "kitti") ? 5.0 : 0.5, map_r);
+                cloud[k].groundPlane(ego_k, plane_h, ob.world_up, ob, vp.width * 0.9,
+                                     (s.dataset == "kitti") ? 5.0 : 0.5, map_r);
+
+                // **노면은 밝기로 칠한다.**
+                //
+                // 차선도 주차선도 횡단보도도 높이 차이가 0 이다. 기하로는
+                // 존재하지 않고 흰 페인트라는 사실로만 존재하므로, 깊이만 쓰는
+                // 지도에서는 원리적으로 보일 수가 없다. 같은 화소의 카메라
+                // 밝기를 들고 오면 그대로 나온다 - 라이다 지도가 intensity 로
+                // 차선을 보여 주는 것과 같은 이야기다.
+                if (layer == 0 || layer == 1 || layer == 5) {
+                    cloud[k].roadSurface(ground_pts, acc[k].voxel, ob,
+                                         vp.width * 0.9, ob.world_up);
                 }
                 const bool L_map = (layer == 0 || layer == 1);
                 if (L_map) cloud[k].draw(near_pts, ob, vp.width * 0.9, 0.62);
