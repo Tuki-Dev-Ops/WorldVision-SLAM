@@ -931,6 +931,186 @@ inline std::int64_t roadKey(const Eigen::Vector3f& p, const Eigen::Vector3f& a,
     return ((q(p.dot(a)) & 0x3FFFFFF) << 26) | (q(p.dot(b)) & 0x3FFFFFF);
 }
 
+// ---------------------------------------------------------------------------
+// Naive Surface Nets — 지나온 곳 전부를 하나의 삼각형 표면으로
+// ---------------------------------------------------------------------------
+// 복셀을 큐브로 채우면 지도는 "블록 더미" 로 남는다. 지나온 곳을 진짜 3D
+// 모형으로 만들려면 닫힌 표면이 있어야 하고, 그것이 이 단계다.
+//
+// **Marching Cubes 가 아니라 Surface Nets 인 이유.** 이진 점유 필드에서 MC 는
+// 모든 엣지 교차가 t=0.5 에 고정되어 정점이 격자 중점에만 놓이고, 결과가
+// 계단으로 나온다. 게다가 256x16 삼각형 룩업 테이블이 필요하다. Surface Nets
+// 는 셀마다 정점 하나이고 (Gibson, MERL TR99-24), 같은 구에서 정점 272 개 대
+// MC 1140 개로 넉 배 가볍다.
+//
+// 이진 필드를 그대로 쓰면 SN 도 중점 고정 문제를 겪는다. 그래서 3x3x3 이웃의
+// 점유 **비율** 을 스칼라 필드로 쓴다 - 한 줄로 이진 필드가 밀도장이 되고,
+// 엣지 교차가 0.5 에서 벗어나면서 표면이 매끄러워진다.
+struct SurfMesh {
+    std::vector<Eigen::Vector3f> vert;
+    std::vector<Eigen::Vector3f> norm;
+    std::vector<std::array<int, 3>> tri;
+    void clear() { vert.clear(); norm.clear(); tri.clear(); }
+};
+
+// 밀도장. **한 번에 미리 만든다.**
+//
+// 코너마다 27 이웃을 세면 조회가 셀당 8x27 이 되고, 70 만 복셀이면 10 억 회를
+// 넘어 한 프레임이 분 단위가 된다 (실측: 600 초에도 안 끝났다). 반대로 하면
+// 된다 - 점유 복셀 하나가 자기 주변 27 칸의 카운터를 올리게 하면 전체가
+// 70 만 x 27 = 1900 만 회 한 패스로 끝나고, 이후 조회는 O(1) 이다.
+//
+// 같은 답을 얻는 두 방향인데 한쪽은 50 배 싸다. 이웃을 "묻는" 대신 "알리는"
+// 것이 그 차이다.
+using DensField = std::unordered_map<std::int64_t, std::uint8_t>;
+
+inline DensField buildDensity(const std::unordered_map<std::int64_t, Splat>& cells,
+                              float voxel, const Eigen::Vector3f& e, float r2) {
+    DensField d;
+    d.reserve(cells.size() * 3);
+    const float inv = 1.0f / voxel;
+    for (const auto& [k, v] : cells) {
+        if ((v.p - e).squaredNorm() > r2) continue;
+        for (int dx = -1; dx <= 1; ++dx) {
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dz = -1; dz <= 1; ++dz) {
+                    const Eigen::Vector3f q = v.p + Eigen::Vector3f(
+                        dx * voxel, dy * voxel, dz * voxel);
+                    auto& c = d[voxKey(q, inv)];
+                    if (c < 255) ++c;
+                }
+            }
+        }
+    }
+    return d;
+}
+
+// 스칼라 필드. 안쪽이 음수다.
+inline float sdfAt(const DensField& dens, const Eigen::Vector3f& p,
+                   float inv, float iso) {
+    const auto it = dens.find(voxKey(p, inv));
+    const float n = (it == dens.end()) ? 0.0f : static_cast<float>(it->second);
+    return iso - n / 27.0f;
+}
+
+// 지도를 삼각형 표면으로 바꾼다. 자차 주변 반경만 - 전체를 매 프레임 다시
+// 만들 이유가 없고, 결과는 캐시된다.
+inline void surfaceNets(const std::unordered_map<std::int64_t, Splat>& cells,
+                        float voxel, const Eigen::Vector3d& ego, double radius,
+                        SurfMesh& out) {
+    out.clear();
+    if (cells.empty()) return;
+    const float inv = 1.0f / voxel;
+    const float iso = 0.35f;
+    const Eigen::Vector3f e = ego.cast<float>();
+    const float r2 = static_cast<float>(radius * radius);
+    // 밀도장을 먼저 한 패스로 만든다. 이후 모든 조회가 O(1) 이 된다.
+    const DensField dens = buildDensity(cells, voxel, e, r2);
+
+    // 셀 -> 정점 인덱스. 셀마다 정점 하나이므로 중복 제거가 필요 없다.
+    std::unordered_map<std::int64_t, int> vidx;
+    vidx.reserve(cells.size());
+
+    // 후보 셀: 점유 복셀과 그 이웃. 빈 공간 전체를 훑지 않는다.
+    std::unordered_map<std::int64_t, Eigen::Vector3f> cand;
+    cand.reserve(cells.size() * 2);
+    for (const auto& [k, v] : cells) {
+        if ((v.p - e).squaredNorm() > r2) continue;
+        // **표면 복셀만 후보로 삼는다.**
+        //
+        // 복셀마다 여덟 칸을 후보로 넣으면 70 만 복셀에서 후보가 560 만 개가
+        // 되고, 그 대부분은 덩어리 **안쪽** 이라 코너 여덟 개를 다 조회한 뒤
+        // mask 가 0 이나 0xFF 여서 버려진다. 조회 1 억 회가 통째로 낭비다.
+        //
+        // 표면은 정의상 빈 이웃이 있는 자리에만 있다. 여섯 면 중 하나라도
+        // 비어 있지 않으면 그 복셀은 안쪽이고, 표면이 지나갈 수 없다.
+        bool boundary = false;
+        for (int ax = 0; ax < 3 && !boundary; ++ax) {
+            for (int sgn = -1; sgn <= 1 && !boundary; sgn += 2) {
+                Eigen::Vector3f d = Eigen::Vector3f::Zero();
+                d[ax] = sgn * voxel;
+                if (!cells.count(voxKey(v.p + d, inv))) boundary = true;
+            }
+        }
+        if (!boundary) continue;
+        for (int dx = -1; dx <= 0; ++dx) {
+            for (int dy = -1; dy <= 0; ++dy) {
+                for (int dz = -1; dz <= 0; ++dz) {
+                    const Eigen::Vector3f c = v.p + Eigen::Vector3f(
+                        dx * voxel, dy * voxel, dz * voxel);
+                    cand[voxKey(c, inv)] = c;
+                }
+            }
+        }
+    }
+
+    static const int kCorner[8][3] = {{0,0,0},{1,0,0},{1,1,0},{0,1,0},
+                                      {0,0,1},{1,0,1},{1,1,1},{0,1,1}};
+    static const int kEdge[12][2] = {{0,1},{1,2},{2,3},{3,0},
+                                     {4,5},{5,6},{6,7},{7,4},
+                                     {0,4},{1,5},{2,6},{3,7}};
+
+    for (const auto& [key, c] : cand) {
+        float d[8];
+        int mask = 0;
+        for (int i = 0; i < 8; ++i) {
+            const Eigen::Vector3f q = c + Eigen::Vector3f(
+                kCorner[i][0] * voxel, kCorner[i][1] * voxel, kCorner[i][2] * voxel);
+            d[i] = sdfAt(dens, q, inv, iso);
+            if (d[i] < 0.0f) mask |= (1 << i);
+        }
+        if (mask == 0 || mask == 0xFF) continue;   // 표면이 지나가지 않는다
+
+        // 부호가 바뀌는 엣지의 교차점들. 그 **무게중심** 이 이 셀의 정점이다.
+        Eigen::Vector3f sum = Eigen::Vector3f::Zero();
+        int cnt = 0;
+        for (const auto& ed : kEdge) {
+            const bool a = (mask >> ed[0]) & 1, b = (mask >> ed[1]) & 1;
+            if (a == b) continue;
+            const float da = d[ed[0]], db = d[ed[1]];
+            const float t = (std::abs(da - db) < 1e-9f) ? 0.5f : da / (da - db);
+            const Eigen::Vector3f pa = c + Eigen::Vector3f(
+                kCorner[ed[0]][0] * voxel, kCorner[ed[0]][1] * voxel,
+                kCorner[ed[0]][2] * voxel);
+            const Eigen::Vector3f pb = c + Eigen::Vector3f(
+                kCorner[ed[1]][0] * voxel, kCorner[ed[1]][1] * voxel,
+                kCorner[ed[1]][2] * voxel);
+            sum += pa + (pb - pa) * t;
+            ++cnt;
+        }
+        if (cnt == 0) continue;
+        vidx[key] = static_cast<int>(out.vert.size());
+        out.vert.push_back(sum / static_cast<float>(cnt));
+        // 법선은 필드의 기울기다. 중앙차분 여섯 번.
+        const float h = voxel * 0.5f;
+        const Eigen::Vector3f g(
+            sdfAt(dens, out.vert.back() + Eigen::Vector3f(h,0,0), inv, iso) -
+            sdfAt(dens, out.vert.back() - Eigen::Vector3f(h,0,0), inv, iso),
+            sdfAt(dens, out.vert.back() + Eigen::Vector3f(0,h,0), inv, iso) -
+            sdfAt(dens, out.vert.back() - Eigen::Vector3f(0,h,0), inv, iso),
+            sdfAt(dens, out.vert.back() + Eigen::Vector3f(0,0,h), inv, iso) -
+            sdfAt(dens, out.vert.back() - Eigen::Vector3f(0,0,h), inv, iso));
+        out.norm.push_back(g.norm() > 1e-9f ? g.normalized()
+                                            : Eigen::Vector3f(0, 1, 0));
+    }
+
+    // 면: 부호가 바뀌는 격자 엣지마다, 그 엣지를 공유하는 네 셀의 정점을 잇는다.
+    const Eigen::Vector3f ax[3] = {{voxel,0,0}, {0,voxel,0}, {0,0,voxel}};
+    for (const auto& [key, c] : cand) {
+        const auto self = vidx.find(key);
+        if (self == vidx.end()) continue;
+        for (int a = 0; a < 3; ++a) {
+            const int b = (a + 1) % 3, d2 = (a + 2) % 3;
+            const auto i1 = vidx.find(voxKey(c - ax[b], inv));
+            const auto i2 = vidx.find(voxKey(c - ax[b] - ax[d2], inv));
+            const auto i3 = vidx.find(voxKey(c - ax[d2], inv));
+            if (i1 == vidx.end() || i2 == vidx.end() || i3 == vidx.end()) continue;
+            out.tri.push_back({self->second, i1->second, i2->second});
+            out.tri.push_back({self->second, i2->second, i3->second});
+        }
+    }
+}
+
 // 월드에 고정되는 물체 기억. 지나온 곳에서 본 물체가 그 자리에 남는다.
 //
 // **관측마다 위치를 덮어쓰면 안 된다.** 그러면 카메라가 움직일 때마다 물체가
@@ -1326,6 +1506,83 @@ public:
             zz = (M * (c - eye)).z();
             if (zz > 1e-3) {
                 cv::fillConvexPoly(zbuf_, poly, 4, cv::Scalar(zz), cv::LINE_8);
+            }
+        }
+    }
+
+    // 삼각형 표면을 z 버퍼로 그린다.
+    //
+    // 화가 알고리즘으로는 안 된다 - 표면은 자기 자신과 교차하는 순서가 없어서,
+    // 정렬만으로는 뒷면이 앞면을 덮는 자리가 반드시 생긴다. 픽셀마다 깊이를
+    // 비교해야 표면이 표면으로 보인다.
+    //
+    // 음영은 헤드라이트 램버트다. 고정 광원을 쓰면 회전할 때 어떤 면은 계속
+    // 어둡게 남아 형상이 안 읽힌다. 카메라를 광원으로 두면 늘 지금 보는
+    // 방향에서 밝다.
+    void surface(const SurfMesh& m, const Orbit& orb, double f,
+                 const cv::Scalar& base) {
+        if (m.tri.empty()) return;
+        const Eigen::Matrix3d M = orb.basis();
+        const Eigen::Vector3d eye = orb.center - M.row(2).transpose() * orb.dist;
+        const double cx = img_.cols * 0.5, cy = img_.rows * 0.5;
+
+        struct P { cv::Point2f s; double z; bool ok; };
+        std::vector<P> pv(m.vert.size());
+        for (std::size_t i = 0; i < m.vert.size(); ++i) {
+            const Eigen::Vector3d v = M * (m.vert[i].cast<double>() - eye);
+            pv[i].z = v.z();
+            pv[i].ok = v.z() > 1e-3;
+            if (pv[i].ok) {
+                pv[i].s = {static_cast<float>(cx + f * v.x() / v.z()),
+                           static_cast<float>(cy - f * v.y() / v.z())};
+            }
+        }
+        const Eigen::Vector3d fwd = M.row(2).transpose();
+
+        for (const auto& t : m.tri) {
+            const P& a = pv[t[0]]; const P& b = pv[t[1]]; const P& c = pv[t[2]];
+            if (!a.ok || !b.ok || !c.ok) continue;
+            // 화면 경계 상자
+            int x0 = static_cast<int>(std::floor(std::min({a.s.x, b.s.x, c.s.x})));
+            int x1 = static_cast<int>(std::ceil (std::max({a.s.x, b.s.x, c.s.x})));
+            int y0 = static_cast<int>(std::floor(std::min({a.s.y, b.s.y, c.s.y})));
+            int y1 = static_cast<int>(std::ceil (std::max({a.s.y, b.s.y, c.s.y})));
+            if (x1 < 0 || y1 < 0 || x0 >= img_.cols || y0 >= img_.rows) continue;
+            // 투영이 튄 삼각형은 화면을 가로지른다. 그리지 않는다.
+            if ((x1 - x0) > img_.cols / 2 || (y1 - y0) > img_.rows / 2) continue;
+            x0 = std::max(0, x0); y0 = std::max(0, y0);
+            x1 = std::min(img_.cols - 1, x1); y1 = std::min(img_.rows - 1, y1);
+
+            const double d = (b.s.x - a.s.x) * (c.s.y - a.s.y)
+                           - (c.s.x - a.s.x) * (b.s.y - a.s.y);
+            if (std::abs(d) < 1e-6) continue;
+
+            // 면 법선은 세 정점 법선의 평균. 헤드라이트와의 내적이 밝기다.
+            Eigen::Vector3f n = m.norm[t[0]] + m.norm[t[1]] + m.norm[t[2]];
+            double lam = 0.35;
+            if (n.norm() > 1e-9f) {
+                n.normalize();
+                lam = 0.35 + 0.65 * std::abs(n.cast<double>().dot(fwd));
+            }
+            const cv::Vec3b col(static_cast<std::uint8_t>(base[0] * lam),
+                                static_cast<std::uint8_t>(base[1] * lam),
+                                static_cast<std::uint8_t>(base[2] * lam));
+
+            for (int y = y0; y <= y1; ++y) {
+                float* zr = zbuf_.ptr<float>(y);
+                auto* pr = img_.ptr<cv::Vec3b>(y);
+                for (int x = x0; x <= x1; ++x) {
+                    const double px = x + 0.5, py = y + 0.5;
+                    const double w0 = ((b.s.x - a.s.x) * (py - a.s.y)
+                                     - (px - a.s.x) * (b.s.y - a.s.y)) / d;
+                    const double w1 = ((px - a.s.x) * (c.s.y - a.s.y)
+                                     - (c.s.x - a.s.x) * (py - a.s.y)) / d;
+                    if (w0 < 0.0 || w1 < 0.0 || w0 + w1 > 1.0) continue;
+                    const double z = a.z + w1 * (b.z - a.z) + w0 * (c.z - a.z);
+                    if (z <= 1e-3 || z >= zr[x]) continue;
+                    zr[x] = static_cast<float>(z);
+                    pr[x] = col;
+                }
             }
         }
     }
@@ -2437,6 +2694,11 @@ int main(int argc, char** argv) {
     std::unordered_map<std::int64_t, Column> stuff[2];
     // 노면 텍스처. 부피 지도와 따로 가는 2 차원 정밀 격자다.
     std::unordered_map<std::int64_t, RoadCell> road[2];
+    // 삼각형 표면. 자차가 의미 있게 움직였을 때만 다시 만든다.
+    SurfMesh surf[2];
+    Eigen::Vector3d surf_at[2] = {Eigen::Vector3d::Constant(1e9),
+                                  Eigen::Vector3d::Constant(1e9)};
+    bool show_surf = true;         // G 로 토글 - 삼각형 표면
     Eigen::Vector3f road_a{Eigen::Vector3f::UnitX()};
     Eigen::Vector3f road_b{Eigen::Vector3f::UnitZ()};
     // 오버레이는 기본 꺼짐. 전부 켜면 지도가 안 보이고, 사람이
@@ -3126,8 +3388,26 @@ int main(int argc, char** argv) {
                                                          ? 28.0 : 5.0));
                 }
                 const bool L_map = (layer == 0 || layer == 1);
+
+                // **지나온 곳 전부를 하나의 표면으로.**
+                //
+                // 큐브를 쌓으면 지도는 블록 더미로 남는다. 진짜 3D 모형은 닫힌
+                // 삼각형 표면이고, 그것이 있어야 "지도" 가 "모형" 이 된다.
+                // 표면이 켜지면 큐브는 그리지 않는다 - 같은 것을 두 번 그리면
+                // 표면 위로 블록 모서리가 삐져나온다.
+                if (show_surf && has_memory && L_map) {
+                    if ((ego_k - surf_at[k]).norm() > acc[k].voxel * 4.0) {
+                        // 표면은 자차 주변만 만든다. 먼 곳은 화면에서
+                        // 삼각형이 픽셀보다 작아 큐브와 구분되지 않는다.
+                        surfaceNets(acc[k].cells, acc[k].voxel, ego_k,
+                                    std::min(map_r, 22.0), surf[k]);
+                        surf_at[k] = ego_k;
+                    }
+                    cloud[k].surface(surf[k], ob, vp.width * 0.9,
+                                     cv::Scalar(196, 186, 170));
+                }
                 if (L_map) cloud[k].draw(near_pts, ob, vp.width * 0.9, 0.62);
-                if (show_cubes && L_map) {
+                if (show_cubes && !show_surf && L_map) {
                     cloud[k].voxelCubes(near_pts, acc[k].voxel, ob, vp.width * 0.9,
                                         ob.world_up, 0.45);
                 }
@@ -3933,6 +4213,8 @@ int main(int argc, char** argv) {
             mem[0].clear(); mem[1].clear(); acc[0].clear(); acc[1].clear();
             pred[0].clear(); pred[1].clear();
             road[0].clear(); road[1].clear();
+            surf[0].clear(); surf[1].clear();
+            surf_at[0].setConstant(1e9); surf_at[1].setConstant(1e9);
             pscore[0].clear(); pscore[1].clear();
             mot_yaw[0] = mot_yaw[1] = 0.0; mot_turns[0] = mot_turns[1] = 0;
             mot_at[0] = mot_at[1] = -1; mot_kind[0] = mot_kind[1] = "";
@@ -3948,12 +4230,18 @@ int main(int argc, char** argv) {
         else if (key == 'c' || key == 'C') show_cubes = !show_cubes;
         else if (key == 't' || key == 'T') layer = (layer + 1) % 6;
         else if (key == 'e' || key == 'E') show_edl = !show_edl;
+        else if (key == 'g' || key == 'G') {
+            show_surf = !show_surf;
+            surf_at[0].setConstant(1e9); surf_at[1].setConstant(1e9);
+        }
         else if (key == 'n' || key == 'N') {
             si = (si + 1) % static_cast<int>(seqs.size());
             frame = 0; acc_frame[0] = acc_frame[1] = -1; orb.dist = 0.0; user_zoomed = false;
             mem[0].clear(); mem[1].clear(); acc[0].clear(); acc[1].clear();
             pred[0].clear(); pred[1].clear();
             road[0].clear(); road[1].clear();
+            surf[0].clear(); surf[1].clear();
+            surf_at[0].setConstant(1e9); surf_at[1].setConstant(1e9);
             pscore[0].clear(); pscore[1].clear();
             mot_yaw[0] = mot_yaw[1] = 0.0; mot_turns[0] = mot_turns[1] = 0;
             mot_at[0] = mot_at[1] = -1; mot_kind[0] = mot_kind[1] = "";
@@ -3965,6 +4253,8 @@ int main(int argc, char** argv) {
             mem[0].clear(); mem[1].clear(); acc[0].clear(); acc[1].clear();
             pred[0].clear(); pred[1].clear();
             road[0].clear(); road[1].clear();
+            surf[0].clear(); surf[1].clear();
+            surf_at[0].setConstant(1e9); surf_at[1].setConstant(1e9);
             pscore[0].clear(); pscore[1].clear();
             mot_yaw[0] = mot_yaw[1] = 0.0; mot_turns[0] = mot_turns[1] = 0;
             mot_at[0] = mot_at[1] = -1; mot_kind[0] = mot_kind[1] = "";
