@@ -662,11 +662,52 @@ inline void labelScene(const std::unordered_map<std::int64_t, Splat>& cells,
         // 법선이 "위" 와 이루는 각. 수직면이면 법선이 수평이라 내적이 0 이다.
         c.vert = static_cast<float>(1.0 - std::abs(nrm.dot(g.up.cast<double>())));
         c.cls = classifyColumn(c);
-        // **누적 지도에 합친다.** 이번에 손대지 않은 칸의 라벨은 그대로
-        // 남는다 - 지나온 곳의 건물이 시야에서 벗어났다고 사라지면
-        // 그것은 세계 모델이 아니라 지금 보이는 것의 목록이다.
-        cols[k] = c;
     }
+
+    // **공간 일관성.** 칸마다 따로 판정하면 건물 벽면 한 장이 법선 잡음
+    // 때문에 조각조각 흩어진다 - kitti_00 에서 나무 2640 대 건물 382 가
+    // 나온 것이 그것이다. 주택가 도로가 그렇게 생겼을 리 없다.
+    //
+    // 구조물은 덩어리로 존재한다. 벽면 한가운데의 칸이 혼자 나무일 수는
+    // 없으므로, 5x5 이웃의 다수결로 고친다. 임계값을 더 만지는 것보다
+    // 이쪽이 옳다 - 문제는 경계선이 아니라 판정에 이웃이 안 들어간 것이었다.
+    {
+        std::unordered_map<std::int64_t, Stuff> voted;
+        voted.reserve(fresh.size());
+        for (const auto& [k, c] : fresh) {
+            // **Unknown 은 투표에 넣지 않는다.**
+            //
+            // Unknown 은 "점이 부족해 판정을 못 했다" 이지 하나의 클래스가
+            // 아니다. 그것을 표로 세면 성긴 칸이 다수를 이루는 곳에서 멀쩡히
+            // 분류된 벽면까지 Unknown 으로 덮인다 - 실제로 미상이 2897 에서
+            // 10776 으로 늘고 건물이 382 에서 100 으로 줄었다. 모른다는 것이
+            // 안다는 것을 이길 수는 없다.
+            if (c.cls == Stuff::Unknown) { voted[k] = c.cls; continue; }
+            int n[6] = {0, 0, 0, 0, 0, 0};
+            for (int di = -2; di <= 2; ++di) {
+                for (int dj = -2; dj <= 2; ++dj) {
+                    const auto it = fresh.find(GroundGrid::key(c.i + di, c.j + dj));
+                    if (it != fresh.end() && it->second.cls != Stuff::Unknown) {
+                        n[static_cast<int>(it->second.cls)]++;
+                    }
+                }
+            }
+            // 자기 자신에 가중치를 준다. 다수결이 완전히 지배하면 가느다란
+            // 기둥이나 홀로 선 나무가 주변 지면에 먹혀 사라진다.
+            n[static_cast<int>(c.cls)] += 2;
+            int best = static_cast<int>(c.cls), bn = -1;
+            for (int ci = 1; ci < 6; ++ci) {
+                if (n[ci] > bn) { bn = n[ci]; best = ci; }
+            }
+            voted[k] = static_cast<Stuff>(best);
+        }
+        for (auto& [k, c] : fresh) c.cls = voted[k];
+    }
+
+    // **누적 지도에 합친다.** 이번에 손대지 않은 칸의 라벨은 그대로 남는다 -
+    // 지나온 곳의 건물이 시야에서 벗어났다고 사라지면 그것은 세계 모델이
+    // 아니라 지금 보이는 것의 목록이다.
+    for (const auto& [k, c] : fresh) cols[k] = c;
 }
 
 // ---------------------------------------------------------------------------
@@ -1270,12 +1311,15 @@ public:
     // 나무를 이으면 있지도 않은 구조가 생긴다.
     void stuffVectors(const std::unordered_map<std::int64_t, Column>& cols,
                       const Eigen::Vector3d& up_d, float cell,
-                      const Orbit& orb, double f) {
+                      const Orbit& orb, double f, int layer = 0) {
         const GroundGrid g(up_d.cast<float>(), cell);
         const Eigen::Vector3f& up = g.up;
 
         for (const auto& [k, c] : cols) {
             if (c.cls == Stuff::Unknown) continue;
+            // 레이어 격리: 4 는 구조물만, 5 는 지면만.
+            if (layer == 4 && c.cls == Stuff::Ground) continue;
+            if (layer == 5 && c.cls != Stuff::Ground) continue;
             cv::Point pa;
             if (!project3(c.rep.cast<double>(), orb, f, pa)) continue;
             const cv::Scalar col = stuffColor(c.cls);
@@ -1988,6 +2032,10 @@ int main(int argc, char** argv) {
     PredictScore pscore[2];
     bool show_pred = false;        // O 로 토글
     bool show_cubes = true;        // C 로 토글 - 복셀을 큐브로 채운다
+    // 레이어 격리. 전부 한 화면에 겹치면 무엇을 보고 있는지 알 수
+    // 없다. 한 층씩 떼어 보는 것이 벤치마크에서는 기본이다.
+    //   0 전체 / 1 지도만 / 2 차량만 / 3 사람만 / 4 구조물만 / 5 지면만
+    int  layer = 0;                // T 로 순환
     // 단계별 소요 시간 (ms). 랙의 원인을 추측하지 않기 위한 계측이다.
     double prof_label[2] = {0, 0}, prof_vec[2] = {0, 0};
     double prof_pred[2] = {0, 0}, prof_pdraw[2] = {0, 0};
@@ -2346,6 +2394,22 @@ int main(int argc, char** argv) {
                     // 화면에서 하늘을 덮은 덩어리였다. KITTI 00 은 2 층
                     // 주택가라 지붕이 8 m 안쪽이다 - 그보다 위에 있는 것은
                     // 건물이 아니라 하늘에서 온 시차다.
+                    // 이 숫자는 **맞바꿈** 이다. 12 m 에서는 8 m 위에 32463 개가
+                    // 남아 하늘을 덮었고, 7.5 m 로 자르니 그것이 489 개로 줄었지만
+                    // 2 층 지붕까지 같이 잘려 건물 칸이 382 에서 144 로 떨어졌다.
+                    // 높이 하나로 하늘과 지붕을 가르려는 것이 애초에 무리다 -
+                    // 하늘 점은 높아서 생기는 것이 아니라 텍스처가 없어서 생긴다.
+                    // 그래서 9 m 로 완화해 보고 **재서** 정했다:
+                    //
+                    //   상한   8 m 초과 복셀   건물 칸
+                    //   12.0 m      32463        382
+                    //    9.0 m       8921        158
+                    //    7.5 m        489        144
+                    //
+                    // 9 m 는 하늘 잡음이 18 배로 늘면서 건물은 14 칸밖에 못
+                    // 되찾는다. 7.5 m 위쪽은 압도적으로 하늘이지 지붕이 아니다.
+                    // 근본 해결은 시차 신뢰도를 깊이와 함께 들고 오는 것이지
+                    // 높이를 자르는 것이 아니고, 그건 StereoDepth 쪽 일이다.
                     const double hlo = (s.dataset == "kitti") ? -3.0 : -2.0;
                     const double hhi = (s.dataset == "kitti") ?  7.5 :  2.2;
                     backProject(d16, s.calib, run.aligned[static_cast<std::size_t>(pi)],
@@ -2462,8 +2526,9 @@ int main(int argc, char** argv) {
                 // 큐브만 그리면 2 px 미만으로 작아지는 먼 구조가 통째로
                 // 사라져 "저기엔 아무 것도 없다" 로 읽힌다 - 없는 것과 너무
                 // 작아 못 그린 것은 다르다.
-                cloud[k].draw(flat, ob, vp.width * 0.9, 0.62);
-                if (show_cubes) {
+                const bool L_map = (layer == 0 || layer == 1);
+                if (L_map) cloud[k].draw(flat, ob, vp.width * 0.9, 0.62);
+                if (show_cubes && L_map) {
                     cloud[k].voxelCubes(flat, acc[k].voxel, ob, vp.width * 0.9,
                                         ob.world_up, 0.45);
                 }
@@ -2509,8 +2574,10 @@ int main(int argc, char** argv) {
                             label_at[k] = ego_k;
                         }
                         const auto t_vec = std::chrono::steady_clock::now();
-                        cloud[k].stuffVectors(stuff[k], ob.world_up, ccell,
-                                              ob, vp.width * 0.9);
+                        if (layer == 0 || layer == 4 || layer == 5) {
+                            cloud[k].stuffVectors(stuff[k], ob.world_up, ccell,
+                                                  ob, vp.width * 0.9, layer);
+                        }
                         const auto t_end = std::chrono::steady_clock::now();
                         prof_label[k] = std::chrono::duration<double, std::milli>(
                             t_vec - t_lbl).count();
@@ -2668,6 +2735,13 @@ int main(int argc, char** argv) {
                         // 서로 겹쳐 엉킨 덩어리가 된다 - 실제로 그랬다.
                         const bool is_person = (m.cls == "person");
                         if (m.cls.empty() || m.count < (is_person ? 5 : 2)) continue;
+                        // 레이어 격리. 2 는 차량만, 3 은 사람만, 4/5 는
+                        // 구조물/지면 레이어이므로 물체를 그리지 않는다.
+                        if (layer == 4 || layer == 5) continue;
+                        if (layer == 3 && !is_person) continue;
+                        if (layer == 2 && !(m.cls == "car" || m.cls == "truck" ||
+                                            m.cls == "bus" || m.cls == "motorcycle" ||
+                                            m.cls == "bicycle" || m.cls == "train")) continue;
                         const bool vehicle = (m.cls == "car" || m.cls == "truck" ||
                                               m.cls == "bus" || m.cls == "motorcycle" ||
                                               m.cls == "bicycle" || m.cls == "train");
@@ -3056,11 +3130,19 @@ int main(int argc, char** argv) {
             std::ostringstream ss;
             ss << "FRAME " << (frame + 1) << " / " << nframes;
             text(canvas, ss.str(), {PAD, fy + 58}, T_BODY, C_INK);
+            // 어느 레이어를 보고 있는지 화면에 적는다. 격리된 화면과
+            // 아무 것도 없는 화면은 그림만으로는 구분되지 않는다.
+            static const char* kLayer[6] = {"ALL LAYERS", "MAP ONLY", "VEHICLES ONLY",
+                                            "PEOPLE ONLY", "STRUCTURE ONLY",
+                                            "GROUND ONLY"};
             const char* mode = (cam_mode == 0) ? "FIRST PERSON"
                              : (cam_mode == 1) ? "THIRD PERSON"
                              : (cam_mode == 2) ? "MAP" : "BIRD'S EYE";
-            label(canvas, "camera", {W_MODE_X, fy + 40}, C_INK3);
-            text(canvas, mode, {W_MODE_X, fy + 62}, T_BODY, C_INK2);
+            label(canvas, "camera / layer", {W_MODE_X, fy + 40}, C_INK3);
+            text(canvas, std::string(mode) + "   ", {W_MODE_X, fy + 62}, T_BODY, C_INK2);
+            text(canvas, kLayer[layer],
+                 {W_MODE_X + textW(std::string(mode) + "   ", T_BODY, 1), fy + 62},
+                 T_BODY, (layer == 0) ? C_INK3 : C_WARN);
             const std::string st = playing ? "RUNNING" : "PAUSED";
             text(canvas, st, {WIN_W - PAD - textW(st, T_BODY, 1), fy + 58}, T_BODY,
                  playing ? C_GOOD : C_INK3);
@@ -3092,7 +3174,7 @@ int main(int argc, char** argv) {
             label(canvas, "controls", {hx, fy + 72}, C_INK3);
             text(canvas, "SPACE play    , . step    N/P sequence    1/2 swap model",
                  {hx, fy + 100}, T_BODY, C_INK2);
-            text(canvas, "A/D orbit  W/S zoom  V camera  C cubes  L labels  M mesh  O lookahead  R restart  F shot  Q quit",
+            text(canvas, "A/D orbit  W/S zoom  V camera  T layer  C cubes  L labels  O lookahead  R restart  F shot  Q quit",
                  {hx, fy + 126}, T_BODY, C_INK2);
         }
         {
@@ -3193,6 +3275,27 @@ int main(int argc, char** argv) {
                           << "  예측 " << prof_pred[k]
                           << "  예측그리기 " << prof_pdraw[k]
                           << "  프레임전체 " << prof_frame
+                          << [&] {
+                                 // 주차 차량이 실제로 몇 개나 기억되는가.
+                                 // "물체 127 개" 로는 그 안에 차가 몇 대인지,
+                                 // 몇 번이나 본 것인지 알 수 없다.
+                                 if (mem[k].empty()) return std::string();
+                                 std::map<std::string, std::array<int, 3>> by;
+                                 for (const auto& m : mem[k]) {
+                                     auto& e = by[m.cls];
+                                     e[0]++;                       // 전체
+                                     if (m.dynamic) e[1]++;        // 동적
+                                     if (m.count >= 5) e[2]++;     // 충분히 본 것
+                                 }
+                                 std::ostringstream o;
+                                 o << "\n           기억 물체 내역:";
+                                 for (const auto& [cls, e] : by) {
+                                     o << "  " << cls << " " << e[0]
+                                       << "(정지 " << (e[0] - e[1])
+                                       << ", 5회+ " << e[2] << ")";
+                                 }
+                                 return o.str();
+                             }()
                           << ", 기억물체 " << mem[k].size()
                           << " (동적 " << std::count_if(mem[k].begin(), mem[k].end(),
                                           [](const MemoryObject& m) { return m.dynamic; })
@@ -3234,6 +3337,7 @@ int main(int argc, char** argv) {
         // 죽었다 - if/else 사슬에서 같은 키를 두 번 쓰면 뒤엣것은 없는 코드다.
         else if (key == 'o' || key == 'O') show_pred = !show_pred;
         else if (key == 'c' || key == 'C') show_cubes = !show_cubes;
+        else if (key == 't' || key == 'T') layer = (layer + 1) % 6;
         else if (key == 'n' || key == 'N') {
             si = (si + 1) % static_cast<int>(seqs.size());
             frame = 0; acc_frame[0] = acc_frame[1] = -1; orb.dist = 0.0; user_zoomed = false;
