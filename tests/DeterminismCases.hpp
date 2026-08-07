@@ -326,12 +326,25 @@ inline void putTokens(test::Blob& blob, const TokenStore& store, const Integrati
 // 두 스토어를 *동시에 살려 두고* 번갈아 먹인다.
 // 순차로 돌리면 첫 스토어가 해제된 자리를 두 번째가 그대로 재사용해
 // 주소 의존 버그가 우연히 같은 답을 내고 만다 - 판별하지 못하는 측정이 된다.
-inline void tokenStoreInterleaved(test::Blob& a, test::Blob& b) {
+//
+// `pad` 는 두 스토어의 할당 사이에 끼워 넣는 살아 있는 더미 할당 수다.
+// 왜 필요한가: 주소 정렬 변이가 **검출되는지** 는 힙이 실제로 어떤 주소를
+// 주느냐에 달려 있다. bump 형태로 단조 증가하는 주소를 주면 주소 순서와 id
+// 순서가 우연히 일치해 변이가 안 잡힌다. 실측에서 이 대조군은 평소 통과하다가
+// 다른 프로세스가 메모리를 쓰는 동안 한 번 실패했다 - 즉 판정이 운에 달려
+// 있었다. pad 를 바꿔 가며 여러 배치를 시도하면 "이 힙에서 우연히 일치했다" 와
+// "변이를 검출할 수 없다" 를 가를 수 있다.
+inline void tokenStoreInterleaved(test::Blob& a, test::Blob& b, std::size_t pad = 0) {
     const auto seq = makeTokenSequence();
 
     TokenStore store_a, store_b;
+    std::vector<std::shared_ptr<int>> ballast;
+    ballast.reserve(pad * seq.size() + 1);
+
     for (const auto& in : seq) {
         const auto ra = store_a.integrate(in.detections, in.frame, in.T_world_cam, in.env);
+        // 두 스토어의 토큰 할당 사이에 살아 있는 블록을 끼운다.
+        for (std::size_t k = 0; k < pad; ++k) ballast.push_back(std::make_shared<int>(0));
         const auto rb = store_b.integrate(in.detections, in.frame, in.T_world_cam, in.env);
         a.put(ra.ok());
         b.put(rb.ok());

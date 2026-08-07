@@ -56,11 +56,24 @@ TEST(MutantControl, NmsTieBreakDifferenceIsDetected) {
 
 // M3: 주소 정렬로 바뀌면 동시에 살아 있는 두 스토어의 출력 순서가 갈라져야 한다.
 TEST(MutantControl, TokenOrderDifferenceIsDetected) {
-    test::Blob a, b;
-    tokenStoreInterleaved(a, b);
-    EXPECT_NE(a, b)
-        << "allTokens() 를 주소 정렬로 바꿔도 결과가 같다 - 토큰 순서 검사는 판별력이 없다";
-    if (a != b) {
-        std::cout << "  TokenStore 차이 검출 (바이트 " << a.firstDifference(b) << ")\n";
+    // 힙 배치를 여러 개 시도한다. 하나라도 차이가 나면 "이 검사는 주소 정렬
+    // 변이를 검출할 수 있다" 가 성립한다.
+    //
+    // 배치 하나만 보면 안 되는 이유: 주소 순서가 id 순서와 우연히 일치하는
+    // 힙에서는 변이가 있어도 결과가 같다. 실제로 이 대조군은 평소 통과하다가
+    // 다른 프로세스가 메모리를 쓰는 동안 한 번 실패했다 - 알고리즘이 아니라
+    // 할당자의 그날 기분을 재고 있었다는 뜻이다.
+    for (std::size_t pad : {std::size_t{0}, std::size_t{1}, std::size_t{3},
+                            std::size_t{7}, std::size_t{16}}) {
+        test::Blob a, b;
+        tokenStoreInterleaved(a, b, pad);
+        if (a != b) {
+            std::cout << "  TokenStore 차이 검출 (pad " << pad << ", 바이트 "
+                      << a.firstDifference(b) << ")\n";
+            SUCCEED();
+            return;
+        }
     }
+    ADD_FAILURE() << "다섯 가지 힙 배치 전부에서 allTokens() 주소 정렬 변이가 "
+                     "같은 결과를 냈다 - 토큰 순서 검사는 판별력이 없다";
 }
