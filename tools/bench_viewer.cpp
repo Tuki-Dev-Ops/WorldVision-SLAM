@@ -372,16 +372,78 @@ struct MemoryObject {
     int    seen{0};        // 마지막 관측 프레임
     int    count{0};       // 몇 번 봤는가. 여러 번 본 것일수록 진하게 그린다
 
-    Eigen::Vector3d center() const { return sum_c / std::max(1, count); }
+    // --- 움직이는가 ---
+    //
+    // 판정은 **기억 모델 안에서** 한다. 클래스로 정하지 않는다: 주차된 차는
+    // 지도의 일부이고 서 있는 사람도 마찬가지다. "person 이니까 동적" 은
+    // 관측이 아니라 편견이고, 06-results.md 14.1 이 그 규칙으로 앉아 있는
+    // 사람에게 15.7 배를 잃은 기록이다.
+    //
+    // 재는 것은 **처음 본 자리에서 얼마나 멀어졌는가의 최댓값** 이다.
+    // 관측 간 이동량의 합이 아니다 - 그러면 제자리에서 떠는 검출 상자가
+    // 전부 동적이 된다. 왕복해서 제자리로 돌아오는 보행자를 놓치지도 않는다.
+    Eigen::Vector3d first_c{Eigen::Vector3d::Zero()};  // 처음 본 자리
+    Eigen::Vector3d cur_c{Eigen::Vector3d::Zero()};    // 가장 최근에 본 자리
+    double span{0.0};      // first_c 로부터의 최대 거리
+    bool   dynamic{false};
+    // 동적으로 판정되면 이 자리들에 남긴 복셀을 지운다. 지금 자리도 다음
+    // 프레임이면 과거가 되므로 계속 채워진다.
+    std::vector<Eigen::Vector3d> trail;
+
+    Eigen::Vector3d center() const { return dynamic ? cur_c : sum_c / std::max(1, count); }
     Eigen::Vector3d size()   const { return sum_s / std::max(1, count); }
 
     void observe(const Eigen::Vector3d& c, const Eigen::Vector3d& sz, int frame) {
+        if (count == 0) first_c = c;
         sum_c += c;
         sum_s += sz;
         ++count;
         seen = frame;
+        cur_c = c;
+        span = std::max(span, (c - first_c).norm());
+
+        // 판정에는 관측이 몇 번 필요하다. 두 번으로 정하면 검출 하나가
+        // 튀는 것만으로 지도의 일부가 지워진다.
+        if (count >= 4) {
+            // 문턱은 물체 자신의 크기에서 나온다 - 제 발자국을 벗어났으면
+            // 움직인 것이고, 몇 cm 떠는 것은 검출 상자의 잡음이다.
+            //
+            // 최대 변보다 작게 잡는 이유: 사람의 최대 변은 **키** 라 1.7 m 다.
+            // 그걸 그대로 쓰면 방을 가로질러 걷는 사람도 한참 동안 정적으로
+            // 남는다. 움직임과 비교할 크기는 높이가 아니라 폭이므로 0.6 배를
+            // 쓰고, 아주 작은 검출이 잡음으로 동적이 되지 않게 바닥을 둔다.
+            const double own = std::max(0.30, 0.6 * size().maxCoeff());
+            if (span > own) dynamic = true;
+        }
+        if (dynamic) trail.push_back(c);
     }
 };
+
+// 복셀 지도에서 상자 하나가 덮는 영역을 지운다.
+//
+// 움직이는 물체가 지나간 자리에는 그때의 표면이 그대로 남는다. 지우지 않으면
+// 보행자 한 명이 지도에 자기 모습을 수십 개 남기고, 그것이 "세계를 기억한다"
+// 가 아니라 "지나간 것을 못 잊는다" 가 된다.
+inline void eraseBox(VoxelMap& vm, const Eigen::Vector3d& c,
+                     const Eigen::Vector3d& size) {
+    // 상자보다 조금 넉넉히. 검출 상자는 물체 경계에 딱 맞지 않는다.
+    const Eigen::Vector3d h = size * 0.5 * 1.35 + Eigen::Vector3d::Constant(vm.voxel);
+    const float inv = 1.0f / vm.voxel;
+    // 지울 복셀 수의 상한. 상자가 터무니없이 크게 잡히면 지도를 통째로
+    // 지울 수 있으므로 막는다 - 지우기는 되돌릴 수 없는 연산이다.
+    const double cells = (2 * h.x() / vm.voxel + 2) * (2 * h.y() / vm.voxel + 2) *
+                         (2 * h.z() / vm.voxel + 2);
+    if (!(cells > 0.0) || cells > 20000.0) return;
+    for (double x = c.x() - h.x(); x <= c.x() + h.x() + vm.voxel; x += vm.voxel) {
+        for (double y = c.y() - h.y(); y <= c.y() + h.y() + vm.voxel; y += vm.voxel) {
+            for (double z = c.z() - h.z(); z <= c.z() + h.z() + vm.voxel; z += vm.voxel) {
+                vm.cells.erase(voxKey(Eigen::Vector3f(static_cast<float>(x),
+                                                      static_cast<float>(y),
+                                                      static_cast<float>(z)), inv));
+            }
+        }
+    }
+}
 
 class CloudView {
 public:
@@ -854,7 +916,10 @@ int main(int argc, char** argv) {
     Orbit orb;
     double user_yaw = 0.0;         // A/D 가 더하는 시선 오프셋
     double base_dist = 0.0;        // 모드 전환 시 되돌아갈 기준 거리
-    Eigen::Vector3d ego_pos = Eigen::Vector3d::Zero();   // 지금 프레임의 자차 위치
+    Eigen::Vector3d ego_pos = Eigen::Vector3d::Zero();   // 지금 프레임의 자차 위치 (정답)
+    // 패널별 시선 중심. 각 패널은 **자기가 추정한** 위치에 걸린다 - 정답에
+    // 걸면 드리프트가 큰 쪽의 지도가 화면 밖으로 나간다.
+    Eigen::Vector3d pan_center[2] = {Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero()};
     bool   user_zoomed = false;    // W/S 를 눌렀으면 자동 거리 조정을 멈춘다
     bool   show_mesh = true;       // 표면 격자 (M 으로 토글)
     cv::Mat canvas(WIN_H, WIN_W, CV_8UC3);
@@ -1004,6 +1069,38 @@ int main(int argc, char** argv) {
             const cv::Rect vp(box.x + 14, box.y + 74, box.width - 28, vp_h);
             cloud[k].reset(vp.width, vp.height);
 
+            // **각 패널은 자기 인식 시점에 걸린다.**
+            //
+            // 두 시스템은 서로 다른 포즈를 추정하고, 각자의 지도는 **자기
+            // 추정 포즈로** 역투영해 쌓은 것이다. 그런데 화면 중심을 정답
+            // 포즈에 두면, 드리프트가 큰 쪽은 지도가 통째로 화면 밖으로
+            // 밀려난다 - walking_xyz 에서 ATE 가 124 cm 인 패널의 표면 격자가
+            // 오른쪽 구석에 몰려 있던 것이 그 결과다. 화면 밖으로 나간 것은
+            // 잘못 그린 것이 아니라 **정답 좌표계로 보고 있었기 때문** 이다.
+            //
+            // 각 패널을 자기 추정 위치에 걸면, 그 시스템이 자기 세계에서
+            // 무엇을 보고 있는지가 보인다. 두 지도가 어긋나 있다는 사실은
+            // 아래 궤적(정답 회색 대 추정 색)이 이미 말해 준다.
+            Orbit ob = orb;
+            Eigen::Vector3d ego_k = ego_pos;
+            {
+                const double st = s.rgb.empty() ? 0.0
+                                : s.rgb[static_cast<std::size_t>(frame)].first;
+                double bd = 0.25;
+                int pj = -1;
+                for (std::size_t j = 0; j < run.traj.size(); ++j) {
+                    const double d = std::abs(run.traj[j].t - st);
+                    if (d < bd) { bd = d; pj = static_cast<int>(j); }
+                }
+                if (pj >= 0) {
+                    ego_k = run.aligned[static_cast<std::size_t>(pj)].translation();
+                    // 부드럽게 따라간다. 프레임마다 튀면 지도가 읽히지 않는다.
+                    ob.center = (acc_frame[k] < 0)
+                              ? ego_k : pan_center[k] * 0.80 + ego_k * 0.20;
+                }
+                pan_center[k] = ob.center;
+            }
+
             // **왼쪽에는 세계 모델이 없다.**
             //
             // ORB+PnP 는 포즈를 추정할 뿐 세계를 기억하지 않는다. 누적 지도도,
@@ -1015,6 +1112,18 @@ int main(int argc, char** argv) {
             // ORB 가 프레임당 다루는 1000 점 규모에 맞춘 것이고, 프레임이
             // 지나가면 사라진다 - 실제로 그 파이프라인이 남기는 것이 없다.
             const bool has_memory = (run.kind != "descriptor");
+
+            // 검출 상자로 받아들일 최대 크기. **장면 규모에서 나온다.**
+            //
+            // 검출 상자 안이 배경이면 깊이 중앙값이 엉뚱한 값을 잡아 물체가
+            // 터무니없이 커진다. 14 m 는 KITTI 의 트럭/버스를 통과시키려고 둔
+            // 값인데, 그걸 TUM 에 그대로 쓰면 5 m 짜리 사무실 안에 14 m 짜리
+            // "사람" 이 생겨 화면을 통째로 덮는다 - walking_xyz 에서 지도가
+            // 거대한 주황 와이어프레임에 파묻힌 것이 그것이다.
+            //
+            // 2.5 m 는 사람이 설 수 있는 크기의 상한이다. 그보다 큰 person 은
+            // 관측이 아니라 깊이 실패다.
+            const double box_max = (s.dataset == "kitti") ? 14.0 : 2.5;
 
             // 점군 누적. 프레임이 뒤로 가면 다시 쌓는다.
             if (kDrawCloud) {
@@ -1066,8 +1175,8 @@ int main(int argc, char** argv) {
                     // 노면은 낮고 건물은 높은, 구조가 읽히는 지도가 된다.
                     const double h0 = (s.dataset == "kitti") ? -1.8 : -0.6;
                     const double h1 = (s.dataset == "kitti") ?  6.0 :  1.6;
-                    const Eigen::Vector3f up_f = orb.world_up.cast<float>();
-                    const float ego_h = static_cast<float>(ego_pos.dot(orb.world_up));
+                    const Eigen::Vector3f up_f = ob.world_up.cast<float>();
+                    const float ego_h = static_cast<float>(ego_k.dot(ob.world_up));
                     for (auto& p : pts) {
                         const float h = p.p.dot(up_f) - ego_h;
                         p.depth_norm = static_cast<float>(
@@ -1092,14 +1201,26 @@ int main(int argc, char** argv) {
                         for (const auto& b : s.boxes) {
                             if (b.frame != fi) continue;
                             const double mx = b.size.maxCoeff();
-                            if (!(mx > 0.2) || mx > 14.0) continue;
+                            if (!(mx > 0.2) || mx > box_max) continue;
                             const Eigen::Vector3d wc = Tw * b.center;
 
+                            // **결합은 마지막으로 본 자리로 한다, 평균이 아니라.**
+                            //
+                            // 평균과 비교하면 걸어가는 사람은 평균이 뒤처지면서
+                            // 거리가 병합 반경을 넘고, 같은 사람이 짧은 조각
+                            // 수십 개로 쪼개진다. 조각마다 관측이 서너 번뿐이라
+                            // 동적 판정에 필요한 관측 수에 영영 도달하지 못한다 -
+                            // 실제로 walking_xyz 에서 상자 1076 개가 물체 49 개로
+                            // 흩어지고 동적 판정은 하나도 서지 않았다.
+                            //
+                            // 평균은 **그리는** 데 쓰는 값이다 (정지 물체가 관측
+                            // 잡음으로 떨지 않게). 결합은 추적이므로 최근 위치가
+                            // 맞다. 두 목적에 같은 숫자를 쓴 것이 잘못이었다.
                             MemoryObject* hit = nullptr;
                             double bestd = merge_r;
                             for (auto& m : mem[k]) {
                                 if (m.cls != b.cls) continue;
-                                const double d = (m.center() - wc).norm();
+                                const double d = ((m.count > 0 ? m.cur_c : m.center()) - wc).norm();
                                 if (d < bestd) { bestd = d; hit = &m; }
                             }
                             if (hit == nullptr) {
@@ -1110,6 +1231,25 @@ int main(int argc, char** argv) {
                             } else {
                                 hit->observe(wc, b.size, fi);
                             }
+                        }
+
+                        // 동적으로 판정된 물체가 지나온 자리를 지운다.
+                        //
+                        // 판정이 뒤늦게 서더라도 trail 에는 처음부터의 자리가
+                        // 다 들어 있으므로, 그 시점까지 쌓인 것도 같이 지워진다.
+                        // "지금부터 안 쌓는다" 로는 이미 남은 잔상이 안 없어진다.
+                        for (auto& m : mem[k]) {
+                            if (!m.dynamic || m.trail.empty()) continue;
+                            const Eigen::Vector3d sz = m.size();
+                            for (const auto& c : m.trail) {
+                                eraseBox(acc[k], c, sz);
+                                eraseBox(mesh[k], c, sz);
+                            }
+                            // 마지막 자리만 남긴다. 다음 프레임이면 그것도
+                            // 과거가 되므로 한 번 더 지워진다.
+                            const Eigen::Vector3d last = m.trail.back();
+                            m.trail.clear();
+                            m.trail.push_back(last);
                         }
                     }
                 }
@@ -1125,7 +1265,7 @@ int main(int argc, char** argv) {
                     v.age = static_cast<float>(
                         std::clamp(1.0 - static_cast<double>(v.seen) / span, 0.0, 1.0));
                 }
-                cloud[k].draw(flat, orb, vp.width * 0.9, 0.62);
+                cloud[k].draw(flat, ob, vp.width * 0.9, 0.62);
                 // 점 위에 표면 격자를 덧그린다. 순서가 중요하다 - 먼저 그리면
                 // 점군이 격자를 덮어 아무 것도 이어져 보이지 않는다.
                 if (show_mesh && has_memory) {
@@ -1133,7 +1273,7 @@ int main(int argc, char** argv) {
                         v.second.age = static_cast<float>(std::clamp(
                             1.0 - static_cast<double>(v.second.seen) / span, 0.0, 1.0));
                     }
-                    cloud[k].lattice(mesh[k].cells, mesh[k].voxel, orb,
+                    cloud[k].lattice(mesh[k].cells, mesh[k].voxel, ob,
                                      vp.width * 0.9, 0.72);
                 }
             }
@@ -1147,12 +1287,12 @@ int main(int argc, char** argv) {
                 // **인식하는 그 시점** 에 링을 건다. 화면 중심(고정 지도의
                 // 중심)에 그리면 링이 자차와 따로 놀아서 "지금 어디서 무엇을
                 // 보고 있는가" 를 전혀 말해 주지 못한다.
-                cloud[k].rangeRings(ego_pos, orb.world_up, orb, f3, step, 5,
+                cloud[k].rangeRings(ego_k, ob.world_up, ob, f3, step, 5,
                                     cv::Scalar(78, 62, 50));
             }
 
             for (std::size_t i = 1; i < s.gt.size(); ++i) {
-                cloud[k].line3(s.gt[i - 1].p, s.gt[i].p, orb, f3, C_GT, 1);
+                cloud[k].line3(s.gt[i - 1].p, s.gt[i].p, ob, f3, C_GT, 1);
             }
             {
                 const double frac = static_cast<double>(frame + 1) / nframes;
@@ -1161,7 +1301,7 @@ int main(int argc, char** argv) {
                 for (int i = 1; i < upto; ++i) {
                     cloud[k].line3(run.aligned[static_cast<std::size_t>(i - 1)].translation(),
                                    run.aligned[static_cast<std::size_t>(i)].translation(),
-                                   orb, f3, accent, 2);
+                                   ob, f3, accent, 2);
                 }
                 // --- 의미 구조 ---
                 // 평면(건물 벽/지면)과 물체 상자(차량/사람)를 **이 시스템의
@@ -1185,6 +1325,33 @@ int main(int argc, char** argv) {
                     for (const auto& q : s.planes) {
                         const int d = std::abs(q.frame - frame);
                         if (d < best) { best = d; snap = q.frame; }
+                    }
+
+                    // **없는 데이터는 그리지 않는다.**
+                    //
+                    // 의미 정보(상자/평면)는 내보내기 프레임에만 있다. 장면
+                    // 내보내기는 stride 4 로 150 프레임까지만 돌았으므로
+                    // walking_xyz 에서는 596 번 프레임이 마지막이다. 그런데
+                    // "가장 가까운" 프레임을 고르는 규칙은 820 번에서도 596 을
+                    // 골라 주고, 그러면 **7.5 초 전의 관측을 그때의 포즈로**
+                    // 지금 화면에 그리게 된다. 그것이 지도 오른쪽에 따로 떠
+                    // 있던 커다란 상자 무더기의 정체다.
+                    //
+                    // 오래된 관측을 지금 것처럼 그리는 것은 드리프트를 보여
+                    // 주려던 화면이 스스로 없는 구조를 지어내는 일이다.
+                    // 내보내기 간격의 두 배를 넘으면 아무 것도 그리지 않는다.
+                    if (snap >= 0) {
+                        // 내보내기 간격은 데이터에서 읽는다 - 도구의 기본값을
+                        // 여기에 또 적어 두면 둘이 어긋날 때 조용히 틀린다.
+                        int stride = 1 << 30, prev = -1;
+                        for (const auto& b : s.boxes) {
+                            if (prev >= 0 && b.frame > prev) {
+                                stride = std::min(stride, b.frame - prev);
+                            }
+                            prev = std::max(prev, b.frame);
+                        }
+                        if (stride == (1 << 30)) stride = 1;
+                        if (best > 2 * stride) snap = -1;
                     }
 
                     // 상자/평면은 **snap 프레임의 카메라 좌표계** 에 있다.
@@ -1211,6 +1378,29 @@ int main(int argc, char** argv) {
                                               m.cls == "bus" || m.cls == "motorcycle" ||
                                               m.cls == "bicycle" || m.cls == "train");
                         const bool person = (m.cls == "person");
+
+                        // **움직인다고 판정된 것은 지도의 일부가 아니다.**
+                        // 지나온 자리에 남기지 않고, 지금 있는 자리에만 그린다.
+                        // 그 자리에 쌓였던 복셀은 이미 지워졌다.
+                        if (m.dynamic) {
+                            // 최근에 못 본 동적 물체는 그리지 않는다. 마지막으로
+                            // 본 자리에 세워 두면 그것이 바로 잔상이다.
+                            if (frame - m.seen > 12) continue;
+                            cloud[k].footprint(Eigen::Isometry3d::Identity(), m.center(),
+                                               m.size(), ob.world_up, ob, f3, C_WARN, 2);
+                            cv::Point at;
+                            const Eigen::Vector3d top =
+                                m.center() - ob.world_up * (m.size().maxCoeff() * 0.5 + 0.12);
+                            if (cloud[k].project3(top, ob, f3, at)) {
+                                at.x += vp.x; at.y += vp.y - 6;
+                                if (at.x > vp.x && at.x < vp.x + vp.width - 90 &&
+                                    at.y > vp.y + 12 && at.y < vp.y + vp.height) {
+                                    text(canvas, m.cls + " moving", at, T_LABEL, C_WARN, 1);
+                                }
+                            }
+                            continue;
+                        }
+
                         const cv::Scalar base = vehicle ? accent
                                               : (person ? C_WARN : C_INK3);
                         // 오래 전에 본 것일수록 어둡게. 지우지는 않는다 -
@@ -1223,7 +1413,7 @@ int main(int argc, char** argv) {
                                              base[2] * a + C_BG[2] * (1 - a)};
                         // 이미 월드 좌표이므로 항등 변환으로 그린다.
                         cloud[k].footprint(Eigen::Isometry3d::Identity(), m.center(),
-                                           m.size(), orb.world_up, orb, f3, col, 1);
+                                           m.size(), ob.world_up, ob, f3, col, 1);
                     }
 
                     if (snap >= 0) {
@@ -1231,10 +1421,19 @@ int main(int argc, char** argv) {
                             if (q.frame != snap || q.conf < 0.25) continue;
                             // extent 는 평면 위 점들의 **평균 산포** 다. 그대로
                             // 반지름으로 쓰면 실제 패치보다 훨씬 커 보인다.
-                            const double half = std::clamp(q.extent, 0.3,
-                                           s.dataset == "kitti" ? 5.0 : 1.2);
-                            cloud[k].planeQuad(Tsnap, q.centroid, q.normal, half, orb, f3,
-                                               cv::Scalar(122, 100, 82));
+                            //
+                            // 게다가 planeQuad 의 네 꼭짓점은 c ± (a±b)·half 라
+                            // 대각선이 2·√2·half 다. 실내 상한 1.2 m 는 한 변
+                            // 3.4 m 짜리 사각형이 되고, 방 자체가 3 m 인 장면에서는
+                            // 평면 열 개가 지도를 통째로 덮어 버린다 - 실제로
+                            // walking_xyz 에서 점군도 물체도 보이지 않았다.
+                            //
+                            // 평면은 Tier 2 의 진단이지 화면의 주인공이 아니다.
+                            // 장면 규모에 맞춰 줄이고 색도 배경 쪽으로 내린다.
+                            const double half = std::clamp(q.extent, 0.15,
+                                           s.dataset == "kitti" ? 5.0 : 0.45);
+                            cloud[k].planeQuad(Tsnap, q.centroid, q.normal, half, ob, f3,
+                                               cv::Scalar(74, 62, 52));
                         }
                         // 이전 내보내기 프레임을 찾아 둔다. 같은 물체의
                         // 프레임 간 이동이 곧 속도 벡터가 된다.
@@ -1248,7 +1447,7 @@ int main(int argc, char** argv) {
                             // 물리적으로 말이 되는 크기만. 검출 상자 안이 배경이면
                             // 깊이 중앙값이 엉뚱해져 50 m 짜리 자동차가 나온다.
                             const double mx = b.size.maxCoeff();
-                            if (!(mx > 0.2) || mx > 14.0) continue;
+                            if (!(mx > 0.2) || mx > box_max) continue;
                             const bool vehicle = (b.cls == "car" || b.cls == "truck" ||
                                                   b.cls == "bus" || b.cls == "motorcycle" ||
                                                   b.cls == "bicycle" || b.cls == "train");
@@ -1256,10 +1455,10 @@ int main(int argc, char** argv) {
                             const cv::Scalar col = vehicle ? accent
                                                  : (person ? C_WARN : C_INK3);
 
-                            cloud[k].box3(Tsnap, b.center, b.size, orb, f3, col, 1);
+                            cloud[k].box3(Tsnap, b.center, b.size, ob, f3, col, 1);
                             // 지면 발자국. 항공뷰에서는 이것이 물체의 본체다.
-                            cloud[k].footprint(Tsnap, b.center, b.size, orb.world_up,
-                                               orb, f3, col, 2);
+                            cloud[k].footprint(Tsnap, b.center, b.size, ob.world_up,
+                                               ob, f3, col, 2);
 
                             // 속도 벡터: 직전 내보내기 프레임에서 가장 가까운
                             // 같은 클래스 상자와 이어 붙인다. 추적기가 아니라
@@ -1278,7 +1477,7 @@ int main(int argc, char** argv) {
                                     const Eigen::Vector3d e = Tsnap * b.center;
                                     // 3 배로 늘려 그린다. 실제 이동량은 짧아서
                                     // 화면에서 방향이 보이지 않는다.
-                                    cloud[k].arrow3(e, e + (e - a) * 3.0, orb, f3, col, 2);
+                                    cloud[k].arrow3(e, e + (e - a) * 3.0, ob, f3, col, 2);
                                 }
                             }
 
@@ -1287,7 +1486,7 @@ int main(int argc, char** argv) {
                             cv::Point at;
                             const Eigen::Vector3d top =
                                 Tsnap * (b.center - Eigen::Vector3d(0, 0.5 * b.size.y(), 0));
-                            if (cloud[k].project3(top, orb, f3, at)) {
+                            if (cloud[k].project3(top, ob, f3, at)) {
                                 at.x += vp.x; at.y += vp.y - 6;
                                 if (at.x > vp.x && at.x < vp.x + vp.width - 60 &&
                                     at.y > vp.y + 12 && at.y < vp.y + vp.height) {
@@ -1301,7 +1500,7 @@ int main(int argc, char** argv) {
                 // 현재 카메라 프러스텀
                 if (upto > 0) {
                     const Eigen::Isometry3d& T = run.aligned[static_cast<std::size_t>(upto - 1)];
-                    const double sc3 = std::max(0.05, orb.dist * 0.03);
+                    const double sc3 = std::max(0.05, ob.dist * 0.03);
                     const Eigen::Vector3d o = T.translation();
                     const Eigen::Vector3d c[4] = {
                         T * Eigen::Vector3d(-sc3, -sc3 * 0.75, sc3 * 1.4),
@@ -1309,8 +1508,8 @@ int main(int argc, char** argv) {
                         T * Eigen::Vector3d( sc3,  sc3 * 0.75, sc3 * 1.4),
                         T * Eigen::Vector3d(-sc3,  sc3 * 0.75, sc3 * 1.4)};
                     for (int e = 0; e < 4; ++e) {
-                        cloud[k].line3(o, c[e], orb, f3, C_INK, 1);
-                        cloud[k].line3(c[e], c[(e + 1) % 4], orb, f3, C_INK, 1);
+                        cloud[k].line3(o, c[e], ob, f3, C_INK, 1);
+                        cloud[k].line3(c[e], c[(e + 1) % 4], ob, f3, C_INK, 1);
                     }
                 }
             }
@@ -1498,6 +1697,9 @@ int main(int argc, char** argv) {
                 std::cerr << "  패널 " << k << ": 복셀 " << acc[k].cells.size()
                           << " (" << acc[k].voxel << " m, coarsen " << acc[k].grown << ")"
                           << ", 기억물체 " << mem[k].size()
+                          << " (동적 " << std::count_if(mem[k].begin(), mem[k].end(),
+                                          [](const MemoryObject& m) { return m.dynamic; })
+                          << ")"
                           << ", 평면 " << s.planes.size()
                           << ", 상자 " << s.boxes.size()
                           << ", orbit dist " << orb.dist
