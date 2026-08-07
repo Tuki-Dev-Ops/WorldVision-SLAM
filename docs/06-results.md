@@ -3113,6 +3113,53 @@ The mask converts exactly the two `walking` sequences and nothing else. **13–4
 that corresponds to a system rather than to a selection**, and it is the one §22's headline
 should have been reporting all along.
 
+#### The third-party control, re-run — and the TUM verdict is a tie
+
+`cv2.Odometry` was re-run over the same complete sequences (75 minutes of wall clock; it is the
+control that owes nothing to this repository, which is what makes it the informative one). ATE
+cm, TUM only, against **the better of the two controls**:
+
+| sequence | ORB+PnP | cv2.Odometry | WME Tier 0 | WME best | winner |
+|---|---|---|---|---|---|
+| fr1_360 | *diverged* | **24.42** | 29.71 | 29.71 | control |
+| fr1_desk | 8.84 | 23.39 | **5.60** | 5.60 | WME |
+| fr1_plant | 15.01 | 14.84 | **6.19** | 6.19 | WME |
+| fr1_room | 48.06 | 72.29 | 21.72 | **21.18** | WME |
+| fr1_teddy | 22.02 | **16.25** | 54.92 | 53.97 | control |
+| fr1_xyz | **4.05** | 4.67 | 4.61 | 4.54 | control |
+| fr2_desk | 29.06 | 45.93 | **11.14** | 11.14 | WME |
+| fr2_desk_with_person | 9.59 | 80.84 | 7.77 | **7.42** | WME |
+| fr3_nostructure_notexture_far | *diverged* | 78.57 | *no output* | *no output* | — |
+| fr3_nostructure_texture_far | 34.12 | 20.60 | 7.74 | **7.21** | WME |
+| fr3_sitting_halfsphere | 101.47 | 15.43 | **9.54** | 9.54 | WME |
+| fr3_sitting_xyz | 19.69 | **3.61** | 4.35 | 4.35 | control |
+| fr3_structure_notexture_far | *diverged* | **6.54** | 12.58 | 12.58 | control |
+| fr3_structure_texture_far | 3.12 | 3.04 | **2.00** | 2.00 | WME |
+| fr3_walking_halfsphere | 50.97 | 79.88 | 63.29 | **33.60** | WME |
+| fr3_walking_xyz | 38.50 | 108.71 | 124.61 | **33.88** | WME |
+
+| what is counted | WME | control | unscorable |
+|---|---|---|---|
+| TUM, better-of-two controls, WME best-of | **10** | 5 | 1 |
+| TUM, better-of-two controls, **Tier 0 alone** | **8** | 7 | 1 |
+| KITTI, ORB only, Tier 0 | **4** | 0 | 0 |
+
+**On TUM, one configuration against two controls is 8–7.** That is a tie, and it is the number
+this project is entitled to state. §22's 9–6 was the best-of figure on truncated data; the
+best-of figure on complete data is 10–5, and the gap between 10–5 and 8–7 is the token mask being
+chosen per sequence.
+
+Two things from §22.4 survive intact and both are unflattering. `structure_notexture_far` —
+descriptors starve, the direct method should own it — still goes to cv2, now **6.54 against
+12.58**. And ORB's divergence there is not a scoring artifact: it happens on complete data too.
+Meanwhile cv2 takes `sitting_xyz` (3.61 against 4.35), which §22 had listed among WME's decisive
+dynamic wins.
+
+> §22.4 wrote that "the count of controls is itself an experimental parameter." Complete data
+> adds a second: **the count of configurations.** One control and a per-sequence best-of read as
+> 12–4. Two controls and one configuration read as 8–7. No WME number changed between those two
+> sentences — only what was allowed to be counted.
+
 #### The divergence detector was measuring the wrong thing
 
 `sitting_halfsphere`'s 4888.94 cm exposed a hole in §22.5's own guard. `run_status()` flagged

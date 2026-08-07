@@ -91,20 +91,30 @@ own estimated pose — drift shows up as a smeared point cloud, not just a numbe
 
 <div align="center">
 
-| Dataset | Sequences | Control | Result |
+| Dataset | Sequences | Control | Result (one configuration) |
 |---|---|---|---|
-| **TUM RGB-D** (indoor, handheld) | 16 | ORB+PnP, `cv2.Odometry` | **9 – 6** (against the better of the two) |
+| **TUM RGB-D** (indoor, handheld) | 16 | ORB+PnP, `cv2.Odometry` | **8 – 7** (against the better of the two) |
 | **KITTI odometry** (outdoor, vehicle) | 4 | ORB+PnP | **4 – 0** |
 
 </div>
 
-With TUM alone the comparison read 9–6. Adding KITTI **flipped it to 2–2.** The cause turned out
-to be that ECDA trusted stereo depth as exact — a point at 60 m carries ±4 m of depth error and
-was being weighted like a 6 m point at ±4 cm. Moving that uncertainty into the residual variance
-(with the coefficient **derived** as `c = σ_d/(f·B)`, not tuned) brought it to 4–0.
+**TUM is a tie.** Picking the better WME variant per sequence reads 10–5, but that is a choice no
+deployed system gets to make; the table above runs **the same configuration** (Tier 0) on
+everything.
 
-> **Every sentence that had read "WME is better" was a property of TUM, not of the algorithms.**
-> The full account is in [§25.20–25.21](../06-results.md).
+These numbers moved twice, and both times the cause was measurement rather than algorithms.
+
+- **Adding KITTI flipped it to 2–2.** ECDA trusted stereo depth as exact — a point at 60 m
+  carries ±4 m of depth error and was weighted like a 6 m point at ±4 cm. Moving that uncertainty
+  into the residual variance (coefficient **derived** as `c = σ_d/(f·B)`, not tuned) brought it
+  to 4–0. ([§25.20–25.21](../06-results.md))
+- **13 of the 16 TUM sequences were being scored on a fraction of themselves** — 35 % on average,
+  6.4 % at worst. An interrupted extraction left the frame index intact while the frames were
+  missing, so every loader read what existed and reported a clean run. Re-fetched and re-run,
+  five verdicts flipped — **in both directions**. ([§25.22](../06-results.md))
+
+> **Every sentence that had read "WME is better" was, once, a property of TUM rather than of the
+> algorithms — and once, a result computed on a third of the data.**
 
 ### 3. Be equally clear about what it is not
 
