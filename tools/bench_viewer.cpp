@@ -563,6 +563,8 @@ inline cv::Scalar stuffColor(Stuff s) {
 // 아니라 어느 높이가 찼는지를 알아야 나온다. 0.5 m 씩 32 칸, 지면 위 16 m.
 constexpr double kPiV = 3.14159265358979323846;
 constexpr float kBinH = 0.5f;
+// 노면 격자 크기. 주차선 폭이 15 cm 이므로 그보다 촘촘해야 한다.
+constexpr float kRoadCell = 0.10f;
 constexpr int   kBins = 32;
 
 struct Column {
@@ -903,6 +905,32 @@ struct PredictScore {
     void clear() { hit = miss = missed = 0; lateral = 6.0f; lateral_n = 1.0f; }
 };
 
+// ---------------------------------------------------------------------------
+// 노면 텍스처 — 도로는 2 차원이므로 3 차원 해상도를 쓸 이유가 없다
+// ---------------------------------------------------------------------------
+// 주차선은 폭이 15 cm 다. 0.3 m 복셀로는 선이 칸보다 가늘어서 표현할 수 있는
+// 크기가 아니고, 그래서 밝기를 들고 와도 선이 나오지 않았다.
+//
+// 그렇다고 부피 복셀을 0.1 m 로 줄이면 메모리가 27 배가 된다. 그럴 필요가
+// 없다 - **노면은 면이지 부피가 아니다.** 높이 축을 뺀 2 차원 격자를 따로
+// 두면 같은 메모리로 세 배 촘촘한 해상도를 얻는다. 55 m 반경 0.1 m 격자가
+// 100 만 칸, 칸당 12 바이트로 12 MB 다.
+struct RoadCell {
+    float        h{0.0f};        // 그 칸의 노면 높이
+    float        range{0.0f};    // 관측 거리. 가까이서 본 것이 이긴다
+    std::uint8_t intensity{0};   // 관측된 밝기 - 흰 페인트가 여기 남는다
+    std::uint8_t hits{0};
+};
+
+// 노면 격자 키. 높이 축을 뺀 2 차원이다.
+inline std::int64_t roadKey(const Eigen::Vector3f& p, const Eigen::Vector3f& a,
+                            const Eigen::Vector3f& b, float inv) {
+    const auto q = [inv](float v) {
+        return static_cast<std::int64_t>(std::floor(static_cast<double>(v) * inv));
+    };
+    return ((q(p.dot(a)) & 0x3FFFFFF) << 26) | (q(p.dot(b)) & 0x3FFFFFF);
+}
+
 // 월드에 고정되는 물체 기억. 지나온 곳에서 본 물체가 그 자리에 남는다.
 //
 // **관측마다 위치를 덮어쓰면 안 된다.** 그러면 카메라가 움직일 때마다 물체가
@@ -1181,6 +1209,73 @@ public:
             const Eigen::Vector3d q0 = o + b * (i * step) - a * reach;
             const Eigen::Vector3d q1 = o + b * (i * step) + a * reach;
             line3(q0, q1, orb, f, col2, 1);
+        }
+    }
+
+    // 노면 텍스처. 정밀 2 차원 격자를 밝기로 칠한다.
+    //
+    // 부피 복셀(0.3 m)이 아니라 노면 전용 격자(0.1 m)를 그리므로, 폭 15 cm 인
+    // 주차선이 칸보다 굵어져 비로소 화면에 나온다. 도로는 면이니 높이 방향
+    // 해상도를 쓸 이유가 없고, 그 예산을 전부 가로세로에 쓰는 것이다.
+    void roadTexture(const std::unordered_map<std::int64_t, RoadCell>& cells,
+                     const Eigen::Vector3f& a, const Eigen::Vector3f& b,
+                     const Eigen::Vector3d& up_d, const Orbit& orb, double f,
+                     const Eigen::Vector3d& ego, double radius) {
+        const Eigen::Vector3d up = up_d.normalized();
+        const Eigen::Vector3d ad = a.cast<double>(), bd = b.cast<double>();
+        const double h = 0.5 * kRoadCell;
+        const double r2 = radius * radius;
+        const Eigen::Matrix3d M = orb.basis();
+        const Eigen::Vector3d eye = orb.center - M.row(2).transpose() * orb.dist;
+
+        // 밝기 범위는 **보이는 범위에서** 잡는다. 지도 전체로 정규화하면
+        // 그늘진 구간이 대비를 통째로 먹어 여기 선이 안 뜬다.
+        int lo = 255, hi = 0;
+        for (const auto& [k, c] : cells) {
+            if (c.hits == 0) continue;
+            const Eigen::Vector3d p = ad * 0.0 + up * c.h;   // 높이만 필요 없음
+            (void)p;
+            lo = std::min(lo, static_cast<int>(c.intensity));
+            hi = std::max(hi, static_cast<int>(c.intensity));
+        }
+        const double span = std::max(20, hi - lo);
+
+        for (const auto& [key, c] : cells) {
+            if (c.hits == 0) continue;
+            // 키에서 격자 좌표를 되찾는다. 부호 확장을 해야 음수 칸이 살아난다.
+            std::int64_t qi = (key >> 26) & 0x3FFFFFF;
+            std::int64_t qj = key & 0x3FFFFFF;
+            if (qi & 0x2000000) qi -= 0x4000000;
+            if (qj & 0x2000000) qj -= 0x4000000;
+            const double ca = (static_cast<double>(qi) + 0.5) * kRoadCell;
+            const double cb = (static_cast<double>(qj) + 0.5) * kRoadCell;
+            const Eigen::Vector3d c3 = ad * ca + bd * cb + up * c.h;
+            if ((c3 - ego).squaredNorm() > r2) continue;
+
+            const Eigen::Vector3d q[4] = {c3 - ad * h - bd * h, c3 + ad * h - bd * h,
+                                          c3 + ad * h + bd * h, c3 - ad * h + bd * h};
+            cv::Point poly[4];
+            bool ok = true;
+            for (int i = 0; i < 4 && ok; ++i) ok = project3(q[i], orb, f, poly[i]);
+            if (!ok) continue;
+            const double w = std::max({std::abs(poly[0].x - poly[2].x),
+                                       std::abs(poly[0].y - poly[2].y)});
+            if (w > img_.cols * 0.4) continue;
+            // **화면에서 1 px 도 안 되는 칸은 그리지 않는다.**
+            //
+            // 0.1 m 격자를 55 m 까지 전부 그리면 사각형이 100 만 개가 되고
+            // 프레임당 361 ms 가 든다 (실측). 그 대부분은 화면에서 한 점보다
+            // 작아 아무 것도 보태지 않는다 - 멀리 있는 노면은 어차피 아래
+            // 격자면이 대신한다.
+            if (w < 1.0) continue;
+
+            // 제곱으로 대비를 세운다. 아스팔트는 배경으로 가라앉고 흰 페인트만
+            // 남아야 선이 선으로 읽힌다.
+            const double t = std::clamp((c.intensity - lo) / span, 0.0, 1.0);
+            const double v = 22.0 + 225.0 * t * t;
+            cv::fillConvexPoly(img_, poly, 4, cv::Scalar(v, v, v), cv::LINE_8);
+            const double zz = (M * (c3 - eye)).z();
+            if (zz > 1e-3) cv::fillConvexPoly(zbuf_, poly, 4, cv::Scalar(zz), cv::LINE_8);
         }
     }
 
@@ -2329,6 +2424,10 @@ int main(int argc, char** argv) {
     std::vector<MemoryObject> mem[2];
     // 지도에서 유도한 장면 라벨 (지면/건물/담장/나무/기둥).
     std::unordered_map<std::int64_t, Column> stuff[2];
+    // 노면 텍스처. 부피 지도와 따로 가는 2 차원 정밀 격자다.
+    std::unordered_map<std::int64_t, RoadCell> road[2];
+    Eigen::Vector3f road_a{Eigen::Vector3f::UnitX()};
+    Eigen::Vector3f road_b{Eigen::Vector3f::UnitZ()};
     // 오버레이는 기본 꺼짐. 전부 켜면 지도가 안 보이고, 사람이
     // 보려던 것은 지도다. L / O 로 필요할 때 켠다.
     // 라벨을 기본으로 켠다. 형상이 있어야 무엇을 인식했는지가 보인다.
@@ -2420,6 +2519,14 @@ int main(int argc, char** argv) {
                 orb.world_up = (s.dataset == "kitti") ? Eigen::Vector3d(0, -1, 0)
                                                       : Eigen::Vector3d(0, 0, 1);
                 // 표면 격자는 성기게. 촘촘하면 선이 뭉쳐 면처럼 뭉개진다.
+                // 노면 격자의 두 축. world_up 과 함께 한 번만 정한다.
+                {
+                    Eigen::Vector3f u = orb.world_up.cast<float>().normalized();
+                    Eigen::Vector3f aa = u.cross(Eigen::Vector3f::UnitZ());
+                    if (aa.norm() < 1e-6f) aa = u.cross(Eigen::Vector3f::UnitX());
+                    road_a = aa.normalized();
+                    road_b = u.cross(road_a).normalized();
+                }
                 mesh[0].voxel = mesh[1].voxel =
                     (s.dataset == "kitti") ? 2.2f : 0.16f;
             }
@@ -2667,10 +2774,12 @@ int main(int argc, char** argv) {
                     acc[k].clear();
                     mesh[k].clear();
                     mem[k].clear();
+                    road[k].clear();
                     acc_frame[k] = frame - 1;
                 } else if (acc_frame[k] > frame || acc_frame[k] < 0) {
                     acc[k].clear();
                     mesh[k].clear();
+                    road[k].clear();
                     acc_frame[k] = -1;
                 }
                 const int from = acc_frame[k] + 1;
@@ -2776,6 +2885,33 @@ int main(int argc, char** argv) {
                         // 넣은 좋은 값까지 같이 지우는 일이 없다.
                         acc[k].insert(p, static_cast<std::size_t>(cloud_cap), sector);
                         mesh[k].insert(p, 120000, sector);
+                    }
+
+                    // **노면은 정밀 격자에 따로 쌓는다.**
+                    //
+                    // 부피 복셀은 0.3 m 라 15 cm 짜리 주차선을 담을 수 없다.
+                    // 노면만 0.1 m 2 차원 격자로 받으면 같은 메모리로 세 배
+                    // 촘촘해지고, 흰 선이 칸보다 굵어져 비로소 보인다.
+                    {
+                        const float e0 = static_cast<float>(ego_hh);
+                        const float rinv = 1.0f / kRoadCell;
+                        for (const auto& p : pts) {
+                            const float rel = p.p.dot(up_f) - e0;
+                            // 자차 발밑 높이 ± 40 cm 가 노면이다. 연석과 차량
+                            // 밑동은 여기서 빠져 부피 지도에 남는다.
+                            const float floor_rel = (s.dataset == "kitti") ? -1.65f : -0.8f;
+                            if (std::abs(rel - floor_rel) > 0.40f) continue;
+                            const std::int64_t rk = roadKey(p.p, road_a, road_b, rinv);
+                            auto& rc = road[k][rk];
+                            // 가까이서 본 관측이 이긴다. 노면 표시는 원거리
+                            // 에서 몇 화소뿐이라 멀리서 본 값은 번져 있다.
+                            if (rc.hits == 0 || p.range < rc.range) {
+                                rc.h = p.p.dot(up_f);
+                                rc.range = p.range;
+                                rc.intensity = p.intensity;
+                            }
+                            if (rc.hits < 255) ++rc.hits;
+                        }
                     }
                     // 가까운 관측만 정정 권한을 갖는다. 30 m 에서 본 것으로
                     // 60 m 짜리를 지우면, 둘 다 못 믿을 값인데 하나가 다른
@@ -2957,8 +3093,13 @@ int main(int argc, char** argv) {
                 // 밝기를 들고 오면 그대로 나온다 - 라이다 지도가 intensity 로
                 // 차선을 보여 주는 것과 같은 이야기다.
                 if (layer == 0 || layer == 1 || layer == 5) {
-                    cloud[k].roadSurface(ground_pts, acc[k].voxel, ob,
-                                         vp.width * 0.9, ob.world_up);
+                    // 노면 텍스처는 부피 지도보다 짧은 반경만 그린다. 0.1 m
+                    // 칸은 멀어지면 화면에서 사라지므로 그릴 값이 없고, 그
+                    // 자리는 아래 격자면이 이미 채우고 있다.
+                    cloud[k].roadTexture(road[k], road_a, road_b, ob.world_up,
+                                         ob, vp.width * 0.9, ego_k,
+                                         std::min(map_r, (s.dataset == "kitti")
+                                                         ? 28.0 : 5.0));
                 }
                 const bool L_map = (layer == 0 || layer == 1);
                 if (L_map) cloud[k].draw(near_pts, ob, vp.width * 0.9, 0.62);
@@ -3767,6 +3908,7 @@ int main(int argc, char** argv) {
         else if (key == 'r' || key == 'R') { frame = 0; acc_frame[0] = acc_frame[1] = -1;
             mem[0].clear(); mem[1].clear(); acc[0].clear(); acc[1].clear();
             pred[0].clear(); pred[1].clear();
+            road[0].clear(); road[1].clear();
             pscore[0].clear(); pscore[1].clear();
             mot_yaw[0] = mot_yaw[1] = 0.0; mot_turns[0] = mot_turns[1] = 0;
             mot_at[0] = mot_at[1] = -1; mot_kind[0] = mot_kind[1] = "";
@@ -3787,6 +3929,7 @@ int main(int argc, char** argv) {
             frame = 0; acc_frame[0] = acc_frame[1] = -1; orb.dist = 0.0; user_zoomed = false;
             mem[0].clear(); mem[1].clear(); acc[0].clear(); acc[1].clear();
             pred[0].clear(); pred[1].clear();
+            road[0].clear(); road[1].clear();
             pscore[0].clear(); pscore[1].clear();
             mot_yaw[0] = mot_yaw[1] = 0.0; mot_turns[0] = mot_turns[1] = 0;
             mot_at[0] = mot_at[1] = -1; mot_kind[0] = mot_kind[1] = "";
@@ -3797,6 +3940,7 @@ int main(int argc, char** argv) {
             frame = 0; acc_frame[0] = acc_frame[1] = -1; orb.dist = 0.0; user_zoomed = false;
             mem[0].clear(); mem[1].clear(); acc[0].clear(); acc[1].clear();
             pred[0].clear(); pred[1].clear();
+            road[0].clear(); road[1].clear();
             pscore[0].clear(); pscore[1].clear();
             mot_yaw[0] = mot_yaw[1] = 0.0; mot_turns[0] = mot_turns[1] = 0;
             mot_at[0] = mot_at[1] = -1; mot_kind[0] = mot_kind[1] = "";
