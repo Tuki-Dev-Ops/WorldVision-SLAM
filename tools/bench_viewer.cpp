@@ -1314,17 +1314,70 @@ public:
                 continue;
             }
 
-            // 수직 벡터는 **이어진 구조에만** 긋는다. 모든 기둥에 바닥까지
-            // 선을 그으면 수만 개의 세로줄이 화면을 잔디처럼 덮어 정작 무엇이
-            // 벽이고 무엇이 나무인지 안 보인다 - 실제로 그렇게 나왔다.
-            // 나무는 수관이 어디 떠 있는지가 정보이므로 줄기를 지어내지 않는다.
-            if (c.cls == Stuff::Building || c.cls == Stuff::Fence ||
-                c.cls == Stuff::Pole) {
-                const float h = static_cast<float>(c.topBin() + 1) * kBinH;
-                cv::Point pb;
-                if (project3((c.rep - up * h).cast<double>(), orb, f, pb)) {
-                    lineClipped(pb, pa, col, 1);
+            // **형상이 클래스를 말한다.**
+            //
+            // 지금까지 건물도 나무도 담장도 같은 가는 선이었다. 위치는 맞는데
+            // 무엇인지가 화면에서 읽히지 않으니, 좌우의 건물이 하늘에 뜬 잡음
+            // 처럼 보였다 - 실제로 그렇게 보고되었다. 건물은 덩어리로, 나무는
+            // 줄기 위 수관으로, 담장은 낮은 판으로 그린다.
+            const float h = static_cast<float>(c.topBin() + 1) * kBinH;
+            const Eigen::Vector3f foot = c.rep - up * h;
+            const float half = cell * 0.5f;
+
+            if (c.cls == Stuff::Building) {
+                // 건물: 지면부터 꼭대기까지 속이 찬 덩어리. 벽면이 덩어리가
+                // 되어야 건물로 읽힌다.
+                solidBox((0.5 * (c.rep + foot)).cast<double>(),
+                         (g.a * half).cast<double>(),
+                         (up * (h * 0.5f)).cast<double>(),
+                         (g.b * half).cast<double>(),
+                         orb, f, col, 1.0);
+                // continue 하지 않는다 - 아래에서 이웃과의 면을 마저 채워야
+                // 덩어리 사이의 틈이 메워지고 벽이 이어져 보인다.
+            }
+            if (c.cls == Stuff::Fence) {
+                // 담장: 낮고 얇은 판. 건물과 같은 형태로 그리면 구분이 사라진다.
+                solidBox((0.5 * (c.rep + foot)).cast<double>(),
+                         (g.a * half).cast<double>(),
+                         (up * (h * 0.5f)).cast<double>(),
+                         (g.b * (half * 0.25f)).cast<double>(),
+                         orb, f, col, 0.85);
+            }
+            if (c.cls == Stuff::Vegetation) {
+                // 나무: 줄기 + 수관. 줄기는 지면에서 수관 아래까지, 수관은
+                // 그 위의 덩어리다. 두 부분의 비율이 "나무" 를 만든다.
+                const float canopy_bot = h * 0.45f;
+                cv::Point p0, p1;
+                if (project3(foot.cast<double>(), orb, f, p0) &&
+                    project3((foot + up * canopy_bot).cast<double>(), orb, f, p1)) {
+                    lineClipped(p0, p1, cv::Scalar(col[0] * 0.55, col[1] * 0.5,
+                                                   col[2] * 0.45), 2);
                 }
+                // 수관을 원으로 얹는다. 사각형으로 그리면 건물과 구분되지 않는다.
+                cv::Point cc, edge;
+                const Eigen::Vector3f cen = foot + up * (h * 0.72f);
+                if (project3(cen.cast<double>(), orb, f, cc) &&
+                    project3((cen + g.a * (cell * 0.9f)).cast<double>(), orb, f, edge)) {
+                    const int r = std::clamp(static_cast<int>(
+                        std::hypot(edge.x - cc.x, edge.y - cc.y)), 2, 60);
+                    if (std::abs(cc.x) < 4 * img_.cols && std::abs(cc.y) < 4 * img_.rows) {
+                        // 수관은 **테두리만** 그린다. 꽉 채우면 격자칸마다
+                        // 원이 하나씩 생겨 도로변이 초록 벽이 된다 - 실측
+                        // 2640 개였고 화면이 그것으로 덮였다. 나무 한 그루가
+                        // 여러 칸에 걸치므로 채우면 중복이 그대로 쌓인다.
+                        cv::circle(img_, cc, r, col, 1, cv::LINE_AA);
+                    }
+                }
+                // 나무는 여기서 끝낸다. 이웃과 면을 채우면 수관이 사각형에
+                // 묻혀 다시 건물처럼 보인다.
+                continue;
+            }
+            if (c.cls == Stuff::Pole) {
+                cv::Point pb;
+                if (project3(foot.cast<double>(), orb, f, pb)) {
+                    lineClipped(pb, pa, col, 2);
+                }
+                continue;
             }
             // **면으로 잇는다.** 선 두 개가 아니라 사각형 하나다.
             //
@@ -1361,13 +1414,36 @@ public:
             const bool ok_b  = nb_b  && project3(nb_b->rep.cast<double>(),  orb, f, p_b);
             const bool ok_ab = nb_ab && project3(nb_ab->rep.cast<double>(), orb, f, p_ab);
 
-            if (ok_a)  lineClipped(pa, p_a, col, 1);
-            if (ok_b)  lineClipped(pa, p_b, col, 1);
-            if (ok_a && ok_ab) lineClipped(p_a, p_ab, col, 1);
-            if (ok_b && ok_ab) lineClipped(p_b, p_ab, col, 1);
-            // 대각선. 사각형만으로는 면의 방향이 안 보이고 격자가 평평해
-            // 보인다 - 삼각형이 되어야 굴곡이 읽힌다.
-            if (ok_ab) lineClipped(pa, p_ab, col, 1);
+            // **사각형을 긋지 말고 채운다.**
+            //
+            // 네 꼭짓점을 선으로 이으면 격자가 남고, 격자는 아무리 촘촘해도
+            // 뒤가 비쳐 면으로 읽히지 않는다. 같은 네 점을 채우면 그 순간
+            // 표면이 된다 - 이으려던 것이 원래 면이었기 때문이다.
+            if (ok_a && ok_b && ok_ab) {
+                const cv::Point quad[4] = {pa, p_a, p_ab, p_b};
+                // 화면에서 터무니없이 큰 조각은 투영이 튄 것이다.
+                const double w = std::max({std::abs(pa.x - p_ab.x),
+                                           std::abs(pa.y - p_ab.y)});
+                if (w < img_.cols * 0.6) {
+                    // 면의 기울기로 명암을 준다. 단색으로 채우면 굴곡이
+                    // 사라져 벽 하나가 평평한 얼룩이 된다.
+                    const Eigen::Vector3f e1 = nb_a->rep - c.rep;
+                    const Eigen::Vector3f e2 = nb_b->rep - c.rep;
+                    Eigen::Vector3f nrm = e1.cross(e2);
+                    double sh = 0.75;
+                    if (nrm.norm() > 1e-9) {
+                        nrm.normalize();
+                        sh = 0.55 + 0.45 * std::abs(static_cast<double>(nrm.dot(up)));
+                    }
+                    cv::fillConvexPoly(img_, quad, 4,
+                                       cv::Scalar(col[0] * sh, col[1] * sh, col[2] * sh),
+                                       cv::LINE_AA);
+                }
+            }
+            // 채워진 면 위에 모서리를 얇게 남긴다. 같은 색의 면 둘이 붙으면
+            // 경계가 사라져 하나로 뭉쳐 보인다.
+            if (ok_a) lineClipped(pa, p_a, col, 1);
+            if (ok_b) lineClipped(pa, p_b, col, 1);
         }
     }
 
@@ -1890,7 +1966,10 @@ int main(int argc, char** argv) {
     int    mot_turns[2] = {0, 0};        // 완전히 돈 바퀴 수
     int    mot_at[2] = {-1, -1};         // 마지막으로 판정한 포즈 인덱스
     bool   user_zoomed = false;    // W/S 를 눌렀으면 자동 거리 조정을 멈춘다
-    bool   show_mesh = true;       // 표면 격자 (M 으로 토글)
+    // 원시 표면 격자는 기본 꺼짐. 거친 복셀에서 이 격자는 가는 선 수만 개가
+    // 되고, 그러면 좌우에 선 건물이 하늘에 뜬 잡음처럼 보인다 - 라벨 형상이
+    // 그 자리를 대신한다. M 으로 켤 수 있다.
+    bool   show_mesh = false;      // 표면 격자 (M 으로 토글)
     cv::Mat canvas(WIN_H, WIN_W, CV_8UC3);
     CloudView cloud[2];
     VoxelMap acc[2];
@@ -1902,7 +1981,8 @@ int main(int argc, char** argv) {
     std::unordered_map<std::int64_t, Column> stuff[2];
     // 오버레이는 기본 꺼짐. 전부 켜면 지도가 안 보이고, 사람이
     // 보려던 것은 지도다. L / O 로 필요할 때 켠다.
-    bool show_stuff = false;       // L 로 토글
+    // 라벨을 기본으로 켠다. 형상이 있어야 무엇을 인식했는지가 보인다.
+    bool show_stuff = true;        // L 로 토글
     // 앞을 내다본 것과 그 성적표.
     std::unordered_map<std::int64_t, Prediction> pred[2];
     PredictScore pscore[2];
@@ -2262,8 +2342,12 @@ int main(int argc, char** argv) {
                             .dot(ob.world_up);
                     // 도로 장면은 위로 12 m (건물 꼭대기), 아래로 4 m.
                     // 실내는 천장이 3 m 를 넘지 않는다.
-                    const double hlo = (s.dataset == "kitti") ? -4.0 : -2.0;
-                    const double hhi = (s.dataset == "kitti") ? 12.0 :  2.5;
+                    // 실측: 12 m 상한에서도 8 m 위에 32463 개가 남았고, 그것이
+                    // 화면에서 하늘을 덮은 덩어리였다. KITTI 00 은 2 층
+                    // 주택가라 지붕이 8 m 안쪽이다 - 그보다 위에 있는 것은
+                    // 건물이 아니라 하늘에서 온 시차다.
+                    const double hlo = (s.dataset == "kitti") ? -3.0 : -2.0;
+                    const double hhi = (s.dataset == "kitti") ?  7.5 :  2.2;
                     backProject(d16, s.calib, run.aligned[static_cast<std::size_t>(pi)],
                                 stride,
                                 s.calib.depth_min, s.calib.depth_max, cmin, cmax,
@@ -2387,7 +2471,14 @@ int main(int argc, char** argv) {
                     std::chrono::steady_clock::now() - t_c0).count();
                 // 점 위에 표면 격자를 덧그린다. 순서가 중요하다 - 먼저 그리면
                 // 점군이 격자를 덮어 아무 것도 이어져 보이지 않는다.
-                if (show_mesh && has_memory) {
+                // **라벨과 원시 격자는 서로 독립이다.**
+                //
+                // 라벨 그리기가 show_mesh 안에 중첩돼 있었다. 원시 격자를
+                // 끄자 라벨도 같이 꺼졌고, 진단은 지면 0 건물 0 나무 0 을
+                // 찍었다 - 분류가 안 된 것이 아니라 아예 돌지 않은 것이다.
+                // 하나의 토글이 두 가지를 끄면 그 중 하나는 반드시 조용히
+                // 사라진다.
+                if (has_memory) {
                     if (show_stuff) {
                         // **지도가 무엇으로 이루어졌는지** 를 그린다.
                         //
@@ -2465,7 +2556,8 @@ int main(int argc, char** argv) {
                             prof_pdraw[k] = std::chrono::duration<double, std::milli>(
                                 t_p2 - t_p1).count();
                         }
-                    } else {
+                    }
+                    if (show_mesh) {
                         for (auto& v : mesh[k].cells) {
                             v.second.age = static_cast<float>(std::clamp(
                                 1.0 - static_cast<double>(v.second.seen) / span, 0.0, 1.0));
@@ -2571,7 +2663,11 @@ int main(int argc, char** argv) {
                     // 월드에 고정된 좌표이므로 자차가 지나가도 그 자리에 남는다.
                     // 지금 프레임에서 다시 보이는 것은 아래에서 진하게 덧그린다.
                     for (const auto& m : mem[k]) {
-                        if (m.cls.empty() || m.count < 2) continue;   // 한 번뿐인 것은 잡음
+                        // 사람 골격은 자리를 크게 차지하므로 관측이 충분한
+                        // 것만 그린다. 한두 번 본 검출이 전부 골격으로 서면
+                        // 서로 겹쳐 엉킨 덩어리가 된다 - 실제로 그랬다.
+                        const bool is_person = (m.cls == "person");
+                        if (m.cls.empty() || m.count < (is_person ? 5 : 2)) continue;
                         const bool vehicle = (m.cls == "car" || m.cls == "truck" ||
                                               m.cls == "bus" || m.cls == "motorcycle" ||
                                               m.cls == "bicycle" || m.cls == "train");
@@ -2749,21 +2845,22 @@ int main(int argc, char** argv) {
                     // 사람을 1.75 m 앞에서 그리면 화면이 통째로 그 사람이 되고,
                     // 지도를 보여 주려던 자리에 자차만 남는다 - TUM 3 인칭에서
                     // 실제로 흰 기둥 하나가 패널을 가렸다.
-                    const double model_h = (s.dataset == "kitti") ? 4.2 : 1.7;
-                    if (cam_mode != 0 && ob.dist > model_h * 2.5) {
+                    // **KITTI 에서만 자차를 그린다.**
+                    //
+                    // KITTI 는 차량에 실린 카메라이므로 그 자리에 차가 있는
+                    // 것이 사실이고, 차체가 곧 척도와 진행 방향이 된다.
+                    //
+                    // TUM 은 손에 든 카메라다. 거기에 사람 몸을 그리면 관측된
+                    // 적 없는 것을 지어내는 것이고, 3 m 짜리 방에서 1.7 m
+                    // 짜리 몸은 화면을 통째로 가린다 - 실제로 그렇게 나왔다.
+                    // 카메라는 프러스텀이 이미 나타내고 있다.
+                    if (cam_mode != 0 && s.dataset == "kitti" && ob.dist > 12.0) {
                         const Eigen::Vector3d fw = (pan_head[k].squaredNorm() > 1e-12)
                                                  ? pan_head[k]
                                                  : (T.rotation() * Eigen::Vector3d::UnitZ());
-                        if (s.dataset == "kitti") {
-                            // KITTI 는 차량이다. 실제 승용차 치수를 쓴다.
-                            cloud[k].carModel(o + ob.world_up * 0.7,
-                                              Eigen::Vector3d(1.8, 1.5, 4.2),
-                                              fw, ob.world_up, ob, f3, C_INK);
-                        } else {
-                            // TUM 은 손에 든 카메라다. 차를 그리면 거짓말이 된다.
-                            cloud[k].personModel(o, Eigen::Vector3d(0.4, 1.7, 0.4),
-                                                 ob.world_up, ob, f3, C_INK);
-                        }
+                        cloud[k].carModel(o + ob.world_up * 0.7,
+                                          Eigen::Vector3d(1.8, 1.5, 4.2),
+                                          fw, ob.world_up, ob, f3, C_INK);
                     }
                 }
             }
@@ -3046,6 +3143,31 @@ int main(int argc, char** argv) {
                                        << '\t' << c.vert << '\t' << c.n << '\n';
                                  }
                                  return "  특징 덤프: " + dump_feat + "\n";
+                             }()
+                          << [&] {
+                                 // 하늘에 무엇이 남아 있는지 **재서** 말한다.
+                                 // 자차 높이 기준 상대 높이의 분포다.
+                                 if (acc[k].cells.empty()) return std::string();
+                                 std::vector<float> hs;
+                                 hs.reserve(acc[k].cells.size());
+                                 const Eigen::Vector3f upf = orb.world_up.cast<float>();
+                                 const float e0 = static_cast<float>(ego_pos.dot(orb.world_up));
+                                 for (const auto& [ck, v] : acc[k].cells) {
+                                     hs.push_back(v.p.dot(upf) - e0);
+                                 }
+                                 std::sort(hs.begin(), hs.end());
+                                 auto q = [&](double t) {
+                                     return hs[std::min(hs.size() - 1,
+                                         static_cast<std::size_t>(t * hs.size()))];
+                                 };
+                                 std::ostringstream o;
+                                 o << "\n           높이(자차기준 m): 최저 " << std::fixed
+                                   << std::setprecision(1) << hs.front()
+                                   << "  p50 " << q(0.50) << "  p90 " << q(0.90)
+                                   << "  p99 " << q(0.99) << "  최고 " << hs.back()
+                                   << "  (8 m 초과 " << std::count_if(hs.begin(), hs.end(),
+                                        [](float x) { return x > 8.0f; }) << " 개)";
+                                 return o.str();
                              }()
                           << ", 예측 " << [&] {
                                  std::ostringstream o;
