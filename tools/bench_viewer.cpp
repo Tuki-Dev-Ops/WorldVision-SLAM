@@ -625,6 +625,45 @@ labelScene(const std::unordered_map<std::int64_t, Splat>& cells,
     return cols;
 }
 
+// ---------------------------------------------------------------------------
+// 앞을 내다보기 — 관측된 구조를 진행 방향으로 외삽하고, 가서 채점한다
+// ---------------------------------------------------------------------------
+// **이것은 생성 모델이 아니다.** 학습된 것이 없고, 여기서 하는 일은 지금까지
+// 본 회랑(지면 높이, 좌우 구조의 측방 거리, 그 클래스)을 진행 방향으로 늘리는
+// 것뿐이다. 그렇게 부르지 않는 이유는 간단하다 - 그럴듯한 그림은 아무것도
+// 증명하지 않고, 이 저장소가 반복해 기록한 실패가 정확히 그것이다.
+//
+// 대신 **채점한다.** 예측한 자리에 실제로 도달하면 거기 무엇이 있었는지 보고
+// 맞았는지 틀렸는지를 센다. 적중률이 화면에 계속 떠 있으므로, 예측이 쓸모가
+// 있는지 없는지가 그림이 아니라 숫자로 나온다. 나중에 생성 모델로 바꾸더라도
+// 같은 자로 재면 비교가 된다.
+struct Prediction {
+    Eigen::Vector3f p{Eigen::Vector3f::Zero()};  // 예측한 자리 (기둥 꼭대기)
+    float  height{0.0f};                          // 지면 위 높이
+    Stuff  cls{Stuff::Unknown};
+    float  conf{0.0f};      // 거리에 따라 감쇠. 먼 예측은 약하게 건다
+    int    made{0};         // 몇 번 프레임에서 예측했나
+    int    grade{0};        // 0 미채점 / +1 적중 / -1 빗나감
+};
+
+// 예측의 성적표. 성장형의 "성장" 은 이 숫자가 움직이는 것으로만 확인된다.
+struct PredictScore {
+    int hit{0}, miss{0}, missed{0};   // 적중 / 헛집음 / 놓침
+    // 회랑 폭 추정. 채점 결과가 이 값을 밀고 당긴다 - 그것이 되먹임이다.
+    float lateral{6.0f};
+    float lateral_n{1.0f};
+
+    double precision() const {
+        const int d = hit + miss;
+        return d > 0 ? static_cast<double>(hit) / d : std::nan("");
+    }
+    double recall() const {
+        const int d = hit + missed;
+        return d > 0 ? static_cast<double>(hit) / d : std::nan("");
+    }
+    void clear() { hit = miss = missed = 0; lateral = 6.0f; lateral_n = 1.0f; }
+};
+
 // 월드에 고정되는 물체 기억. 지나온 곳에서 본 물체가 그 자리에 남는다.
 //
 // **관측마다 위치를 덮어쓰면 안 된다.** 그러면 카메라가 움직일 때마다 물체가
@@ -707,6 +746,148 @@ inline void eraseBox(VoxelMap& vm, const Eigen::Vector3d& c,
                                                       static_cast<float>(z)), inv));
             }
         }
+    }
+}
+
+// 지금까지 본 회랑을 앞으로 100 m 늘린다.
+//
+// 재는 것은 세 가지뿐이다. 관측 범위 안에서
+//   - 지면 높이가 진행 방향으로 어떻게 변하는가 (선형 추세)
+//   - 구조(건물/담장/나무)가 진행축에서 좌우로 얼마나 떨어져 있는가
+//   - 그 구조가 어느 클래스이고 얼마나 높은가
+// 그리고 그것을 앞으로 늘린다. 곡선 도로는 직선으로 예측되고 교차로는 예측이
+// 통째로 틀린다 - 그것을 숨기지 않는 것이 채점을 붙인 이유다.
+inline void predictAhead(const std::unordered_map<std::int64_t, Column>& cols,
+                         const Eigen::Vector3d& ego, const Eigen::Vector3d& dir_d,
+                         const Eigen::Vector3d& up_d, float cell, int frame,
+                         PredictScore& score,
+                         std::unordered_map<std::int64_t, Prediction>& out) {
+    if (cols.empty() || dir_d.norm() < 1e-6) return;
+    const GroundGrid g(up_d.cast<float>(), cell);
+    const Eigen::Vector3f up = g.up;
+    const Eigen::Vector3f fwd = dir_d.cast<float>().normalized();
+    const Eigen::Vector3f left = up.cross(fwd).normalized();
+    const Eigen::Vector3f e = ego.cast<float>();
+
+    // 1) 최근 관측에서 회랑을 읽는다. 뒤로 30 m, 좌우 40 m 안쪽만 본다 -
+    //    더 넓히면 지나온 다른 길의 구조가 섞인다.
+    struct Side { float sum{0}; int n{0}; float h{0}; int cls_n[6] = {0,0,0,0,0,0}; };
+    Side sd[2];
+    float gsum = 0.0f, gn = 0.0f, gslope_num = 0.0f, gslope_den = 0.0f;
+    for (const auto& [k, c] : cols) {
+        const Eigen::Vector3f d = c.rep - e;
+        const float along = d.dot(fwd);
+        if (along < -30.0f || along > 5.0f) continue;
+        const float lat = d.dot(left);
+        if (std::abs(lat) > 40.0f) continue;
+        const float h = static_cast<float>(c.topBin() + 1) * kBinH;
+
+        if (c.cls == Stuff::Ground) {
+            const float gh = c.rep.dot(up) - h;
+            gsum += gh; gn += 1.0f;
+            gslope_num += along * gh; gslope_den += along * along;
+            continue;
+        }
+        if (c.cls == Stuff::Unknown || h < 1.0f) continue;
+        Side& s = sd[lat >= 0.0f ? 0 : 1];
+        s.sum += std::abs(lat); s.n += 1; s.h += h;
+        s.cls_n[static_cast<int>(c.cls)]++;
+    }
+    if (gn < 4.0f) return;
+    const float g0 = gsum / gn;
+    const float slope = (gslope_den > 1e-3f) ? (gslope_num / gslope_den) : 0.0f;
+
+    // 2) 좌우 측방 거리. 관측이 없으면 지금까지의 추정을 그대로 쓴다 -
+    //    그것이 되먹임으로 갱신되는 값이다.
+    for (int s = 0; s < 2; ++s) {
+        if (sd[s].n >= 3) {
+            const float lat = sd[s].sum / static_cast<float>(sd[s].n);
+            // 지수 이동. 한 프레임의 관측으로 통째로 갈아치우면 교차로에서
+            // 회랑 추정이 튄다.
+            score.lateral = 0.9f * score.lateral + 0.1f * lat;
+        }
+    }
+
+    // 3) 앞으로 늘린다. 신뢰도는 거리에 따라 떨어뜨린다 - 100 m 앞의 예측과
+    //    5 m 앞의 예측을 같은 무게로 채점하면 채점이 의미를 잃는다.
+    for (float d = 4.0f; d <= 100.0f; d += cell) {
+        const Eigen::Vector3f centre = e + fwd * d;
+        const float gh = g0 + slope * d;
+        const float conf = std::clamp(1.0f - d / 120.0f, 0.05f, 1.0f);
+
+        for (int s = 0; s < 2; ++s) {
+            if (sd[s].n < 3) continue;
+            // 그 쪽에서 가장 많이 본 클래스를 그대로 세운다.
+            int best = 0, bn = 0;
+            for (int ci = 1; ci < 6; ++ci) {
+                if (sd[s].cls_n[ci] > bn) { bn = sd[s].cls_n[ci]; best = ci; }
+            }
+            if (best == 0) continue;
+            const float h = sd[s].h / static_cast<float>(sd[s].n);
+            const float sign = (s == 0 ? 1.0f : -1.0f);
+
+            // **선이 아니라 띠로 예측한다.**
+            //
+            // 회랑 가장자리에 한 줄만 세우면 재현율이 구조적으로 낮다 -
+            // 실측 2 % 였다. 장면의 구조는 벽면 한 겹이 아니라 그 뒤로
+            // 이어지는 부피이기 때문이다. 건물 정면이 보였으면 그 뒤에도
+            // 건물이 있고, 가로수가 한 그루 있으면 그 줄로 이어진다.
+            //
+            // 넓히면 정밀도가 떨어질 수 있다. 어느 쪽이 얼마나 움직이는지는
+            // 아래 채점이 말해 준다 - 그것이 이 숫자를 붙인 이유다.
+            for (float w = 0.0f; w <= 6.0f; w += cell) {
+                const float lat = (score.lateral + w) * sign;
+                const Eigen::Vector3f p = centre + left * lat + up * (gh + h);
+                const std::int64_t key = g.key(p);
+                // 이미 실제로 관측한 자리에는 예측을 세우지 않는다. 예측이
+                // 관측을 덮으면 채점이 자기 자신을 맞히게 된다.
+                if (cols.count(key) || out.count(key)) continue;
+                // 안쪽일수록 확신이 크다. 회랑에서 멀어질수록 근거가 약하다.
+                const float cw = conf * std::clamp(1.0f - w / 8.0f, 0.2f, 1.0f);
+                out[key] = Prediction{p, h, static_cast<Stuff>(best), cw, frame, 0};
+            }
+        }
+    }
+}
+
+// 도달한 자리의 예측을 채점한다.
+//
+// 채점 시점이 중요하다. 자차가 그 자리를 **지나간 뒤** 에 봐야 관측이 다
+// 들어와 있다. 지나가기 전에 채점하면 아직 안 본 것을 "없다" 로 세게 된다 -
+// 그것은 예측이 아니라 관측 진행 상황을 재는 것이다.
+inline void gradePredictions(std::unordered_map<std::int64_t, Prediction>& preds,
+                             const std::unordered_map<std::int64_t, Column>& cols,
+                             const Eigen::Vector3d& ego, const Eigen::Vector3d& dir_d,
+                             const Eigen::Vector3d& up_d, float cell,
+                             PredictScore& score) {
+    if (preds.empty() || dir_d.norm() < 1e-6) return;
+    const GroundGrid g(up_d.cast<float>(), cell);
+    const Eigen::Vector3f fwd = dir_d.cast<float>().normalized();
+    const Eigen::Vector3f e = ego.cast<float>();
+
+    for (auto& [k, pr] : preds) {
+        if (pr.grade != 0) continue;
+        const float along = (pr.p - e).dot(fwd);
+        if (along > -3.0f) continue;            // 아직 안 지나갔다
+        const auto it = cols.find(k);
+        if (it == cols.end()) {
+            // 지나갔는데 그 칸에 아무 관측도 없다. 관측 자체가 없는 것은
+            // "틀렸다" 가 아니라 "확인 불가" 다 - 채점하지 않고 남겨 둔다.
+            continue;
+        }
+        const bool structure = (it->second.cls != Stuff::Ground &&
+                                it->second.cls != Stuff::Unknown);
+        if (structure) { pr.grade = 1;  ++score.hit; }
+        else           { pr.grade = -1; ++score.miss; }
+    }
+
+    // 놓친 것: 지나온 자리에 구조가 실제로 있었는데 예측이 없었던 칸.
+    // 이것을 세지 않으면 "적게 예측하고 다 맞히기" 가 만점을 받는다.
+    for (const auto& [k, c] : cols) {
+        if (c.cls == Stuff::Ground || c.cls == Stuff::Unknown) continue;
+        const float along = (c.rep - e).dot(fwd);
+        if (along > -3.0f || along < -20.0f) continue;   // 방금 지나온 구간만
+        if (!preds.count(k)) ++score.missed;
     }
 }
 
@@ -850,6 +1031,48 @@ public:
                 cv::Point pc;
                 if (!project3(it->second.rep.cast<double>(), orb, f, pc)) continue;
                 lineClipped(pa, pc, col, 1);
+            }
+        }
+    }
+
+    // 예측을 그린다. **관측과 절대로 같아 보이면 안 된다.**
+    //
+    // 예측한 구조와 실제로 본 구조가 화면에서 구분되지 않으면, 그림은 있지도
+    // 않은 세계를 보여 주면서 그것을 관측이라고 말하는 것이 된다. 그래서
+    // 파선으로, 배경 쪽으로 눌러서, 신뢰도만큼만 진하게 그린다. 채점이 끝난
+    // 것은 결과대로 색을 바꾼다 - 맞은 예측과 틀린 예측이 자리째로 보인다.
+    void predictions(const std::unordered_map<std::int64_t, Prediction>& preds,
+                     const Eigen::Vector3d& up, const Orbit& orb, double f) {
+        for (const auto& [k, pr] : preds) {
+            cv::Point pa, pb;
+            if (!project3(pr.p.cast<double>(), orb, f, pa)) continue;
+            const Eigen::Vector3d base =
+                pr.p.cast<double>() - up.normalized() * pr.height;
+            if (!project3(base, orb, f, pb)) continue;
+
+            cv::Scalar col = (pr.grade > 0) ? C_GOOD
+                           : (pr.grade < 0) ? C_BAD : stuffColor(pr.cls);
+            // 미채점 예측은 신뢰도만큼만 진하다. 100 m 앞은 거의 배경이다.
+            const double a = (pr.grade != 0) ? 0.85
+                                             : 0.25 + 0.45 * pr.conf;
+            col = {col[0] * a + C_BG[0] * (1 - a),
+                   col[1] * a + C_BG[1] * (1 - a),
+                   col[2] * a + C_BG[2] * (1 - a)};
+
+            // 파선. 관측은 실선이므로 이것만으로도 눈이 먼저 가른다.
+            const int m = 4 * std::max(img_.cols, img_.rows);
+            if (std::abs(pa.x) > m || std::abs(pa.y) > m ||
+                std::abs(pb.x) > m || std::abs(pb.y) > m) continue;
+            const int seg = 5;
+            const double dx = pa.x - pb.x, dy = pa.y - pb.y;
+            const int steps = std::max(1, static_cast<int>(std::hypot(dx, dy) / seg));
+            for (int i = 0; i < steps; i += 2) {
+                const double t0 = static_cast<double>(i) / steps;
+                const double t1 = std::min(1.0, static_cast<double>(i + 1) / steps);
+                cv::line(img_,
+                         {static_cast<int>(pb.x + dx * t0), static_cast<int>(pb.y + dy * t0)},
+                         {static_cast<int>(pb.x + dx * t1), static_cast<int>(pb.y + dy * t1)},
+                         col, 1, cv::LINE_AA);
             }
         }
     }
@@ -1234,7 +1457,9 @@ int main(int argc, char** argv) {
     if (!headless) cv::namedWindow(win, cv::WINDOW_AUTOSIZE);
 
     int si = std::clamp(start_seq, 0, static_cast<int>(seqs.size()) - 1);
-    int frame = headless ? shot_frame : 0;
+    // 헤드리스도 0 부터 재생한다. 예측 채점이 프레임 진행에
+    // 의존하므로, 목표 프레임으로 건너뛰면 채점이 영영 안 된다.
+    int frame = 0;
     int pick[2] = {0, 1};          // 각 패널이 보여 줄 시스템 인덱스
     bool playing = autoplay;
     int shot = 0;
@@ -1264,6 +1489,10 @@ int main(int argc, char** argv) {
     // 지도에서 유도한 장면 라벨 (지면/건물/담장/나무/기둥).
     std::unordered_map<std::int64_t, Column> stuff[2];
     bool show_stuff = true;        // L 로 토글
+    // 앞을 내다본 것과 그 성적표.
+    std::unordered_map<std::int64_t, Prediction> pred[2];
+    PredictScore pscore[2];
+    bool show_pred = true;         // P 로 토글
     int acc_frame[2] = {-1, -1};
     std::vector<double> err_series[2];
 
@@ -1620,6 +1849,37 @@ int main(int argc, char** argv) {
                                               acc[k].voxel);
                         cloud[k].stuffVectors(stuff[k], ob.world_up, ccell,
                                               ob, vp.width * 0.9);
+
+                        // 앞을 내다보고, 지나온 자리는 채점한다.
+                        //
+                        // 순서가 중요하다: **채점이 먼저** 다. 이번 프레임에
+                        // 새로 세운 예측이 곧바로 채점 대상이 되면, 아직
+                        // 지나가지도 않은 것을 판정하게 된다.
+                        if (show_pred) {
+                            // 진행 방향은 최근 궤적에서 잡는다. 한 프레임
+                            // 차분은 잡음이라 방향이 매 프레임 튄다.
+                            Eigen::Vector3d dir = Eigen::Vector3d::Zero();
+                            {
+                                const int back = 12;
+                                const int i1 = std::min<int>(
+                                    static_cast<int>(run.aligned.size()) - 1,
+                                    std::max(0, static_cast<int>(
+                                        run.aligned.size() * (frame + 1) / nframes) - 1));
+                                const int i0 = std::max(0, i1 - back);
+                                if (i1 > i0) {
+                                    dir = run.aligned[static_cast<std::size_t>(i1)].translation()
+                                        - run.aligned[static_cast<std::size_t>(i0)].translation();
+                                }
+                            }
+                            if (dir.norm() > 0.2) {
+                                gradePredictions(pred[k], stuff[k], ego_k, dir,
+                                                 ob.world_up, ccell, pscore[k]);
+                                predictAhead(stuff[k], ego_k, dir, ob.world_up,
+                                             ccell, frame, pscore[k], pred[k]);
+                            }
+                            cloud[k].predictions(pred[k], ob.world_up, ob,
+                                                 vp.width * 0.9);
+                        }
                     } else {
                         for (auto& v : mesh[k].cells) {
                             v.second.age = static_cast<float>(std::clamp(
@@ -1927,6 +2187,30 @@ int main(int argc, char** argv) {
                         }
                         label(canvas, "scene labels from map geometry (not the detector)",
                               {vp.x + 14, vp.y + 126}, C_INK3, T_MICRO, 1);
+                        // **예측은 채점 결과와 함께만 말한다.** 적중률 없이
+                        // "100 m 앞을 예측한다" 만 적으면 그림이 주장을 대신하게
+                        // 된다 - 이 저장소가 반복해 기록한 실패다.
+                        if (show_pred) {
+                            const double pr = pscore[k].precision();
+                            const double rc = pscore[k].recall();
+                            std::ostringstream o;
+                            o << "lookahead 100 m: extrapolated, not generated  |  "
+                              << pred[k].size() << " open  |  hit " << pscore[k].hit
+                              << "  wrong " << pscore[k].miss
+                              << "  missed " << pscore[k].missed << "  |  ";
+                            if (std::isfinite(pr)) {
+                                o << "precision " << static_cast<int>(pr * 100) << "%";
+                            } else {
+                                o << "precision --";
+                            }
+                            if (std::isfinite(rc)) {
+                                o << "  recall " << static_cast<int>(rc * 100) << "%";
+                            }
+                            o << "  |  corridor " << std::fixed << std::setprecision(1)
+                              << pscore[k].lateral << " m";
+                            label(canvas, o.str(), {vp.x + 14, vp.y + 162},
+                                  C_INK2, T_MICRO, 1);
+                        }
                         int lx = vp.x + 14;
                         for (const Stuff sc : {Stuff::Ground, Stuff::Building,
                                                Stuff::Fence, Stuff::Vegetation,
@@ -2067,6 +2351,15 @@ int main(int argc, char** argv) {
                  T_MICRO, C_INK3);
         }
 
+        // 예측 채점은 **여러 프레임을 지나가야** 일어난다. 자차가 예측한
+        // 자리를 통과해야 거기 무엇이 있었는지 볼 수 있기 때문이다. 한 장만
+        // 찍는 헤드리스로는 영원히 0 - 0 이 나오고, 그것은 "예측이 틀렸다" 가
+        // 아니라 "아직 안 가 봤다" 다. 그래서 재생하며 도는 모드를 따로 둔다.
+        if (headless && frame < shot_frame) {
+            ++frame;
+            continue;
+        }
+
         if (headless) {
             // 왜 비었는지 사후에 물어볼 수 있어야 한다. 화면이 검은 것과
             // 데이터가 없는 것은 그림만 봐서는 구분되지 않는다.
@@ -2099,6 +2392,23 @@ int main(int argc, char** argv) {
                                  }
                                  return "  특징 덤프: " + dump_feat + "\n";
                              }()
+                          << ", 예측 " << [&] {
+                                 std::ostringstream o;
+                                 o << pred[k].size() << " (적중 " << pscore[k].hit
+                                   << " 빗나감 " << pscore[k].miss
+                                   << " 놓침 " << pscore[k].missed;
+                                 const double pr = pscore[k].precision();
+                                 const double rc = pscore[k].recall();
+                                 if (std::isfinite(pr)) {
+                                     o << ", 정밀도 " << static_cast<int>(pr * 100) << "%";
+                                 }
+                                 if (std::isfinite(rc)) {
+                                     o << " 재현율 " << static_cast<int>(rc * 100) << "%";
+                                 }
+                                 o << ", 회랑 " << std::fixed << std::setprecision(1)
+                                   << pscore[k].lateral << " m)";
+                                 return o.str();
+                             }()
                           << ", 기억물체 " << mem[k].size()
                           << " (동적 " << std::count_if(mem[k].begin(), mem[k].end(),
                                           [](const MemoryObject& m) { return m.dynamic; })
@@ -2124,26 +2434,35 @@ int main(int argc, char** argv) {
         else if (key == ' ') playing = !playing;
         else if (key == 'r' || key == 'R') { frame = 0; acc_frame[0] = acc_frame[1] = -1;
             mem[0].clear(); mem[1].clear(); acc[0].clear(); acc[1].clear();
+            pred[0].clear(); pred[1].clear();
+            pscore[0].clear(); pscore[1].clear();
             mesh[0].clear(); mesh[1].clear(); }
         else if (key == 'v' || key == 'V') { cam_mode = (cam_mode + 1) % 3; }
         else if (key == 'm' || key == 'M') show_mesh = !show_mesh;
         else if (key == 'l' || key == 'L') show_stuff = !show_stuff;
+        else if (key == 'p' || key == 'P') show_pred = !show_pred;
         else if (key == 'n' || key == 'N') {
             si = (si + 1) % static_cast<int>(seqs.size());
             frame = 0; acc_frame[0] = acc_frame[1] = -1; orb.dist = 0.0; user_zoomed = false;
             mem[0].clear(); mem[1].clear(); acc[0].clear(); acc[1].clear();
+            pred[0].clear(); pred[1].clear();
+            pscore[0].clear(); pscore[1].clear();
             mesh[0].clear(); mesh[1].clear();
         } else if (key == 'p' || key == 'P') {
             si = (si + static_cast<int>(seqs.size()) - 1) % static_cast<int>(seqs.size());
             frame = 0; acc_frame[0] = acc_frame[1] = -1; orb.dist = 0.0; user_zoomed = false;
             mem[0].clear(); mem[1].clear(); acc[0].clear(); acc[1].clear();
+            pred[0].clear(); pred[1].clear();
+            pscore[0].clear(); pscore[1].clear();
             mesh[0].clear(); mesh[1].clear();
         } else if (key == '1') {
             pick[0] = (pick[0] + 1) % static_cast<int>(s.systems.size());
             acc_frame[0] = -1; mem[0].clear(); acc[0].clear(); mesh[0].clear();
+            pred[0].clear(); pscore[0].clear();
         } else if (key == '2') {
             pick[1] = (pick[1] + 1) % static_cast<int>(s.systems.size());
             acc_frame[1] = -1; mem[1].clear(); acc[1].clear(); mesh[1].clear();
+            pred[1].clear(); pscore[1].clear();
         } else if (key == 'a' || key == 'A') user_yaw -= 0.12;
         else if (key == 'd' || key == 'D') user_yaw += 0.12;
         else if (key == 'w' || key == 'W') { orb.dist *= 0.88; user_zoomed = true; }
