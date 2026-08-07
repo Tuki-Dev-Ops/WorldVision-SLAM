@@ -18,7 +18,9 @@
 
 #include <algorithm>
 #include <iostream>
+#include <iterator>
 #include <random>
+#include <vector>
 
 using namespace wme;
 
@@ -262,11 +264,22 @@ TEST(DirectAligner, BasinRadiusAndKernelWidth) {
 TEST(DirectAligner, PyramidDepthExtendsConvergenceRadius) {
     // 레벨을 늘릴수록 수렴 반경이 넓어져야 한다. 어느 레벨에서 깨지는지
     // 숫자로 남긴다 - 이 프로젝트에서 잔차만이 원인을 구분해 준 적이 여러 번 있었다.
-    const auto scene = makeScene(Vec3(0.03, 0.04, -0.02), Vec3(0.18, 0.12, -0.06));
-
+    //
     // 한 크기의 오차만 보면 아무 것도 안 나온다. 레벨 수마다 "어디까지 잡히는가"
     // 를 재야 피라미드가 실제로 무엇을 해주는지 알 수 있다.
     const double mags[] = {0.02, 0.04, 0.06, 0.08, 0.10, 0.12, 0.14, 0.18};
+
+    // 장면은 mag 만의 함수다 (씨앗 고정). 레벨 루프 안에서 만들면 같은 여덟
+    // 장면을 최대 여섯 번 다시 합성하게 되는데, makeScene 은 880x720 텍스처
+    // 2500 도형 + 워프 + 픽셀별 깊이라 싸지 않다. 새니타이저 빌드에서 이
+    // 중복이 이 테스트를 180 초 상한 너머로 밀어냈다. 한 번만 만든다 -
+    // 측정 대상은 정렬기지 장면 합성기가 아니다.
+    std::vector<Scene> scenes;
+    scenes.reserve(std::size(mags));
+    for (double mag : mags) {
+        const Vec3 t = Vec3(0.8, 0.53, -0.27).normalized() * mag;
+        scenes.push_back(makeScene(Vec3(0.03, 0.04, -0.02) * (mag / 0.18), t));
+    }
 
     double radius_single = 0.0, radius_deep = 0.0;
     for (int levels = 1; levels <= 6; ++levels) {
@@ -274,9 +287,9 @@ TEST(DirectAligner, PyramidDepthExtendsConvergenceRadius) {
         cfg.pyramid_levels = levels;
 
         double radius = 0.0;
-        for (double mag : mags) {
-            const Vec3 t = Vec3(0.8, 0.53, -0.27).normalized() * mag;
-            const auto s = makeScene(Vec3(0.03, 0.04, -0.02) * (mag / 0.18), t);
+        for (std::size_t i = 0; i < scenes.size(); ++i) {
+            const double mag = mags[i];
+            const Scene& s = scenes[i];
             DirectAligner a(cfg);
             const auto r = a.align(s.ref, s.cur, SE3::identity());
             const double err = r.ok() ? r.value().T_cur_ref.distanceTo(s.truth).x() : 1e9;
@@ -294,6 +307,18 @@ TEST(DirectAligner, PyramidDepthExtendsConvergenceRadius) {
     EXPECT_GT(radius_deep, radius_single * 2.0)
         << "피라미드가 수렴 반경을 넓히지 못한다 - 단일 " << radius_single
         << " m, 최대 " << radius_deep << " m";
+
+    // 배수 조건만으로는 부족하다. 단일 해상도 반경은 실제로 0 m 이고
+    // 0 * 2 == 0 이므로, 위 조건은 깊은 피라미드가 최소 탐침 0.02 m 하나만
+    // 잡아도 통과한다. 그건 "피라미드가 동작한다" 가 아니라 "0 보다 크다" 다.
+    // 절대 하한을 따로 건다.
+    //
+    // 0.06 은 실측 0.18 m 의 1/3 이다. 경계에서 재지 않기 위해 여유를 크게
+    // 둔다 - 이 저장소는 문턱을 반경의 98 % 에 두었다가 컴파일러가 바뀌었을
+    // 뿐인데 실패로 읽힌 적이 있다 (10.4).
+    EXPECT_GE(radius_deep, 0.06)
+        << "가장 깊은 피라미드도 반경이 " << radius_deep
+        << " m 뿐이다 - 배수 조건은 단일이 0 이라 통과했을 뿐이다";
 }
 
 TEST(DirectAligner, InvariantToExposureChange) {
