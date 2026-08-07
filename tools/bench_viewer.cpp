@@ -1034,6 +1034,156 @@ public:
         }
     }
 
+    // --- 클래스별 3 차원 형상 ---
+    //
+    // 지금까지 물체는 전부 같은 와이어프레임 상자였고, 자동차인지 사람인지는
+    // 색으로만 갈렸다. 그러면 "무엇을 인식했는가" 가 화면에서 확인되지 않는다 -
+    // 상자는 검출기가 무엇을 내놓았든 똑같이 생겼기 때문이다.
+    //
+    // 형상이 클래스를 말하게 한다. 자동차는 차체 위에 캐빈이 얹힌 실루엣이고,
+    // 사람은 좁고 높은 몸통에 머리가 붙는다. 멀리서 실루엣만 봐도 갈린다.
+
+    // 방향이 있는 속이 찬 상자. 세 축과 반크기를 받아 카메라 쪽 세 면을 채운다.
+    void solidBox(const Eigen::Vector3d& c, const Eigen::Vector3d& ex,
+                  const Eigen::Vector3d& ey, const Eigen::Vector3d& ez,
+                  const Orbit& orb, double f, const cv::Scalar& base,
+                  double bright = 1.0) {
+        const Eigen::Matrix3d M = orb.basis();
+        const Eigen::Vector3d eye = orb.center - M.row(2).transpose() * orb.dist;
+        const Eigen::Vector3d axes[3] = {ex, ey, ez};
+        const double shade[3] = {0.95, 0.70, 0.52};
+        for (int k = 0; k < 3; ++k) {
+            const double sgn = ((eye - c).dot(axes[k]) >= 0.0) ? 1.0 : -1.0;
+            const Eigen::Vector3d n  = axes[k] * sgn;
+            const Eigen::Vector3d u1 = axes[(k + 1) % 3];
+            const Eigen::Vector3d u2 = axes[(k + 2) % 3];
+            const Eigen::Vector3d fc = c + n;
+            const Eigen::Vector3d q[4] = {fc - u1 - u2, fc + u1 - u2,
+                                          fc + u1 + u2, fc - u1 + u2};
+            cv::Point poly[4];
+            bool ok = true;
+            for (int i = 0; i < 4 && ok; ++i) ok = project3(q[i], orb, f, poly[i]);
+            if (!ok) continue;
+            const double a = std::clamp(shade[k] * bright, 0.0, 1.0);
+            cv::fillConvexPoly(img_, poly, 4,
+                               cv::Scalar(base[0] * a, base[1] * a, base[2] * a),
+                               cv::LINE_AA);
+            // 모서리를 한 번 더 그어 실루엣을 세운다. 채우기만 하면 같은 색의
+            // 물체 둘이 붙어 있을 때 하나로 뭉쳐 보인다.
+            cv::polylines(img_, std::vector<cv::Point>(poly, poly + 4), true,
+                          base, 1, cv::LINE_AA);
+        }
+    }
+
+    // 자동차. 차체 + 그 위에 얹힌 캐빈. 진행 방향으로 눕힌다.
+    void carModel(const Eigen::Vector3d& c, const Eigen::Vector3d& size,
+                  const Eigen::Vector3d& fwd, const Eigen::Vector3d& up,
+                  const Orbit& orb, double f, const cv::Scalar& col) {
+        Eigen::Vector3d u = up.normalized();
+        Eigen::Vector3d fw = fwd - u * fwd.dot(u);
+        if (fw.norm() < 1e-6) fw = Eigen::Vector3d::UnitX();
+        fw.normalize();
+        const Eigen::Vector3d rt = u.cross(fw).normalized();
+
+        const double L = std::max(0.6, size.maxCoeff());          // 길이
+        const double W = std::max(0.4, std::min(size.x(), size.z()));
+        const double H = std::max(0.4, size.y());
+        // 차체: 낮고 길다. 지면에서 살짝 띄운다.
+        solidBox(c - u * (H * 0.15), fw * (L * 0.5), u * (H * 0.30),
+                 rt * (W * 0.5), orb, f, col, 1.0);
+        // 캐빈: 짧고 위에. 이 두 덩이의 비율이 "자동차" 를 만든다.
+        solidBox(c + u * (H * 0.34), fw * (L * 0.28), u * (H * 0.22),
+                 rt * (W * 0.42), orb, f, col, 0.78);
+    }
+
+    // 사람 골격.
+    //
+    // **관절을 추정한 것이 아니다.** 이 저장소에는 자세 추정기가 없고, 있는
+    // 것은 YOLO 의 person 상자 하나뿐이다. 여기서 그리는 것은 그 상자에 사람
+    // 비례를 맞춰 넣은 **도식** 이고, 팔다리의 각도는 관측이 아니라 그림이다.
+    //
+    // 그래도 상자보다 낫다: 멀리서도 사람으로 읽히고, 자동차와 절대 헷갈리지
+    // 않는다. 다만 화면이 "관절을 봤다" 고 말하게 두면 안 되므로 라벨에
+    // schematic 을 붙인다 - 그리지 않은 것을 그린 척하지 않는 쪽이 규칙이다.
+    void personSkeleton(const Eigen::Vector3d& c, const Eigen::Vector3d& size,
+                        const Eigen::Vector3d& up, const Eigen::Vector3d& face,
+                        const Orbit& orb, double f, const cv::Scalar& col) {
+        const Eigen::Vector3d u = up.normalized();
+        Eigen::Vector3d fw = face - u * face.dot(u);
+        if (fw.norm() < 1e-6) fw = Eigen::Vector3d::UnitX();
+        fw.normalize();
+        const Eigen::Vector3d rt = u.cross(fw).normalized();
+
+        const double H = std::clamp(size.maxCoeff(), 0.9, 2.2);
+        const double W = std::clamp(std::min(size.x(), size.z()), 0.25, 0.7);
+        // 인체 비례. 발밑을 원점으로 잡는다.
+        const Eigen::Vector3d foot = c - u * (H * 0.5);
+        const auto P = [&](double h, double side, double front = 0.0) {
+            return foot + u * (H * h) + rt * (W * side) + fw * (W * front);
+        };
+        const Eigen::Vector3d head   = P(0.94, 0.0);
+        const Eigen::Vector3d neck   = P(0.83, 0.0);
+        const Eigen::Vector3d sh_l   = P(0.82, -0.62), sh_r = P(0.82, 0.62);
+        const Eigen::Vector3d el_l   = P(0.63, -0.72), el_r = P(0.63, 0.72);
+        const Eigen::Vector3d hd_l   = P(0.46, -0.66), hd_r = P(0.46, 0.66);
+        const Eigen::Vector3d pelvis = P(0.52, 0.0);
+        const Eigen::Vector3d hip_l  = P(0.50, -0.30), hip_r = P(0.50, 0.30);
+        const Eigen::Vector3d kn_l   = P(0.27, -0.32), kn_r = P(0.27, 0.32);
+        const Eigen::Vector3d ft_l   = P(0.02, -0.32), ft_r = P(0.02, 0.32);
+
+        const std::pair<const Eigen::Vector3d*, const Eigen::Vector3d*> bones[] = {
+            {&neck, &pelvis},                                  // 척추
+            {&sh_l, &sh_r},                                    // 어깨
+            {&sh_l, &el_l}, {&el_l, &hd_l},                    // 왼팔
+            {&sh_r, &el_r}, {&el_r, &hd_r},                    // 오른팔
+            {&hip_l, &hip_r},                                  // 골반
+            {&hip_l, &kn_l}, {&kn_l, &ft_l},                   // 왼다리
+            {&hip_r, &kn_r}, {&kn_r, &ft_r},                   // 오른다리
+        };
+        for (const auto& b : bones) {
+            cv::Point a1, b1;
+            if (project3(*b.first, orb, f, a1) && project3(*b.second, orb, f, b1)) {
+                const int m = 4 * std::max(img_.cols, img_.rows);
+                if (std::abs(a1.x) > m || std::abs(b1.x) > m) continue;
+                cv::line(img_, a1, b1, col, 2, cv::LINE_AA);
+            }
+        }
+        // 머리
+        cv::Point hp, np;
+        if (project3(head, orb, f, hp) && project3(neck, orb, f, np)) {
+            const int r = std::clamp(static_cast<int>(
+                std::hypot(hp.x - np.x, hp.y - np.y) * 0.85), 2, 40);
+            cv::circle(img_, hp, r, col, 2, cv::LINE_AA);
+        }
+    }
+
+    // 사람. 좁고 높은 몸통 + 머리. 자동차와 실루엣이 겹치지 않는다.
+    void personModel(const Eigen::Vector3d& c, const Eigen::Vector3d& size,
+                     const Eigen::Vector3d& up, const Orbit& orb, double f,
+                     const cv::Scalar& col) {
+        const Eigen::Vector3d u = up.normalized();
+        Eigen::Vector3d a = u.cross(Eigen::Vector3d::UnitZ());
+        if (a.norm() < 1e-6) a = u.cross(Eigen::Vector3d::UnitX());
+        a.normalize();
+        const Eigen::Vector3d b = u.cross(a).normalized();
+        const double H = std::max(0.8, size.maxCoeff());
+        const double W = std::max(0.20, std::min(0.55, size.minCoeff()));
+        // 몸통
+        solidBox(c - u * (H * 0.10), a * (W * 0.5), u * (H * 0.36), b * (W * 0.35),
+                 orb, f, col, 1.0);
+        // 머리
+        cv::Point hp;
+        if (project3(c + u * (H * 0.40), orb, f, hp)) {
+            const Eigen::Vector3d probe = c + u * (H * 0.40) + a * (W * 0.5);
+            cv::Point pp;
+            const int r = project3(probe, orb, f, pp)
+                        ? std::clamp(static_cast<int>(std::hypot(pp.x - hp.x,
+                                                                 pp.y - hp.y)), 2, 40)
+                        : 3;
+            cv::circle(img_, hp, r, col, cv::FILLED, cv::LINE_AA);
+        }
+    }
+
     void draw(const std::vector<Splat>& pts, const Orbit& orb, double f,
               double fade) {
         const Eigen::Matrix3d M = orb.basis();
@@ -1130,14 +1280,37 @@ public:
             if (!project3(c.rep.cast<double>(), orb, f, pa)) continue;
             const cv::Scalar col = stuffColor(c.cls);
 
-            // 지면은 선이 너무 많다. 점만 찍어 배경으로 둔다.
+            // **지면도 면이다.** 점 하나만 찍으면 노면이 화면에서 사라져,
+            // 무엇이 길이고 무엇이 허공인지 구분되지 않는다. 격자칸을 칸
+            // 크기대로 채우면 도로가 도로로 보이고, 그 위에 선 구조의
+            // 발치가 어디인지도 읽힌다.
             if (c.cls == Stuff::Ground) {
-                if (pa.x >= 0 && pa.y >= 0 && pa.x < img_.cols && pa.y < img_.rows) {
-                    img_.at<cv::Vec3b>(pa) = cv::Vec3b(
-                        static_cast<std::uint8_t>(col[0]),
-                        static_cast<std::uint8_t>(col[1]),
-                        static_cast<std::uint8_t>(col[2]));
+                const Eigen::Vector3f q[4] = {
+                    c.rep - g.a * (cell * 0.5f) - g.b * (cell * 0.5f),
+                    c.rep + g.a * (cell * 0.5f) - g.b * (cell * 0.5f),
+                    c.rep + g.a * (cell * 0.5f) + g.b * (cell * 0.5f),
+                    c.rep - g.a * (cell * 0.5f) + g.b * (cell * 0.5f)};
+                cv::Point poly[4];
+                bool ok = true;
+                for (int i = 0; i < 4 && ok; ++i) {
+                    ok = project3(q[i].cast<double>(), orb, f, poly[i]);
                 }
+                if (!ok) continue;
+                // 칸이 화면에서 너무 크면 투영이 튄 것이다 - 지평선 근처의
+                // 칸 하나가 화면 절반을 덮는 일을 막는다.
+                const double w = std::max({std::abs(poly[0].x - poly[2].x),
+                                           std::abs(poly[0].y - poly[2].y)});
+                if (w > img_.cols * 0.5) continue;
+                // **채우지 않고 격자로 긋는다.**
+                //
+                // 칸을 불투명하게 채웠더니 노면이 지도 전체를 덮어, 정작 그
+                // 위에 선 구조가 하나도 안 보였다. 지면은 배경이고 척도이지
+                // 주인공이 아니다. 테두리만 그으면 노면의 결이 보이면서도
+                // 그 위의 것을 가리지 않는다 - 라이다 시각화의 바닥 격자가
+                // 하는 일이 정확히 이것이다.
+                const cv::Scalar gcol{col[0] * 0.55, col[1] * 0.55, col[2] * 0.55};
+                cv::polylines(img_, std::vector<cv::Point>(poly, poly + 4), true,
+                              gcol, 1, cv::LINE_AA);
                 continue;
             }
 
@@ -1168,8 +1341,16 @@ public:
             {
                 auto get = [&](const Eigen::Vector3f& d) -> const Column* {
                     const auto it = cols.find(g.key(c.rep + d));
-                    return (it != cols.end() && it->second.cls == c.cls)
-                         ? &it->second : nullptr;
+                    if (it == cols.end() || it->second.cls != c.cls) return nullptr;
+                    // **월드에서 멀리 떨어진 칸은 잇지 않는다.**
+                    //
+                    // 격자 좌표로는 이웃이어도 대표점의 높이가 크게 다르면 실제
+                    // 거리는 수십 m 다. 그것을 이으면 장면을 가로지르는 긴 선이
+                    // 생기고, 화면에는 있지도 않은 구조가 거미줄처럼 깔린다 -
+                    // 지금까지 그 선들이 하늘을 덮고 있었다.
+                    const float far2 = 9.0f * cell * cell;
+                    if ((it->second.rep - c.rep).squaredNorm() > far2) return nullptr;
+                    return &it->second;
                 };
                 nb_a  = get(g.a * cell);
                 nb_b  = get(g.b * cell);
@@ -1594,6 +1775,8 @@ void loadSeq(Seq& s) {
 void backProject(const cv::Mat& depth16, const wme_tools::DatasetCalib& cal,
                  const Eigen::Isometry3d& T_world_cam, int stride,
                  double dmin, double dmax, double cmin, double cmax,
+                 const Eigen::Vector3d& up, double ego_h,
+                 double h_lo, double h_hi,
                  std::vector<Splat>& out) {
     if (depth16.empty()) return;
     const double fx = cal.K.fx, fy = cal.K.fy, cx = cal.K.cx, cy = cal.K.cy;
@@ -1604,8 +1787,22 @@ void backProject(const cv::Mat& depth16, const wme_tools::DatasetCalib& cal,
             const double z = static_cast<double>(row[u]) / sc;
             if (!(z > dmin) || z > dmax) continue;
             const Eigen::Vector3d p_cam((u - cx) * z / fx, (v - cy) * z / fy, z);
+            const Eigen::Vector3d p_w = T_world_cam * p_cam;
+
+            // **하늘에는 아무 것도 없다.**
+            //
+            // 하늘은 텍스처가 없으므로 스테레오 정합이 아무 시차나 골라낸다.
+            // 그 시차를 역투영하면 도로 위 수십 m 에 구조가 생기고, 화면에는
+            // 뚫려 있어야 할 곳이 지붕처럼 덮인다 - 실제로 그렇게 나왔다.
+            //
+            // 자차 높이를 기준으로 위아래를 자른다. 도로 장면에서 자차보다
+            // 12 m 위에 있는 것은 건물 꼭대기까지이고, 그보다 높으면 관측이
+            // 아니라 정합 실패다. 아래쪽도 자른다 - 노면 밑은 없다.
+            const double h = p_w.dot(up) - ego_h;
+            if (h < h_lo || h > h_hi) continue;
+
             Splat s;
-            s.p = (T_world_cam * p_cam).cast<float>();
+            s.p = p_w.cast<float>();
             // 색 범위는 **유효 범위와 다르다.** KITTI 의 유효 범위는 3~80 m 지만
             // 실제 점의 대부분은 5~30 m 에 있어서, 유효 범위로 정규화하면 전부
             // turbo 의 파란 끝에 몰려 색이 정보를 잃는다.
@@ -2059,9 +2256,18 @@ int main(int argc, char** argv) {
                     // 기억이 없는 쪽은 성기게. ORB 가 프레임당 쓰는 점 수에 맞춘다.
                     const int stride = has_memory ? (s.dataset == "kitti" ? 3 : 2)
                                                   : (s.dataset == "kitti" ? 22 : 16);
+                    // 이 프레임의 자차 높이. 하늘/노면밑 걸러내기의 기준이다.
+                    const double ego_hh =
+                        run.aligned[static_cast<std::size_t>(pi)].translation()
+                            .dot(ob.world_up);
+                    // 도로 장면은 위로 12 m (건물 꼭대기), 아래로 4 m.
+                    // 실내는 천장이 3 m 를 넘지 않는다.
+                    const double hlo = (s.dataset == "kitti") ? -4.0 : -2.0;
+                    const double hhi = (s.dataset == "kitti") ? 12.0 :  2.5;
                     backProject(d16, s.calib, run.aligned[static_cast<std::size_t>(pi)],
                                 stride,
-                                s.calib.depth_min, s.calib.depth_max, cmin, cmax, pts);
+                                s.calib.depth_min, s.calib.depth_max, cmin, cmax,
+                                ob.world_up, ego_hh, hlo, hhi, pts);
                     // 색을 **관측 거리가 아니라 월드 높이** 로 다시 칠한다.
                     //
                     // 누적 지도에서 "카메라로부터 몇 m" 는 지도의 성질이 아니라
@@ -2378,8 +2584,23 @@ int main(int argc, char** argv) {
                             // 최근에 못 본 동적 물체는 그리지 않는다. 마지막으로
                             // 본 자리에 세워 두면 그것이 바로 잔상이다.
                             if (frame - m.seen > 12) continue;
-                            cloud[k].footprint(Eigen::Isometry3d::Identity(), m.center(),
-                                               m.size(), ob.world_up, ob, f3, C_WARN, 2);
+                            // 움직이는 것도 무엇인지 알아볼 수 있어야 한다.
+                            // 이동 방향은 첫 관측에서 지금까지의 변위다.
+                            const Eigen::Vector3d mv = m.cur_c - m.first_c;
+                            if (vehicle) {
+                                cloud[k].carModel(m.center(), m.size(),
+                                                  mv.norm() > 0.2 ? mv : pan_head[k],
+                                                  ob.world_up, ob, f3, C_WARN);
+                            } else if (person) {
+                                cloud[k].personSkeleton(m.center(), m.size(),
+                                                        ob.world_up,
+                                                        mv.norm() > 0.1 ? mv : pan_head[k],
+                                                        ob, f3, C_WARN);
+                            } else {
+                                cloud[k].footprint(Eigen::Isometry3d::Identity(),
+                                                   m.center(), m.size(),
+                                                   ob.world_up, ob, f3, C_WARN, 2);
+                            }
                             cv::Point at;
                             const Eigen::Vector3d top =
                                 m.center() - ob.world_up * (m.size().maxCoeff() * 0.5 + 0.12);
@@ -2387,7 +2608,8 @@ int main(int argc, char** argv) {
                                 at.x += vp.x; at.y += vp.y - 6;
                                 if (at.x > vp.x && at.x < vp.x + vp.width - 90 &&
                                     at.y > vp.y + 12 && at.y < vp.y + vp.height) {
-                                    text(canvas, m.cls + " moving", at, T_LABEL, C_WARN, 1);
+                                    text(canvas, m.cls + (person ? " moving (schematic)" : " moving"),
+                                         at, T_LABEL, C_WARN, 1);
                                 }
                             }
                             continue;
@@ -2403,9 +2625,22 @@ int main(int argc, char** argv) {
                         const cv::Scalar col{base[0] * a + C_BG[0] * (1 - a),
                                              base[1] * a + C_BG[1] * (1 - a),
                                              base[2] * a + C_BG[2] * (1 - a)};
-                        // 이미 월드 좌표이므로 항등 변환으로 그린다.
-                        cloud[k].footprint(Eigen::Isometry3d::Identity(), m.center(),
-                                           m.size(), ob.world_up, ob, f3, col, 1);
+                        // **형상이 클래스를 말한다.** 이미 월드 좌표이므로
+                        // 항등 변환으로 그린다.
+                        if (vehicle) {
+                            const Eigen::Vector3d mv = m.cur_c - m.first_c;
+                            cloud[k].carModel(m.center(), m.size(),
+                                              mv.norm() > 0.3 ? mv : pan_head[k],
+                                              ob.world_up, ob, f3, col);
+                        } else if (person) {
+                            const Eigen::Vector3d mv2 = m.cur_c - m.first_c;
+                            cloud[k].personSkeleton(m.center(), m.size(), ob.world_up,
+                                                    mv2.norm() > 0.1 ? mv2 : pan_head[k],
+                                                    ob, f3, col);
+                        } else {
+                            cloud[k].footprint(Eigen::Isometry3d::Identity(), m.center(),
+                                               m.size(), ob.world_up, ob, f3, col, 1);
+                        }
                     }
 
                     if (snap >= 0) {
@@ -2502,6 +2737,33 @@ int main(int argc, char** argv) {
                     for (int e = 0; e < 4; ++e) {
                         cloud[k].line3(o, c[e], ob, f3, C_INK, 1);
                         cloud[k].line3(c[e], c[(e + 1) % 4], ob, f3, C_INK, 1);
+                    }
+
+                    // **자차도 형상으로 그린다.**
+                    //
+                    // 라이다 시각화가 한가운데에 차를 놓는 것은 장식이 아니다 -
+                    // 그 차가 척도이고 방향이다. 프러스텀 하나만 있으면 지도의
+                    // 크기도 자차가 어느 쪽을 향하는지도 화면에서 읽히지 않는다.
+                    // 1 인칭에서는 눈이 차 안에 있으므로 그리지 않는다.
+                    // 카메라가 모델보다 가까우면 그리지 않는다. 1.7 m 짜리
+                    // 사람을 1.75 m 앞에서 그리면 화면이 통째로 그 사람이 되고,
+                    // 지도를 보여 주려던 자리에 자차만 남는다 - TUM 3 인칭에서
+                    // 실제로 흰 기둥 하나가 패널을 가렸다.
+                    const double model_h = (s.dataset == "kitti") ? 4.2 : 1.7;
+                    if (cam_mode != 0 && ob.dist > model_h * 2.5) {
+                        const Eigen::Vector3d fw = (pan_head[k].squaredNorm() > 1e-12)
+                                                 ? pan_head[k]
+                                                 : (T.rotation() * Eigen::Vector3d::UnitZ());
+                        if (s.dataset == "kitti") {
+                            // KITTI 는 차량이다. 실제 승용차 치수를 쓴다.
+                            cloud[k].carModel(o + ob.world_up * 0.7,
+                                              Eigen::Vector3d(1.8, 1.5, 4.2),
+                                              fw, ob.world_up, ob, f3, C_INK);
+                        } else {
+                            // TUM 은 손에 든 카메라다. 차를 그리면 거짓말이 된다.
+                            cloud[k].personModel(o, Eigen::Vector3d(0.4, 1.7, 0.4),
+                                                 ob.world_up, ob, f3, C_INK);
+                        }
                     }
                 }
             }
