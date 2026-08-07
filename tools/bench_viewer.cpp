@@ -50,6 +50,7 @@
 #include <cstdlib>
 #include <deque>
 #include <filesystem>
+#include <chrono>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -282,6 +283,10 @@ struct Orbit {
     // 매달리고 지면이 사라진다 - 실제로 처음에 그렇게 나왔다.
     Eigen::Vector3d world_up{0, -1, 0};
 
+    // 진행 방향. 1 인칭/3 인칭에서는 시선이 이 방향을 따라간다.
+    // 영벡터면 쓰지 않는다 (고정 방위 지도 뷰).
+    Eigen::Vector3d heading{Eigen::Vector3d::Zero()};
+
     Eigen::Matrix3d basis() const {
         const double cy = std::cos(yaw), sy = std::sin(yaw);
         const double cp = std::cos(pitch), sp = std::sin(pitch);
@@ -290,6 +295,22 @@ struct Orbit {
         if (a.norm() < 1e-6) a = world_up.cross(Eigen::Vector3d::UnitX());
         a.normalize();
         const Eigen::Vector3d b = world_up.cross(a).normalized();
+        // 진행 방향이 주어지면 그것을 지면 안에 눕혀 시선의 기준으로 쓴다.
+        // 1 인칭은 "지금 무엇을 향해 가고 있는가" 가 화면이어야 하므로
+        // 고정 방위로는 성립하지 않는다.
+        if (heading.squaredNorm() > 1e-12) {
+            Eigen::Vector3d hg = heading - world_up * heading.dot(world_up);
+            if (hg.norm() > 1e-9) {
+                hg.normalize();
+                const Eigen::Vector3d fwd2 = (hg * cp - world_up * sp).normalized();
+                Eigen::Vector3d up2 = world_up;
+                Eigen::Vector3d right2 = fwd2.cross(up2).normalized();
+                up2 = right2.cross(fwd2).normalized();
+                Eigen::Matrix3d M2;
+                M2.row(0) = right2; M2.row(1) = up2; M2.row(2) = fwd2;
+                return M2;
+            }
+        }
         // yaw 로 지면 안에서 방향을 정하고, pitch 만큼 위에서 내려다본다.
         const Eigen::Vector3d ground = (a * sy + b * cy).normalized();
         const Eigen::Vector3d fwd = (ground * cp - world_up * sp).normalized();
@@ -520,19 +541,33 @@ inline Stuff classifyColumn(const Column& c) {
 // 반경 안의 최저점을 지면으로 쓰면 벽면 칸은 옆 도로의 높이를 기준으로 삼게
 // 되어 진짜 높이가 나온다. 전역 최저점을 쓰지 않는 이유는 반대다 - KITTI 00
 // 은 평지가 아니고, 언덕 하나에 지도의 절반이 건물이 된다.
-inline std::unordered_map<std::int64_t, Column>
-labelScene(const std::unordered_map<std::int64_t, Splat>& cells,
-           const Eigen::Vector3d& up_d, float cell, float voxel,
-           int ground_radius = 3) {
+// **자차 주변만 새로 라벨하고, 나머지는 이미 붙은 것을 그대로 둔다.**
+//
+// 프레임마다 500 m 지도 전체를 다시 분류하면 310 ms 가 든다 (실측). 3 fps 다.
+// 그런데 지도는 자차가 지금 보고 있는 곳에서만 자란다 - 뒤쪽 200 m 의 벽면은
+// 이번 프레임에도, 다음 프레임에도 같은 벽면이다. 다시 계산할 이유가 없다.
+//
+// 자차가 결국 모든 곳을 지나가므로 지도는 빠짐없이 라벨된다. 잘라내는 것이
+// 아니라 **한 번 계산한 것을 재사용** 하는 것이므로 화면에서 사라지는 것도 없다.
+inline void labelScene(const std::unordered_map<std::int64_t, Splat>& cells,
+                       const Eigen::Vector3d& up_d, float cell, float voxel,
+                       const Eigen::Vector3d& ego, float work_radius,
+                       std::unordered_map<std::int64_t, Column>& cols,
+                       int ground_radius = 3) {
     const GroundGrid g(up_d.cast<float>(), cell);
-    std::unordered_map<std::int64_t, Column> cols;
-    cols.reserve(cells.size() / 4 + 1);
+    const Eigen::Vector3f e = ego.cast<float>();
+    const float r2 = work_radius * work_radius;
+
+    // 이번에 손댈 칸만 모은다. 이전 라벨은 지우지 않는다.
+    std::unordered_map<std::int64_t, Column> fresh;
+    fresh.reserve(cells.size() / 8 + 1);
 
     // 1 차: 칸마다 최저/최고 높이와 구조 텐서 누적.
     for (const auto& [k, v] : cells) {
+        if ((v.p - e).squaredNorm() > r2) continue;
         const float h = v.p.dot(g.up);
         const auto [i, j] = g.ij(v.p);
-        auto& c = cols[GroundGrid::key(i, j)];
+        auto& c = fresh[GroundGrid::key(i, j)];
         c.i = i; c.j = j;
         if (h > c.high) { c.high = h; c.rep = v.p; }
         c.low = std::min(c.low, h);
@@ -551,11 +586,11 @@ labelScene(const std::unordered_map<std::int64_t, Splat>& cells,
     // 이웃 칸들의 최저 높이 **중앙값** 은 이상치 하나에 흔들리지 않는다.
     // 벽면 칸의 최저점도 결국 도로면이므로 중앙값은 지면에 앉는다.
     std::vector<float> nb;
-    for (auto& [k, c] : cols) {
+    for (auto& [k, c] : fresh) {
         nb.clear();
         for (int di = -ground_radius; di <= ground_radius; ++di) {
             for (int dj = -ground_radius; dj <= ground_radius; ++dj) {
-                const auto it = cols.find(GroundGrid::key(c.i + di, c.j + dj));
+                const auto it = fresh.find(GroundGrid::key(c.i + di, c.j + dj));
                 if (it != cols.end()) nb.push_back(it->second.low);
             }
         }
@@ -570,7 +605,8 @@ labelScene(const std::unordered_map<std::int64_t, Splat>& cells,
     // 대가로 "어느 높이가 찼는가" 를 얻는다 - 그 정보 없이는 나무와 벽이
     // 구분되지 않는다.
     for (const auto& [k, v] : cells) {
-        const auto it = cols.find(g.key(v.p));
+        if ((v.p - e).squaredNorm() > r2) continue;
+        const auto it = fresh.find(g.key(v.p));
         if (it == cols.end()) continue;
         const float rel = v.p.dot(g.up) - it->second.ground;
         const int b = static_cast<int>(std::floor(rel / kBinH));
@@ -586,7 +622,7 @@ labelScene(const std::unordered_map<std::int64_t, Splat>& cells,
     //
     // 이웃은 기둥이 아니라 **공** 이어야 한다. 복셀 ±2 칸이면 KITTI 에서 약
     // 3 m 로, 벽면 한 조각과 수관 한 덩이를 가르기에 맞는 크기다.
-    for (auto& [k, c] : cols) {
+    for (auto& [k, c] : fresh) {
         int n = 0;
         Eigen::Vector3d sum = Eigen::Vector3d::Zero();
         Eigen::Matrix3d sq = Eigen::Matrix3d::Zero();
@@ -610,7 +646,7 @@ labelScene(const std::unordered_map<std::int64_t, Splat>& cells,
         cov = 0.5 * (cov + cov.transpose());
         Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es(cov);
         Eigen::Vector3d ev = es.eigenvalues();          // 오름차순
-        for (int e = 0; e < 3; ++e) ev[e] = std::max(ev[e], 0.0);
+        for (int q = 0; q < 3; ++q) ev[q] = std::max(ev[q], 0.0);
         const double l0 = ev[2], l1 = ev[1], l2 = ev[0];   // l0 >= l1 >= l2
         if (l0 < 1e-9) { c.cls = Stuff::Unknown; continue; }
         c.linearity = static_cast<float>((l0 - l1) / l0);
@@ -621,8 +657,11 @@ labelScene(const std::unordered_map<std::int64_t, Splat>& cells,
         // 법선이 "위" 와 이루는 각. 수직면이면 법선이 수평이라 내적이 0 이다.
         c.vert = static_cast<float>(1.0 - std::abs(nrm.dot(g.up.cast<double>())));
         c.cls = classifyColumn(c);
+        // **누적 지도에 합친다.** 이번에 손대지 않은 칸의 라벨은 그대로
+        // 남는다 - 지나온 곳의 건물이 시야에서 벗어났다고 사라지면
+        // 그것은 세계 모델이 아니라 지금 보이는 것의 목록이다.
+        cols[k] = c;
     }
-    return cols;
 }
 
 // ---------------------------------------------------------------------------
@@ -1022,16 +1061,40 @@ public:
                     lineClipped(pb, pa, col, 1);
                 }
             }
-            // 수평 벡터: 같은 클래스의 이웃 기둥과 꼭대기끼리 잇는다.
-            // 클래스가 다르면 잇지 않는다 - 건물과 나무를 이으면 있지도 않은
-            // 구조가 생긴다.
-            for (const Eigen::Vector3f& d : {g.a * cell, g.b * cell}) {
-                const auto it = cols.find(g.key(c.rep + d));
-                if (it == cols.end() || it->second.cls != c.cls) continue;
-                cv::Point pc;
-                if (!project3(it->second.rep.cast<double>(), orb, f, pc)) continue;
-                lineClipped(pa, pc, col, 1);
+            // **면으로 잇는다.** 선 두 개가 아니라 사각형 하나다.
+            //
+            // +a, +b 두 방향으로만 선을 그으면 화면에는 서로 만나지 않는
+            // 짧은 선분들이 남고, 표면이 아니라 빗금처럼 보인다. 네 이웃이
+            // 다 있을 때 사각형을 닫고 대각선 하나를 그어 삼각형 두 개로
+            // 만들면 그때부터 면으로 읽힌다 - 3 차원 격자가 되는 지점이다.
+            //
+            // 클래스가 다르면 잇지 않는다. 건물과 나무를 한 면으로 이으면
+            // 있지도 않은 구조가 생긴다.
+            const Column* nb_a = nullptr;
+            const Column* nb_b = nullptr;
+            const Column* nb_ab = nullptr;
+            {
+                auto get = [&](const Eigen::Vector3f& d) -> const Column* {
+                    const auto it = cols.find(g.key(c.rep + d));
+                    return (it != cols.end() && it->second.cls == c.cls)
+                         ? &it->second : nullptr;
+                };
+                nb_a  = get(g.a * cell);
+                nb_b  = get(g.b * cell);
+                nb_ab = get(g.a * cell + g.b * cell);
             }
+            cv::Point p_a, p_b, p_ab;
+            const bool ok_a  = nb_a  && project3(nb_a->rep.cast<double>(),  orb, f, p_a);
+            const bool ok_b  = nb_b  && project3(nb_b->rep.cast<double>(),  orb, f, p_b);
+            const bool ok_ab = nb_ab && project3(nb_ab->rep.cast<double>(), orb, f, p_ab);
+
+            if (ok_a)  lineClipped(pa, p_a, col, 1);
+            if (ok_b)  lineClipped(pa, p_b, col, 1);
+            if (ok_a && ok_ab) lineClipped(p_a, p_ab, col, 1);
+            if (ok_b && ok_ab) lineClipped(p_b, p_ab, col, 1);
+            // 대각선. 사각형만으로는 면의 방향이 안 보이고 격자가 평평해
+            // 보인다 - 삼각형이 되어야 굴곡이 읽힌다.
+            if (ok_ab) lineClipped(pa, p_ab, col, 1);
         }
     }
 
@@ -1042,8 +1105,14 @@ public:
     // 파선으로, 배경 쪽으로 눌러서, 신뢰도만큼만 진하게 그린다. 채점이 끝난
     // 것은 결과대로 색을 바꾼다 - 맞은 예측과 틀린 예측이 자리째로 보인다.
     void predictions(const std::unordered_map<std::int64_t, Prediction>& preds,
-                     const Eigen::Vector3d& up, const Orbit& orb, double f) {
+                     const Eigen::Vector3d& up, const Orbit& orb, double f,
+                     const Eigen::Vector3d& ego, double draw_radius) {
+        const double r2 = draw_radius * draw_radius;
         for (const auto& [k, pr] : preds) {
+            // 멀리 있는 예측은 그리지 않는다. 4 만 개를 전부 파선으로 그리면
+            // 프레임당 62 ms 가 든다 (실측) - 그 대부분은 화면에서 한 점에
+            // 뭉쳐 아무 것도 말해 주지 않는다.
+            if ((pr.p.cast<double>() - ego).squaredNorm() > r2) continue;
             cv::Point pa, pb;
             if (!project3(pr.p.cast<double>(), orb, f, pa)) continue;
             const Eigen::Vector3d base =
@@ -1427,7 +1496,7 @@ int main(int argc, char** argv) {
     std::string dump_feat;
     int shot_frame = 0;
     int cloud_cap = 260000;
-    int start_cam = 0;      // 0 추격 / 1 항공 / 2 자유
+    int start_cam = 0;      // 0 1인칭 / 1 3인칭 / 2 지도 / 3 항공
 
     for (int i = 1; i + 1 < argc; i += 2) {
         const std::string k = argv[i];
@@ -1474,6 +1543,10 @@ int main(int argc, char** argv) {
     double user_yaw = 0.0;         // A/D 가 더하는 시선 오프셋
     double base_dist = 0.0;        // 모드 전환 시 되돌아갈 기준 거리
     Eigen::Vector3d ego_pos = Eigen::Vector3d::Zero();   // 지금 프레임의 자차 위치 (정답)
+    Eigen::Vector3d heading_dir = Eigen::Vector3d::Zero();  // 진행 방향 (1/3 인칭 시선)
+    // 마지막으로 라벨을 계산한 자리. 이만큼 움직이기 전엔 다시 안 한다.
+    Eigen::Vector3d label_at[2] = {Eigen::Vector3d::Constant(1e9),
+                                   Eigen::Vector3d::Constant(1e9)};
     // 패널별 시선 중심. 각 패널은 **자기가 추정한** 위치에 걸린다 - 정답에
     // 걸면 드리프트가 큰 쪽의 지도가 화면 밖으로 나간다.
     Eigen::Vector3d pan_center[2] = {Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero()};
@@ -1492,7 +1565,11 @@ int main(int argc, char** argv) {
     // 앞을 내다본 것과 그 성적표.
     std::unordered_map<std::int64_t, Prediction> pred[2];
     PredictScore pscore[2];
-    bool show_pred = true;         // P 로 토글
+    bool show_pred = true;         // O 로 토글
+    // 단계별 소요 시간 (ms). 랙의 원인을 추측하지 않기 위한 계측이다.
+    double prof_label[2] = {0, 0}, prof_vec[2] = {0, 0};
+    double prof_pred[2] = {0, 0}, prof_pdraw[2] = {0, 0};
+    double prof_cloud[2] = {0, 0}, prof_frame = 0;
     int acc_frame[2] = {-1, -1};
     std::vector<double> err_series[2];
 
@@ -1503,6 +1580,7 @@ int main(int argc, char** argv) {
     const int vp_h = card_h - 250;
 
     while (true) {
+        const auto t_frame0 = std::chrono::steady_clock::now();
         Seq& s = seqs[static_cast<std::size_t>(si)];
         const bool first_load = !s.loaded;
         loadSeq(s);
@@ -1526,6 +1604,20 @@ int main(int argc, char** argv) {
             const Eigen::Vector3d target = (j >= 0)
                 ? s.gt[static_cast<std::size_t>(j)].p : Eigen::Vector3d::Zero();
             ego_pos = target;
+
+            // 진행 방향. 한 프레임 차분은 잡음이라 시선이 매 프레임 튄다 -
+            // 1 인칭에서는 그것이 곧 멀미다. 몇 프레임 뒤를 본다.
+            if (j > 0) {
+                const int j0 = std::max(0, j - 10);
+                const Eigen::Vector3d d =
+                    s.gt[static_cast<std::size_t>(j)].p - s.gt[static_cast<std::size_t>(j0)].p;
+                if (d.norm() > 1e-3) {
+                    // 부드럽게 따라간다. 코너에서 화면이 홱 돌지 않게.
+                    heading_dir = (heading_dir.squaredNorm() < 1e-12)
+                                ? d.normalized()
+                                : (heading_dir * 0.85 + d.normalized() * 0.15).normalized();
+                }
+            }
 
             // 시점은 **인식 시점(자차)에 고정** 한다.
             //
@@ -1558,18 +1650,31 @@ int main(int argc, char** argv) {
             // 카메라 모드별 시선각. 항공뷰는 거의 수직으로 내려다보되 완전한
             // 90 도는 피한다 - 정확히 수직이면 지면 위 높이가 전부 한 점에
             // 겹쳐 물체의 높이 정보가 사라진다.
-            //   0 MAP   비스듬히 내려다보는 고정 지도. 구조와 높이가 같이 보인다
-            //   1 BIRD  거의 수직. 배치와 궤적 형상이 가장 잘 읽힌다
-            //   2 CHASE 자차 추종. "지금 무엇을 보고 있는가"
-            const double want_pitch = (cam_mode == 1) ? 1.30
-                                    : (cam_mode == 0) ? 0.85 : 0.40;
+            //   0 FIRST  1 인칭. 눈이 인식 시점에 있고 진행 방향을 본다
+            //   1 THIRD  3 인칭. 자차 뒤 위에서 따라간다 - 이동이 보인다
+            //   2 MAP    비스듬히 내려다보는 고정 방위 지도
+            //   3 BIRD   거의 수직. 배치와 궤적 형상이 가장 잘 읽힌다
+            //
+            // 기본이 1 인칭인 이유: 실내 시퀀스에서 위에서 내려다보면 방
+            // 하나가 점 덩어리로만 보여 무엇을 보고 있는지 알 수 없다.
+            // 사람이 그 자리에 서 있을 때 보이는 것이 기준이어야 한다.
+            const double want_pitch = (cam_mode == 3) ? 1.30
+                                    : (cam_mode == 2) ? 0.85
+                                    : (cam_mode == 1) ? 0.35 : 0.02;
             // headless 는 루프를 한 번만 돈다. 보간만 하면 목표각에
             // 도달하지 못한 그림이 저장된다.
             orb.pitch += (want_pitch - orb.pitch) * (headless ? 1.0 : 0.25);
-            if (cam_mode == 1 && !user_zoomed) {
-                // 위에서 보면 같은 거리라도 훨씬 좁은 영역만 담긴다.
-                orb.dist = base_dist * 1.1;
+            if (!user_zoomed) {
+                // 1 인칭은 눈이 자차에 있어야 하므로 궤도 반지름이 거의 0 이다.
+                // 3 인칭은 자차가 화면 아래쪽에 오도록 조금 뒤에 선다.
+                if (cam_mode == 0)      orb.dist = base_dist * 0.06;
+                else if (cam_mode == 1) orb.dist = base_dist * 0.35;
+                else if (cam_mode == 3) orb.dist = base_dist * 1.1;
+                else                    orb.dist = base_dist;
             }
+            // 1 인칭과 3 인칭만 진행 방향을 따라간다. 지도 뷰에서 시선이
+            // 돌면 코너마다 화면이 통째로 회전해 쌓인 지도가 안 읽힌다.
+            orb.heading = (cam_mode <= 1) ? heading_dir : Eigen::Vector3d::Zero();
             // yaw 는 사용자 조작(A/D)에만 반응한다. 진행 방향을 따라
             // 돌리면 코너마다 지도가 통째로 회전해서, 무엇이 쌓였는지가 아니라
             // 차가 어느 쪽을 향하는지만 보이게 된다.
@@ -1829,7 +1934,10 @@ int main(int argc, char** argv) {
                     v.age = static_cast<float>(
                         std::clamp(1.0 - static_cast<double>(v.seen) / span, 0.0, 1.0));
                 }
+                const auto t_c0 = std::chrono::steady_clock::now();
                 cloud[k].draw(flat, ob, vp.width * 0.9, 0.62);
+                prof_cloud[k] = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t_c0).count();
                 // 점 위에 표면 격자를 덧그린다. 순서가 중요하다 - 먼저 그리면
                 // 점군이 격자를 덮어 아무 것도 이어져 보이지 않는다.
                 if (show_mesh && has_memory) {
@@ -1845,10 +1953,31 @@ int main(int argc, char** argv) {
                         // 1 m 칸이면 벽면이 여러 칸에 걸쳐 이어지고, 실내는
                         // 0.25 m 라야 가구와 벽이 갈린다.
                         const float ccell = (s.dataset == "kitti") ? 1.0f : 0.25f;
-                        stuff[k] = labelScene(acc[k].cells, ob.world_up, ccell,
-                                              acc[k].voxel);
+                        const auto t_lbl = std::chrono::steady_clock::now();
+                        // 작업 반경. 자차가 지금 보고 있는 범위만 새로
+                        // 분류하고 나머지는 이전 라벨을 재사용한다.
+                        const float work_r = (s.dataset == "kitti") ? 45.0f : 6.0f;
+                        // **자차가 의미 있게 움직였을 때만 다시 분류한다.**
+                        //
+                        // 프레임당 1 m 남짓 움직이는데 반경 45 m 를 매번 다시
+                        // 계산하면 같은 답을 45 번 구하는 셈이다. 실측 50.7 ms
+                        // 가 통째로 그 낭비였다. 이동량 기준이라 정지 구간에서
+                        // 저절로 멈추고, 빠른 구간에서는 저절로 자주 돈다 -
+                        // 프레임 수로 세면 속도에 따라 성기거나 낭비가 된다.
+                        const double moved = (ego_k - label_at[k]).norm();
+                        if (moved > work_r * 0.06 || stuff[k].empty()) {
+                            labelScene(acc[k].cells, ob.world_up, ccell,
+                                       acc[k].voxel, ego_k, work_r, stuff[k]);
+                            label_at[k] = ego_k;
+                        }
+                        const auto t_vec = std::chrono::steady_clock::now();
                         cloud[k].stuffVectors(stuff[k], ob.world_up, ccell,
                                               ob, vp.width * 0.9);
+                        const auto t_end = std::chrono::steady_clock::now();
+                        prof_label[k] = std::chrono::duration<double, std::milli>(
+                            t_vec - t_lbl).count();
+                        prof_vec[k] = std::chrono::duration<double, std::milli>(
+                            t_end - t_vec).count();
 
                         // 앞을 내다보고, 지나온 자리는 채점한다.
                         //
@@ -1871,14 +2000,22 @@ int main(int argc, char** argv) {
                                         - run.aligned[static_cast<std::size_t>(i0)].translation();
                                 }
                             }
+                            const auto t_p0 = std::chrono::steady_clock::now();
                             if (dir.norm() > 0.2) {
                                 gradePredictions(pred[k], stuff[k], ego_k, dir,
                                                  ob.world_up, ccell, pscore[k]);
                                 predictAhead(stuff[k], ego_k, dir, ob.world_up,
                                              ccell, frame, pscore[k], pred[k]);
                             }
+                            const auto t_p1 = std::chrono::steady_clock::now();
                             cloud[k].predictions(pred[k], ob.world_up, ob,
-                                                 vp.width * 0.9);
+                                                 vp.width * 0.9, ego_k,
+                                                 (s.dataset == "kitti") ? 130.0 : 14.0);
+                            const auto t_p2 = std::chrono::steady_clock::now();
+                            prof_pred[k] = std::chrono::duration<double, std::milli>(
+                                t_p1 - t_p0).count();
+                            prof_pdraw[k] = std::chrono::duration<double, std::milli>(
+                                t_p2 - t_p1).count();
                         }
                     } else {
                         for (auto& v : mesh[k].cells) {
@@ -2305,8 +2442,9 @@ int main(int argc, char** argv) {
             std::ostringstream ss;
             ss << "FRAME " << (frame + 1) << " / " << nframes;
             text(canvas, ss.str(), {PAD, fy + 58}, T_BODY, C_INK);
-            const char* mode = (cam_mode == 1) ? "BIRD'S EYE"
-                             : (cam_mode == 2) ? "CHASE" : "MAP";
+            const char* mode = (cam_mode == 0) ? "FIRST PERSON"
+                             : (cam_mode == 1) ? "THIRD PERSON"
+                             : (cam_mode == 2) ? "MAP" : "BIRD'S EYE";
             label(canvas, "camera", {W_MODE_X, fy + 40}, C_INK3);
             text(canvas, mode, {W_MODE_X, fy + 62}, T_BODY, C_INK2);
             const std::string st = playing ? "RUNNING" : "PAUSED";
@@ -2340,7 +2478,7 @@ int main(int argc, char** argv) {
             label(canvas, "controls", {hx, fy + 72}, C_INK3);
             text(canvas, "SPACE play    , . step    N/P sequence    1/2 swap model",
                  {hx, fy + 100}, T_BODY, C_INK2);
-            text(canvas, "A/D orbit     W/S zoom    V camera (chase/bird)    R restart    F shot    Q quit",
+            text(canvas, "A/D orbit   W/S zoom   V camera (1st/3rd/map/bird)   L labels   O lookahead   R restart   F shot   Q quit",
                  {hx, fy + 126}, T_BODY, C_INK2);
         }
         {
@@ -2409,6 +2547,13 @@ int main(int argc, char** argv) {
                                    << pscore[k].lateral << " m)";
                                  return o.str();
                              }()
+                          << "\n           시간(ms): 점군 " << std::fixed
+                          << std::setprecision(1) << prof_cloud[k]
+                          << "  라벨 " << prof_label[k]
+                          << "  벡터 " << prof_vec[k]
+                          << "  예측 " << prof_pred[k]
+                          << "  예측그리기 " << prof_pdraw[k]
+                          << "  프레임전체 " << prof_frame
                           << ", 기억물체 " << mem[k].size()
                           << " (동적 " << std::count_if(mem[k].begin(), mem[k].end(),
                                           [](const MemoryObject& m) { return m.dynamic; })
@@ -2427,6 +2572,8 @@ int main(int argc, char** argv) {
             return 0;
         }
 
+        prof_frame = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t_frame0).count();
         cv::imshow(win, canvas);
         const int key = cv::waitKey(playing ? 1 : 0);
 
@@ -2437,10 +2584,13 @@ int main(int argc, char** argv) {
             pred[0].clear(); pred[1].clear();
             pscore[0].clear(); pscore[1].clear();
             mesh[0].clear(); mesh[1].clear(); }
-        else if (key == 'v' || key == 'V') { cam_mode = (cam_mode + 1) % 3; }
+        else if (key == 'v' || key == 'V') { cam_mode = (cam_mode + 1) % 4; user_zoomed = false; }
         else if (key == 'm' || key == 'M') show_mesh = !show_mesh;
         else if (key == 'l' || key == 'L') show_stuff = !show_stuff;
-        else if (key == 'p' || key == 'P') show_pred = !show_pred;
+        // 예측 토글은 O 다. P 는 **이전 시퀀스** 로 이미 잡혀 있었고, 여기에
+        // 토글을 얹으니 아래 분기가 영영 안 닿아 시퀀스 되감기가 통째로
+        // 죽었다 - if/else 사슬에서 같은 키를 두 번 쓰면 뒤엣것은 없는 코드다.
+        else if (key == 'o' || key == 'O') show_pred = !show_pred;
         else if (key == 'n' || key == 'N') {
             si = (si + 1) % static_cast<int>(seqs.size());
             frame = 0; acc_frame[0] = acc_frame[1] = -1; orb.dist = 0.0; user_zoomed = false;
