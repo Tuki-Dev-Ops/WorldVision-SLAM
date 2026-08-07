@@ -343,6 +343,27 @@ struct Splat {
     // 잠정임을 표시하고, 나중에 가까이 가서 같은 자리를 다시 보면 **먼 관측을
     // 폐기** 할 수 있다. 지도가 시간이 지나며 좋아지는 것이 그 뜻이다.
     float range{0.0f};     // 관측 당시 카메라로부터의 거리 (m)
+
+    // --- 잡음을 거르는 두 가지 근거: 공간과 시간 ---
+    //
+    // **공간**: 반경 이웃 수 (Radius Outlier Removal). 주변에 아무 것도 없는
+    // 점은 표면이 아니라 SGBM 오매칭의 산탄이다. PCL 의 ROR 과 같은 판정이되,
+    // 이미 해시 복셀이라 kd-tree 가 필요 없다 - 26 이웃 키를 조회하면 끝이다.
+    //
+    // **시간**: 몇 번, 그리고 **몇 개의 서로 다른 시점** 에서 봤는가. 이 둘은
+    // 다른 것을 잡는다. 스테레오 유령은 같은 오매칭이 인접 프레임에서 반복
+    // 재현되므로 관측 횟수만으로는 안 걸러지고, 시점이 바뀌면 사라진다.
+    // 공간 판정이 절대 못 잡는 밀집 유령 덩어리가 여기서 걸린다.
+    std::uint8_t  nbr{0};        // 26 이웃 중 점유 수
+    std::uint8_t  hits{0};       // 총 관측 수 (포화 255)
+    std::uint16_t view_mask{0};  // 관측한 시점 섹터 비트
+
+    // 그릴 만한가. hits 만 보면 유령이 통과하고, 시점만 보면 웜업이 길다.
+    bool confirmed() const {
+        int v = 0;
+        for (std::uint16_t m = view_mask; m; m >>= 1) v += (m & 1u);
+        return hits >= 3 && v >= 2;
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -378,18 +399,62 @@ struct VoxelMap {
     // 가까이서 본 관측이 멀리서 본 관측을 **이긴다.**
     long long revised{0};      // 폐기한 먼 관측의 수. 개선이 일어났다는 증거다.
 
-    void insert(const Splat& s, std::size_t cap) {
+    void insert(const Splat& s, std::size_t cap, int view_sector = -1) {
         const float inv = 1.0f / voxel;
         const auto key = voxKey(s.p, inv);
-        const auto it = cells.find(key);
+        auto it = cells.find(key);
+
+        // **증거는 누적된다.** 관측 하나가 다른 관측을 대체하더라도, 이 칸을
+        // 몇 번 어디서 봤는지는 그 칸의 이력이지 개별 관측의 속성이 아니다.
+        // 덮어쓸 때 이것까지 갈아치우면 시간 판정이 통째로 무력해진다.
+        std::uint8_t hits = 0;
+        std::uint16_t vm = 0;
+        std::uint8_t nbr = 0;
+        if (it != cells.end()) {
+            hits = it->second.hits;
+            vm   = it->second.view_mask;
+            nbr  = it->second.nbr;
+        }
+        if (hits < 255) ++hits;
+        if (view_sector >= 0) vm |= static_cast<std::uint16_t>(1u << (view_sector & 15));
+
         if (it != cells.end() && it->second.range > 0.0f && s.range > 0.0f &&
             it->second.range < s.range * 0.8f) {
             // 같은 칸에 이미 더 가까이서 본 관측이 있다. 먼 것으로 덮으면
             // 좋은 값을 나쁜 값으로 바꾸는 것이다 - 최신이 항상 나은 것은
-            // 아니고, 여기서 나은 것은 **가까운** 것이다.
+            // 아니고, 여기서 나은 것은 **가까운** 것이다. 다만 이력은 갱신한다.
+            it->second.hits = hits;
+            it->second.view_mask = vm;
             return;
         }
-        cells[key] = s;
+
+        const bool fresh = (it == cells.end());
+        Splat& slot = cells[key];
+        slot = s;
+        slot.hits = hits;
+        slot.view_mask = vm;
+        slot.nbr = nbr;
+
+        // 새 칸이 생기면 26 이웃의 카운터를 올리고 자기 것도 세어 온다.
+        // 삽입할 때만 26 회 조회하면 렌더에서는 비교 한 번으로 끝난다 -
+        // 전체 90 만 셀을 매 프레임 훑으면 1.6 초다.
+        if (fresh) {
+            int mine = 0;
+            for (int dx = -1; dx <= 1; ++dx) {
+                for (int dy = -1; dy <= 1; ++dy) {
+                    for (int dz = -1; dz <= 1; ++dz) {
+                        if (!dx && !dy && !dz) continue;
+                        const Eigen::Vector3f q = s.p + Eigen::Vector3f(
+                            dx * voxel, dy * voxel, dz * voxel);
+                        const auto n = cells.find(voxKey(q, inv));
+                        if (n == cells.end()) continue;
+                        ++mine;
+                        if (n->second.nbr < 255) ++n->second.nbr;
+                    }
+                }
+            }
+            cells[key].nbr = static_cast<std::uint8_t>(std::min(mine, 255));
+        }
         if (cells.size() > cap) coarsen();
     }
 
@@ -1069,6 +1134,73 @@ public:
     }
 
     // 화면에 투영. f 는 초점거리(px), 카메라는 orbit 중심을 바라본다.
+    // Eye-Dome Lighting.
+    //
+    // Boucheny (2009) 가 만들고 CloudCompare / Potree / ArcGIS 가 쓰는 기법이다.
+    // 원리는 순수 화면공간이다: 이웃 픽셀보다 **뒤에 있는** 픽셀을 어둡게 칠한다.
+    // 법선도 조명도 지오메트리도 필요 없고 깊이 버퍼만 있으면 된다.
+    //
+    //   res   = (1/N) * sum_i max(0, D(p) - D(p + r*n_i))
+    //   shade = exp(-res * 300 * strength)
+    //
+    // 성긴 점군이 "3D 모델처럼" 보이는 이유의 거의 전부가 이것이다 - 사람의
+    // 시각은 깊이 불연속의 음영 대비로 형상을 읽는데, EDL 이 정확히 그것만
+    // 공급한다. 데이터도 알고리즘도 건드리지 않는 후처리 한 패스다.
+    //
+    // **D 는 선형 깊이가 아니라 log2 깊이다.** 이것을 놓치면 안 된다. 로그를
+    // 쓰면 차이가 깊이의 **비율** 이 되어 거리 스케일에 불변이 되는데, 선형 z
+    // 를 그대로 쓰면 1 m 부터 55 m 까지 오가는 이 장면에서 근거리는 새까맣고
+    // 원거리는 밋밋해진다.
+    void eyeDomeLighting(double strength = 0.4, double radius = 1.4) {
+        const int W = img_.cols, H = img_.rows;
+        if (W < 4 || H < 4) return;
+
+        // log2 깊이를 한 번에 만든다. 배경(무한대)은 0 으로 표시한다.
+        cv::Mat d(H, W, CV_32F);
+        for (int y = 0; y < H; ++y) {
+            const float* z = zbuf_.ptr<float>(y);
+            float* o = d.ptr<float>(y);
+            for (int x = 0; x < W; ++x) {
+                o[x] = (z[x] >= std::numeric_limits<float>::max() * 0.5f || z[x] <= 0.0f)
+                     ? 0.0f : std::log2(z[x]);
+            }
+        }
+
+        static const int nx[8] = {1, -1, 0, 0, 1, 1, -1, -1};
+        static const int ny[8] = {0, 0, 1, -1, 1, -1, 1, -1};
+        const int r = std::max(1, static_cast<int>(std::lround(radius)));
+        const double k = 300.0 * strength;
+
+        cv::parallel_for_(cv::Range(0, H), [&](const cv::Range& rows) {
+            for (int y = rows.start; y < rows.end; ++y) {
+                auto* px = img_.ptr<cv::Vec3b>(y);
+                const float* dc = d.ptr<float>(y);
+                for (int x = 0; x < W; ++x) {
+                    const float dp = dc[x];
+                    if (dp == 0.0f) continue;           // 배경은 칠하지 않는다
+                    double sum = 0.0;
+                    for (int i = 0; i < 8; ++i) {
+                        const int sx = x + nx[i] * r, sy = y + ny[i] * r;
+                        if (sx < 0 || sy < 0 || sx >= W || sy >= H) continue;
+                        const float dn = d.ptr<float>(sy)[sx];
+                        // 이웃이 배경이면 실루엣이다. 큰 값을 더해 외곽에
+                        // 어두운 윤곽선을 만든다 - EDL 특유의 "종이에 그린 듯한"
+                        // 인상이 여기서 나온다.
+                        sum += (dn == 0.0f) ? 100.0 : std::max(0.0f, dp - dn);
+                    }
+                    const double res = sum * 0.125;
+                    if (res <= 0.0) continue;           // 평탄면은 exp 를 건너뛴다
+                    const double shade = std::exp(-res * k);
+                    if (shade >= 0.999) continue;
+                    auto& c = px[x];
+                    c[0] = static_cast<std::uint8_t>(c[0] * shade);
+                    c[1] = static_cast<std::uint8_t>(c[1] * shade);
+                    c[2] = static_cast<std::uint8_t>(c[2] * shade);
+                }
+            }
+        });
+    }
+
     // 복셀을 **속이 찬 육면체** 로 그린다. OctoMap / RViz 가 보여 주는 그 그림이다.
     //
     // 점으로 찍으면 같은 지도가 성기게 보인다. 복셀은 부피를 가진 칸인데 그
@@ -1152,6 +1284,11 @@ public:
                                      base[1] * a + C_VOID[1] * (1 - a),
                                      base[2] * a + C_VOID[2] * (1 - a)};
                 cv::fillConvexPoly(img_, poly, 4, col, cv::LINE_8);
+                // **깊이도 같이 쓴다.** 화가 알고리즘이라 색은 뒤에서 앞으로
+                // 덮이는데, EDL 은 깊이 버퍼를 읽으므로 색만 채우면 그 자리의
+                // 깊이가 비어 있다. 뒤에서 앞으로 쓰므로 마지막에 남는 값이
+                // 가장 가까운 면이 된다 - 정렬이 이미 그 일을 해 준다.
+                cv::fillConvexPoly(zbuf_, poly, 4, cv::Scalar(it.z), cv::LINE_8);
             }
         }
     }
@@ -2125,6 +2262,7 @@ int main(int argc, char** argv) {
     PredictScore pscore[2];
     bool show_pred = false;        // O 로 토글
     bool show_cubes = true;        // C 로 토글 - 복셀을 큐브로 채운다
+    bool show_edl = true;          // E 로 토글 - Eye-Dome Lighting
     // 레이어 격리. 전부 한 화면에 겹치면 무엇을 보고 있는지 알 수
     // 없다. 한 층씩 떼어 보는 것이 벤치마크에서는 기본이다.
     //   0 전체 / 1 지도만 / 2 차량만 / 3 사람만 / 4 구조물만 / 5 지면만
@@ -2528,6 +2666,16 @@ int main(int argc, char** argv) {
                     // 보인다. 라이다 지도가 높이를 색으로 읽히게 하는 것은
                     // 범위가 실제 구조 높이를 덮기 때문이다.
                     const double h1 = (s.dataset == "kitti") ? 14.0 :  2.4;
+                    // **시점 섹터.** 어디에서 봤는지를 16 칸으로 접는다. 자차
+                    // 위치를 5 m 로 양자화하므로 같은 자리에서 여러 프레임 본
+                    // 것은 한 시점으로 세어진다 - 그것이 요점이다. 스테레오
+                    // 유령은 같은 오매칭이 인접 프레임에서 그대로 재현되므로
+                    // 관측 횟수로는 안 걸리고, **시점이 바뀌어야** 사라진다.
+                    const Eigen::Vector3d epos =
+                        run.aligned[static_cast<std::size_t>(pi)].translation();
+                    const int sector = static_cast<int>(
+                        (static_cast<long long>(std::floor(epos.x() / 5.0)) * 7 +
+                         static_cast<long long>(std::floor(epos.z() / 5.0)) * 13) & 15);
                     const Eigen::Vector3f up_f = ob.world_up.cast<float>();
                     const float ego_h = static_cast<float>(ego_k.dot(ob.world_up));
                     for (auto& p : pts) {
@@ -2538,8 +2686,8 @@ int main(int argc, char** argv) {
                         // **가까이서 본 것이 먼저 들어간다.** 가까운 관측이
                         // 자리를 잡은 뒤에 주변의 먼 유령을 걷어내야, 방금
                         // 넣은 좋은 값까지 같이 지우는 일이 없다.
-                        acc[k].insert(p, static_cast<std::size_t>(cloud_cap));
-                        mesh[k].insert(p, 120000);
+                        acc[k].insert(p, static_cast<std::size_t>(cloud_cap), sector);
+                        mesh[k].insert(p, 120000, sector);
                     }
                     // 가까운 관측만 정정 권한을 갖는다. 30 m 에서 본 것으로
                     // 60 m 짜리를 지우면, 둘 다 못 믿을 값인데 하나가 다른
@@ -2659,6 +2807,18 @@ int main(int argc, char** argv) {
                                         (s.dataset == "kitti") ? 1.0f : 0.25f);
                     for (const auto& sp : flat) {
                         if ((sp.p - e).squaredNorm() > map_r2) continue;
+
+                        // **근거 없는 점은 그리지 않는다.**
+                        //
+                        // 공간: 26 이웃 중 셋도 안 차 있으면 표면이 아니라
+                        // SGBM 오매칭의 산탄이다 (PCL 의 Radius Outlier Removal
+                        // 과 같은 판정, 해시 복셀이라 kd-tree 없이 된다).
+                        //
+                        // 시간: 세 번 이상, 서로 다른 두 시점 이상에서 봐야
+                        // 인정한다. 유령은 한 시점에서만 재현되므로 이 조건이
+                        // 공간 판정이 못 잡는 밀집 덩어리를 걷어낸다.
+                        if (sp.nbr < 3) continue;
+                        if (!sp.confirmed()) continue;
                         if (show_stuff) {
                             const auto it = stuff[k].find(gg.key(sp.p));
                             if (it != stuff[k].end() &&
@@ -3085,6 +3245,9 @@ int main(int argc, char** argv) {
                     }
                 }
             }
+            // EDL 은 모든 3D 패스가 끝난 뒤에 건다. 깊이 버퍼가 다
+            // 채워져 있어야 이웃 비교가 의미를 갖는다.
+            if (show_edl) cloud[k].eyeDomeLighting(0.4, 1.4);
             cloud[k].image().copyTo(canvas(vp));
             cv::rectangle(canvas, vp, C_LINE, 1, cv::LINE_AA);
 
@@ -3486,6 +3649,7 @@ int main(int argc, char** argv) {
         else if (key == 'o' || key == 'O') show_pred = !show_pred;
         else if (key == 'c' || key == 'C') show_cubes = !show_cubes;
         else if (key == 't' || key == 'T') layer = (layer + 1) % 6;
+        else if (key == 'e' || key == 'E') show_edl = !show_edl;
         else if (key == 'n' || key == 'N') {
             si = (si + 1) % static_cast<int>(seqs.size());
             frame = 0; acc_frame[0] = acc_frame[1] = -1; orb.dist = 0.0; user_zoomed = false;
