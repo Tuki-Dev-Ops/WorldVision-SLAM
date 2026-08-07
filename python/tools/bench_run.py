@@ -202,13 +202,23 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="results/bench")
     ap.add_argument("--max-frames", type=int, default=0)
+    ap.add_argument("--allow-partial", action="store_true",
+                    help="인덱스보다 프레임이 적은 시퀀스도 실행한다 "
+                         "(결과는 '전체 시퀀스' 가 아니다)")
     ap.add_argument("--only", nargs="*", default=None,
                     help="시퀀스 이름 또는 데이터셋(tum/kitti) 으로 거른다")
-    ap.add_argument("--merge", action="store_true",
-                    help="기존 benchmark.json 의 다른 시퀀스를 보존한 채 합친다")
+    # --only 를 주면 합치는 것이 기본이다. 옛 기본값(덮어쓰기)은 "한 시퀀스만
+    # 확인" 이 나머지 열아홉 개의 결과를 지우는 동작이었고, 실제로 그렇게
+    # benchmark.json 하나를 날렸다. 25.22 가 다루는 실패 양식 그대로다:
+    # 조용한 축소는 "그 시퀀스에서 아무 일도 없었다" 로 읽힌다.
+    ap.add_argument("--merge", action=argparse.BooleanOptionalAction, default=None,
+                    help="기존 benchmark.json 의 다른 시퀀스를 보존한 채 합친다 "
+                         "(--only 를 주면 기본 켜짐, --no-merge 로 끈다)")
     ap.add_argument("--skip-run", action="store_true",
                     help="재추정 없이 기존 궤적만 다시 채점한다")
     args = ap.parse_args()
+    if args.merge is None:
+        args.merge = args.only is not None
 
     out_dir = ROOT / args.out
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -226,6 +236,37 @@ def main() -> int:
                 or dataset_of(p) in want]
     if not seqs:
         raise SystemExit("data/ 에 실행할 시퀀스가 없다")
+
+    # 인덱스가 약속한 프레임이 실제로 디스크에 있는지 **여기서** 본다.
+    #
+    # 없으면 imread 가 빈 Mat 를 주고 도구는 그 프레임을 조용히 건너뛴다.
+    # 궤적은 짧아지지만 ATE 는 계속 계산되고 표에 실린다 - 06-results.md
+    # 25.22 는 그렇게 TUM 16 개 중 13 개가 평균 35 % 만 채점된 채로 스무 개
+    # 절을 통과한 기록이다. 가장 심한 것은 4042 프레임 중 258 개였다.
+    #
+    # check_datasets.py 는 그 전에도 있었지만 아무도 부르지 않았다. 검사는
+    # 실행 경로 위에 있어야 검사다.
+    incomplete = []
+    for seq in (() if args.allow_partial else seqs):
+        n_idx = n_have = 0
+        for kind in ("rgb", "depth"):
+            idx = [ln.split()[1] for ln in
+                   (seq / f"{kind}.txt").read_text(encoding="utf-8",
+                                                   errors="replace").splitlines()
+                   if ln.strip() and not ln.startswith("#") and len(ln.split()) >= 2]
+            n_idx += len(idx)
+            n_have += sum(1 for rel in idx if (seq / rel).exists())
+        if n_idx and n_have < n_idx:
+            incomplete.append((seq.name, n_have, n_idx))
+    if incomplete:
+        for name, have, idx in incomplete:
+            print(f"  {name}: {have}/{idx} 프레임 ({100.0*have/idx:.1f} %)",
+                  file=sys.stderr)
+        raise SystemExit(
+            f"{len(incomplete)} 개 시퀀스가 인덱스보다 적은 프레임을 갖고 있다. "
+            "이대로 재면 '전체 시퀀스' 가 아닌 결과가 그렇게 보이는 표로 나온다 - "
+            "python/tools/tum_fetch.py 로 다시 받거나, 의도한 것이면 --allow-partial "
+            "을 준다.")
 
     # 재채점(--skip-run)에는 벽시계가 없다. 이전 실행의 측정값을 이어받지 않으면
     # 타이밍이 통째로 사라지고, 그 자리를 0 으로 채우면 "무한히 빠르다" 가 된다.
