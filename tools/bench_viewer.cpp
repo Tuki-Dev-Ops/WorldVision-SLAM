@@ -360,6 +360,271 @@ struct VoxelMap {
     }
 };
 
+// ---------------------------------------------------------------------------
+// 장면 라벨 — 지도가 스스로 말하는 것
+// ---------------------------------------------------------------------------
+// **검출기는 이 라벨을 낼 수 없다.** yolo11n 은 COCO 80 클래스이고 거기에
+// building / tree / fence 는 없다. kitti_00 에서 나온 검출은 car 465, person 5,
+// truck 4 - 도로 양옆의 건물도 가로수도 담장도 한 번도 나오지 않는다. 그런데
+// 그것들은 장면의 대부분이다.
+//
+// 그래서 클래스를 **누적 지도의 기하** 에서 만든다. 우회가 아니라 이쪽이 맞는
+// 방법이다: 건물은 연속된 수직 벽면이고, 나무는 줄기 위에 흩어진 수관이며,
+// 담장은 낮고 연속된 수직면이다. 그 차이는 이미 복셀 배치 안에 있다.
+//
+// 판정 단위는 **지면 격자 한 칸의 수직 기둥** 이다. 기둥 하나가 어느 높이에
+// 얼마나 채워져 있는가가 곧 그것이 무엇인가다.
+enum class Stuff : std::uint8_t { Unknown, Ground, Building, Fence, Vegetation, Pole };
+
+inline const char* stuffName(Stuff s) {
+    switch (s) {
+        case Stuff::Ground:     return "ground";
+        case Stuff::Building:   return "building";
+        case Stuff::Fence:      return "fence / wall";
+        case Stuff::Vegetation: return "tree";
+        case Stuff::Pole:       return "pole";
+        default:                return "";
+    }
+}
+
+// 클래스 색. turbo 팔레트와 섞이면 안 되므로 채도를 낮춘 고유색을 쓴다.
+inline cv::Scalar stuffColor(Stuff s) {
+    switch (s) {                                    // BGR
+        case Stuff::Ground:     return {104,  92,  78};
+        case Stuff::Building:   return {196, 156, 108};
+        case Stuff::Fence:      return {132, 176, 190};
+        case Stuff::Vegetation: return {110, 190, 130};
+        case Stuff::Pole:       return {168, 168, 214};
+        default:                return {90, 90, 90};
+    }
+}
+
+// 기둥 하나. 핵심은 **높이 점유 비트마스크** 다.
+//
+// 처음에는 최저/최고 높이와 복셀 개수만 셌는데, 그것으로는 나무와 건물이
+// 갈리지 않았다. 복셀 개수는 "몇 층이 찼는가" 가 아니다 - 격자칸이 복셀보다
+// 넓으면 같은 높이에 여러 개가 들어가므로 연속성과 아무 관계가 없어진다.
+// KITTI 00 이 통째로 초록(나무)이 된 것이 그 결과다.
+//
+// 나무와 건물을 가르는 것은 **프로파일에 구멍이 있는가** 이고, 그것은 개수가
+// 아니라 어느 높이가 찼는지를 알아야 나온다. 0.5 m 씩 32 칸, 지면 위 16 m.
+constexpr float kBinH = 0.5f;
+constexpr int   kBins = 32;
+
+struct Column {
+    std::uint32_t bins{0};   // 지면 기준 높이 점유
+    float low{1e9f};         // 절대 최저 높이 (이웃 지면 추정용)
+    float high{-1e9f};       // 절대 최고 높이
+    int   i{0}, j{0};        // 지면 격자 좌표 (이웃 조회용)
+    Eigen::Vector3f rep{Eigen::Vector3f::Zero()};   // 그릴 대표점 (기둥 꼭대기)
+    float ground{0.0f};      // 이 칸에 쓰인 지면 높이
+
+    // 구조 텐서용 누적. 이웃 아홉 칸의 것을 더하면 그 자리의 공분산이 된다 -
+    // 점 목록을 따로 들고 있지 않아도 된다.
+    int    n{0};
+    Eigen::Vector3d sum{Eigen::Vector3d::Zero()};
+    Eigen::Matrix3d sumsq{Eigen::Matrix3d::Zero()};
+
+    // 분류 결과와 그 근거. 근거를 남기는 이유는 화면에서 틀렸을 때 어느
+    // 판별자가 틀렸는지 알아야 하기 때문이다.
+    float planarity{0.0f}, linearity{0.0f}, scatter{0.0f};
+    float vert{0.0f};        // 법선이 수평에 가까운 정도 (1 = 수직면)
+    Stuff cls{Stuff::Unknown};
+
+    int topBin() const {
+        for (int b = kBins - 1; b >= 0; --b) if (bins & (1u << b)) return b;
+        return -1;
+    }
+};
+
+// 지면 격자. up 에 수직인 두 축으로 만든 2 차원 격자다. 데이터셋마다 "위" 가
+// 다르므로 축을 고정하면 한쪽에서 격자가 벽을 따라 잘린다.
+struct GroundGrid {
+    Eigen::Vector3f up, a, b;
+    float inv;
+    GroundGrid(const Eigen::Vector3f& up_in, float cell) : up(up_in.normalized()) {
+        a = up.cross(Eigen::Vector3f::UnitZ());
+        if (a.norm() < 1e-6f) a = up.cross(Eigen::Vector3f::UnitX());
+        a.normalize();
+        b = up.cross(a).normalized();
+        inv = 1.0f / cell;
+    }
+    std::pair<int, int> ij(const Eigen::Vector3f& p) const {
+        return {static_cast<int>(std::floor(p.dot(a) * inv)),
+                static_cast<int>(std::floor(p.dot(b) * inv))};
+    }
+    static std::int64_t key(int i, int j) {
+        return (static_cast<std::int64_t>(i & 0x3FFFFFF) << 26) |
+                static_cast<std::int64_t>(j & 0x3FFFFFF);
+    }
+    std::int64_t key(const Eigen::Vector3f& p) const {
+        const auto [i, j] = ij(p);
+        return key(i, j);
+    }
+};
+
+// 기둥 하나를 읽는다.
+//
+// **점유 프로파일의 구멍으로는 안 된다.** 처음에 그렇게 했다가 KITTI 00 의
+// 87 % 가 나무로 분류됐다. 수동 스테레오 지도에서 복셀이 없다는 것은 그 자리가
+// 비었다는 뜻이 아니라 **거기서 표면을 못 봤다** 는 뜻이다. 점은 표면에만
+// 생기고 관측은 한쪽에서만 오므로 멀쩡한 벽면에도 구멍이 가득하다. 구멍을
+// 세는 판별자는 구조가 아니라 센서의 희소성을 재고 있었다.
+//
+// 국소 구조 텐서는 그 함정에 빠지지 않는다. 있는 점들이 **어떻게 퍼져 있는가**
+// 만 보기 때문이다:
+//
+//   평면성 λ1-λ2  벽·바닥은 한 방향으로 납작하다
+//   선형성 λ0-λ1  기둥·가로등은 한 방향으로 길다
+//   산포   λ2/λ0  잎은 세 방향으로 고르게 퍼진다
+//
+// 그리고 평면의 **법선 방향** 이 바닥과 벽을 가른다. 높이만으로는 못 가른다.
+inline Stuff classifyColumn(const Column& c) {
+    const int t = c.topBin();
+    if (t < 0 || c.n < 6) return Stuff::Unknown;
+    const float top_m = static_cast<float>(t + 1) * kBinH;
+
+    // 문턱은 실측 분포의 사분위에서 골랐다 (11718 개 기둥, kitti_00 302 프레임):
+    //   planarity  p25 0.20  p50 0.34  p75 0.48  p90 0.60
+    //   linearity  p25 0.19  p50 0.33  p75 0.49  p90 0.63
+    //   scatter    p25 0.14  p50 0.25  p75 0.36  p90 0.46
+    //   vert       p25 0.03  p50 0.10  p75 0.28  p90 0.62
+    // 눈대중으로 정하면 분포의 어디에 걸리는지 알 수 없고, 한 클래스가 90 %
+    // 를 먹는 일이 조용히 일어난다 - 실제로 두 번 그랬다.
+
+    // 법선이 위를 향하는 평면이고 낮으면 지면.
+    if (c.vert < 0.30f && c.planarity > 0.25f && top_m < 1.2f) return Stuff::Ground;
+
+    // 세 방향으로 고르게 퍼진 것은 면도 선도 아니다 - 잎이다. p75 위.
+    if (c.scatter > 0.36f && top_m >= 1.5f) return Stuff::Vegetation;
+
+    // 납작하고 법선이 수평이면 수직면. 높으면 건물, 낮으면 담장.
+    if (c.planarity > 0.34f && c.vert > 0.60f) {
+        return (top_m >= 3.0f) ? Stuff::Building : Stuff::Fence;
+    }
+    // 한 방향으로 길고 가늘다. p90 위.
+    if (c.linearity > 0.63f && top_m >= 1.5f) return Stuff::Pole;
+    // 법선이 위를 향하는 평면 - 지면이거나 그 위의 평평한 것.
+    if (c.vert < 0.30f && c.planarity > 0.25f) return Stuff::Ground;
+    if (top_m >= 2.0f) return Stuff::Vegetation;
+    return Stuff::Fence;
+}
+
+// 지도 전체를 기둥으로 접어 라벨을 붙인다.
+//
+// **지면은 이웃에서 온다.** 각 칸의 최저점을 그 칸의 지면으로 삼으면 top 은
+// "그 칸에서 관측된 수직 범위" 가 되어 버린다. 길에서 본 건물 벽면은 3 m 짜리
+// 슬라이스로만 보이므로 담장으로 분류되고, 실제로 첫 시도에서 KITTI 00 의
+// 지도가 거의 전부 fence 가 되었다.
+//
+// 반경 안의 최저점을 지면으로 쓰면 벽면 칸은 옆 도로의 높이를 기준으로 삼게
+// 되어 진짜 높이가 나온다. 전역 최저점을 쓰지 않는 이유는 반대다 - KITTI 00
+// 은 평지가 아니고, 언덕 하나에 지도의 절반이 건물이 된다.
+inline std::unordered_map<std::int64_t, Column>
+labelScene(const std::unordered_map<std::int64_t, Splat>& cells,
+           const Eigen::Vector3d& up_d, float cell, float voxel,
+           int ground_radius = 3) {
+    const GroundGrid g(up_d.cast<float>(), cell);
+    std::unordered_map<std::int64_t, Column> cols;
+    cols.reserve(cells.size() / 4 + 1);
+
+    // 1 차: 칸마다 최저/최고 높이와 구조 텐서 누적.
+    for (const auto& [k, v] : cells) {
+        const float h = v.p.dot(g.up);
+        const auto [i, j] = g.ij(v.p);
+        auto& c = cols[GroundGrid::key(i, j)];
+        c.i = i; c.j = j;
+        if (h > c.high) { c.high = h; c.rep = v.p; }
+        c.low = std::min(c.low, h);
+        const Eigen::Vector3d p = v.p.cast<double>();
+        ++c.n;
+        c.sum += p;
+        c.sumsq += p * p.transpose();
+    }
+
+    // 2 차: 이웃 반경 안에서 그 칸의 지면 높이를 잡는다.
+    //
+    // **최솟값을 쓰면 안 된다.** 스테레오 깊이의 이상치 하나가 반경 안의 모든
+    // 칸의 지면을 함께 끌어내린다 - 실측에서 지면 위 높이의 중앙값이 11.5 m
+    // 로 나왔다. 도로 장면에서 그럴 수는 없다.
+    //
+    // 이웃 칸들의 최저 높이 **중앙값** 은 이상치 하나에 흔들리지 않는다.
+    // 벽면 칸의 최저점도 결국 도로면이므로 중앙값은 지면에 앉는다.
+    std::vector<float> nb;
+    for (auto& [k, c] : cols) {
+        nb.clear();
+        for (int di = -ground_radius; di <= ground_radius; ++di) {
+            for (int dj = -ground_radius; dj <= ground_radius; ++dj) {
+                const auto it = cols.find(GroundGrid::key(c.i + di, c.j + dj));
+                if (it != cols.end()) nb.push_back(it->second.low);
+            }
+        }
+        if (nb.empty()) { c.ground = c.low; continue; }
+        const std::size_t mid = nb.size() / 2;
+        std::nth_element(nb.begin(), nb.begin() + static_cast<std::ptrdiff_t>(mid),
+                         nb.end());
+        c.ground = nb[mid];
+    }
+
+    // 3 차: 지면이 정해졌으니 점유 프로파일을 채운다. 셀을 한 번 더 훑는
+    // 대가로 "어느 높이가 찼는가" 를 얻는다 - 그 정보 없이는 나무와 벽이
+    // 구분되지 않는다.
+    for (const auto& [k, v] : cells) {
+        const auto it = cols.find(g.key(v.p));
+        if (it == cols.end()) continue;
+        const float rel = v.p.dot(g.up) - it->second.ground;
+        const int b = static_cast<int>(std::floor(rel / kBinH));
+        if (b >= 0 && b < kBins) it->second.bins |= (1u << b);
+    }
+
+    // 4 차: 구조 텐서. **국소 3 차원 이웃에서** 계산한다.
+    //
+    // 처음에는 기둥 아홉 칸을 통째로 더했는데, 그것은 1 x 1 m 바닥에 높이
+    // 11 m 인 부피다. 그런 상자 안의 점은 무엇이 들었든 세로로 길게 퍼지므로
+    // 선형성이 항상 1 에 가깝게 나온다 - 실측 중앙값이 0.926 이었고 평면성은
+    // 0.019 였다. 판별자가 장면이 아니라 자기 이웃의 모양을 재고 있었다.
+    //
+    // 이웃은 기둥이 아니라 **공** 이어야 한다. 복셀 ±2 칸이면 KITTI 에서 약
+    // 3 m 로, 벽면 한 조각과 수관 한 덩이를 가르기에 맞는 크기다.
+    for (auto& [k, c] : cols) {
+        int n = 0;
+        Eigen::Vector3d sum = Eigen::Vector3d::Zero();
+        Eigen::Matrix3d sq = Eigen::Matrix3d::Zero();
+        const float inv = 1.0f / voxel;
+        for (int dx = -2; dx <= 2; ++dx) {
+            for (int dy = -2; dy <= 2; ++dy) {
+                for (int dz = -2; dz <= 2; ++dz) {
+                    const Eigen::Vector3f q = c.rep + Eigen::Vector3f(
+                        dx * voxel, dy * voxel, dz * voxel);
+                    const auto it = cells.find(voxKey(q, inv));
+                    if (it == cells.end()) continue;
+                    const Eigen::Vector3d p = it->second.p.cast<double>();
+                    ++n; sum += p; sq += p * p.transpose();
+                }
+            }
+        }
+        if (n < 8) { c.cls = Stuff::Unknown; continue; }
+        const Eigen::Vector3d mean = sum / n;
+        Eigen::Matrix3d cov = sq / n - mean * mean.transpose();
+        // 수치 안정. 대칭이 깨지면 고유해가 복소수로 샌다.
+        cov = 0.5 * (cov + cov.transpose());
+        Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es(cov);
+        Eigen::Vector3d ev = es.eigenvalues();          // 오름차순
+        for (int e = 0; e < 3; ++e) ev[e] = std::max(ev[e], 0.0);
+        const double l0 = ev[2], l1 = ev[1], l2 = ev[0];   // l0 >= l1 >= l2
+        if (l0 < 1e-9) { c.cls = Stuff::Unknown; continue; }
+        c.linearity = static_cast<float>((l0 - l1) / l0);
+        c.planarity = static_cast<float>((l1 - l2) / l0);
+        c.scatter   = static_cast<float>(l2 / l0);
+        // 최소 고유값의 고유벡터가 평면의 법선이다.
+        const Eigen::Vector3d nrm = es.eigenvectors().col(0).normalized();
+        // 법선이 "위" 와 이루는 각. 수직면이면 법선이 수평이라 내적이 0 이다.
+        c.vert = static_cast<float>(1.0 - std::abs(nrm.dot(g.up.cast<double>())));
+        c.cls = classifyColumn(c);
+    }
+    return cols;
+}
+
 // 월드에 고정되는 물체 기억. 지나온 곳에서 본 물체가 그 자리에 남는다.
 //
 // **관측마다 위치를 덮어쓰면 안 된다.** 그러면 카메라가 움직일 때마다 물체가
@@ -524,6 +789,71 @@ public:
     // 이웃 판정은 +x/+y/+z 세 방향만 본다. 여섯 방향을 다 보면 같은 선을 두 번
     // 긋게 된다. basis 와 eye 는 한 번만 계산한다 - 선마다 다시 구하면 수만 번
     // 행렬 곱이 돈다.
+    // 화면 밖으로 크게 벗어난 선은 그리지 않는다. 투영이 튀면 화면을
+    // 가로지르는 긴 선이 생겨 없는 구조를 만들어 낸다 - lattice 가 같은
+    // 이유로 같은 검사를 한다.
+    void lineClipped(const cv::Point& a, const cv::Point& b,
+                     const cv::Scalar& col, int th) {
+        const int m = 4 * std::max(img_.cols, img_.rows);
+        if (std::abs(a.x) > m || std::abs(a.y) > m ||
+            std::abs(b.x) > m || std::abs(b.y) > m) return;
+        cv::line(img_, a, b, col, th, cv::LINE_AA);
+    }
+
+    // 장면 라벨을 3 차원 벡터로 그린다.
+    //
+    // 점으로 찍으면 클래스가 색 얼룩으로만 보인다. 같은 클래스의 이웃 기둥을
+    // **선으로 이어야** 벽이 벽으로, 가로수가 줄로 읽힌다 - 그것이 "공간을
+    // 벡터로 그린다" 의 내용이다. 서로 다른 클래스는 잇지 않는다: 건물과
+    // 나무를 이으면 있지도 않은 구조가 생긴다.
+    void stuffVectors(const std::unordered_map<std::int64_t, Column>& cols,
+                      const Eigen::Vector3d& up_d, float cell,
+                      const Orbit& orb, double f) {
+        const GroundGrid g(up_d.cast<float>(), cell);
+        const Eigen::Vector3f& up = g.up;
+
+        for (const auto& [k, c] : cols) {
+            if (c.cls == Stuff::Unknown) continue;
+            cv::Point pa;
+            if (!project3(c.rep.cast<double>(), orb, f, pa)) continue;
+            const cv::Scalar col = stuffColor(c.cls);
+
+            // 지면은 선이 너무 많다. 점만 찍어 배경으로 둔다.
+            if (c.cls == Stuff::Ground) {
+                if (pa.x >= 0 && pa.y >= 0 && pa.x < img_.cols && pa.y < img_.rows) {
+                    img_.at<cv::Vec3b>(pa) = cv::Vec3b(
+                        static_cast<std::uint8_t>(col[0]),
+                        static_cast<std::uint8_t>(col[1]),
+                        static_cast<std::uint8_t>(col[2]));
+                }
+                continue;
+            }
+
+            // 수직 벡터는 **이어진 구조에만** 긋는다. 모든 기둥에 바닥까지
+            // 선을 그으면 수만 개의 세로줄이 화면을 잔디처럼 덮어 정작 무엇이
+            // 벽이고 무엇이 나무인지 안 보인다 - 실제로 그렇게 나왔다.
+            // 나무는 수관이 어디 떠 있는지가 정보이므로 줄기를 지어내지 않는다.
+            if (c.cls == Stuff::Building || c.cls == Stuff::Fence ||
+                c.cls == Stuff::Pole) {
+                const float h = static_cast<float>(c.topBin() + 1) * kBinH;
+                cv::Point pb;
+                if (project3((c.rep - up * h).cast<double>(), orb, f, pb)) {
+                    lineClipped(pb, pa, col, 1);
+                }
+            }
+            // 수평 벡터: 같은 클래스의 이웃 기둥과 꼭대기끼리 잇는다.
+            // 클래스가 다르면 잇지 않는다 - 건물과 나무를 이으면 있지도 않은
+            // 구조가 생긴다.
+            for (const Eigen::Vector3f& d : {g.a * cell, g.b * cell}) {
+                const auto it = cols.find(g.key(c.rep + d));
+                if (it == cols.end() || it->second.cls != c.cls) continue;
+                cv::Point pc;
+                if (!project3(it->second.rep.cast<double>(), orb, f, pc)) continue;
+                lineClipped(pa, pc, col, 1);
+            }
+        }
+    }
+
     void lattice(const std::unordered_map<std::int64_t, Splat>& cells, float voxel,
                  const Orbit& orb, double f, double fade) {
         const Eigen::Matrix3d M = orb.basis();
@@ -871,6 +1201,7 @@ int main(int argc, char** argv) {
     int start_seq = 0;
     bool autoplay = true;
     std::string shot_path;
+    std::string dump_feat;
     int shot_frame = 0;
     int cloud_cap = 260000;
     int start_cam = 0;      // 0 추격 / 1 항공 / 2 자유
@@ -883,6 +1214,7 @@ int main(int argc, char** argv) {
         else if (k == "--screenshot") shot_path = argv[i + 1];
         else if (k == "--frame") shot_frame = std::atoi(argv[i + 1]);
         else if (k == "--cloud-cap") cloud_cap = std::atoi(argv[i + 1]);
+        else if (k == "--dump-features") dump_feat = argv[i + 1];
         else if (k == "--cam") start_cam = std::atoi(argv[i + 1]);
     }
 
@@ -929,6 +1261,9 @@ int main(int argc, char** argv) {
     // 되어 프레임을 못 채운다. 구조를 보여 주는 데는 성긴 격자로 충분하다.
     VoxelMap mesh[2];
     std::vector<MemoryObject> mem[2];
+    // 지도에서 유도한 장면 라벨 (지면/건물/담장/나무/기둥).
+    std::unordered_map<std::int64_t, Column> stuff[2];
+    bool show_stuff = true;        // L 로 토글
     int acc_frame[2] = {-1, -1};
     std::vector<double> err_series[2];
 
@@ -1269,12 +1604,30 @@ int main(int argc, char** argv) {
                 // 점 위에 표면 격자를 덧그린다. 순서가 중요하다 - 먼저 그리면
                 // 점군이 격자를 덮어 아무 것도 이어져 보이지 않는다.
                 if (show_mesh && has_memory) {
-                    for (auto& v : mesh[k].cells) {
-                        v.second.age = static_cast<float>(std::clamp(
-                            1.0 - static_cast<double>(v.second.seen) / span, 0.0, 1.0));
+                    if (show_stuff) {
+                        // **지도가 무엇으로 이루어졌는지** 를 그린다.
+                        //
+                        // 입력은 mesh 가 아니라 acc 다. 표면 격자의 복셀은
+                        // KITTI 에서 2.2 m 인데, 그 해상도로는 줄기 위의 빈
+                        // 공간도 벽면의 연속성도 표현되지 않는다 - 분류가
+                        // 기대는 형상 자체가 사라진다.
+                        //
+                        // 지면 격자칸은 장면 규모에서 정한다. 도로변 건물은
+                        // 1 m 칸이면 벽면이 여러 칸에 걸쳐 이어지고, 실내는
+                        // 0.25 m 라야 가구와 벽이 갈린다.
+                        const float ccell = (s.dataset == "kitti") ? 1.0f : 0.25f;
+                        stuff[k] = labelScene(acc[k].cells, ob.world_up, ccell,
+                                              acc[k].voxel);
+                        cloud[k].stuffVectors(stuff[k], ob.world_up, ccell,
+                                              ob, vp.width * 0.9);
+                    } else {
+                        for (auto& v : mesh[k].cells) {
+                            v.second.age = static_cast<float>(std::clamp(
+                                1.0 - static_cast<double>(v.second.seen) / span, 0.0, 1.0));
+                        }
+                        cloud[k].lattice(mesh[k].cells, mesh[k].voxel, ob,
+                                         vp.width * 0.9, 0.72);
                     }
-                    cloud[k].lattice(mesh[k].cells, mesh[k].voxel, ob,
-                                     vp.width * 0.9, 0.72);
                 }
             }
 
@@ -1563,6 +1916,30 @@ int main(int argc, char** argv) {
                     label(canvas,
                           "arrows = frame-to-frame motion, nearest-match (not a tracker)",
                           {vp.x + 14, vp.y + 102}, C_INK3, T_MICRO, 1);
+
+                    // 장면 라벨 범례. **개수를 같이 적는다** - 색만 있으면
+                    // 그 클래스가 실제로 나왔는지 화면에서 알 수 없고,
+                    // 0 개인 범례는 있지도 않은 능력을 광고한다.
+                    if (show_stuff && !stuff[k].empty()) {
+                        int n[6] = {0, 0, 0, 0, 0, 0};
+                        for (const auto& [ck, c] : stuff[k]) {
+                            n[static_cast<int>(c.cls)]++;
+                        }
+                        label(canvas, "scene labels from map geometry (not the detector)",
+                              {vp.x + 14, vp.y + 126}, C_INK3, T_MICRO, 1);
+                        int lx = vp.x + 14;
+                        for (const Stuff sc : {Stuff::Ground, Stuff::Building,
+                                               Stuff::Fence, Stuff::Vegetation,
+                                               Stuff::Pole}) {
+                            const int cnt = n[static_cast<int>(sc)];
+                            if (cnt == 0) continue;
+                            fill(canvas, {lx, vp.y + 136, 10, 10}, stuffColor(sc));
+                            const std::string t = std::string(stuffName(sc)) + " " +
+                                                  std::to_string(cnt);
+                            label(canvas, t, {lx + 15, vp.y + 145}, C_INK2, T_MICRO, 1);
+                            lx += 22 + textW(t, T_MICRO, 1);
+                        }
+                    }
                 }
             }
 
@@ -1696,6 +2073,32 @@ int main(int argc, char** argv) {
             for (int k = 0; k < 2; ++k) {
                 std::cerr << "  패널 " << k << ": 복셀 " << acc[k].cells.size()
                           << " (" << acc[k].voxel << " m, coarsen " << acc[k].grown << ")"
+                          << ", 라벨 " << [&] {
+                                 int n[6] = {0,0,0,0,0,0};
+                                 for (const auto& [ck, c] : stuff[k]) {
+                                     n[static_cast<int>(c.cls)]++;
+                                 }
+                                 std::ostringstream o;
+                                 o << "지면 " << n[1] << " 건물 " << n[2]
+                                   << " 담장 " << n[3] << " 나무 " << n[4]
+                                   << " 기둥 " << n[5] << " 미상 " << n[0];
+                                 return o.str();
+                             }()
+                          << [&] {
+                                 // 임계값을 눈대중으로 정하지 않기 위한 덤프.
+                                 // 분포를 보고 빈 구간에서 고르는 것이
+                                 // 25.22 의 발산 문턱을 정한 방법이다.
+                                 if (k != 1 || dump_feat.empty()) return std::string();
+                                 std::ofstream o(dump_feat);
+                                 o << "top_m\tplanarity\tlinearity\tscatter\tvert\tn\n";
+                                 for (const auto& [ck, c] : stuff[k]) {
+                                     if (c.n < 6) continue;
+                                     o << (c.topBin() + 1) * kBinH << '\t' << c.planarity
+                                       << '\t' << c.linearity << '\t' << c.scatter
+                                       << '\t' << c.vert << '\t' << c.n << '\n';
+                                 }
+                                 return "  특징 덤프: " + dump_feat + "\n";
+                             }()
                           << ", 기억물체 " << mem[k].size()
                           << " (동적 " << std::count_if(mem[k].begin(), mem[k].end(),
                                           [](const MemoryObject& m) { return m.dynamic; })
@@ -1724,6 +2127,7 @@ int main(int argc, char** argv) {
             mesh[0].clear(); mesh[1].clear(); }
         else if (key == 'v' || key == 'V') { cam_mode = (cam_mode + 1) % 3; }
         else if (key == 'm' || key == 'M') show_mesh = !show_mesh;
+        else if (key == 'l' || key == 'L') show_stuff = !show_stuff;
         else if (key == 'n' || key == 'N') {
             si = (si + 1) % static_cast<int>(seqs.size());
             frame = 0; acc_frame[0] = acc_frame[1] = -1; orb.dist = 0.0; user_zoomed = false;
