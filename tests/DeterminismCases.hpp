@@ -338,13 +338,19 @@ inline void tokenStoreInterleaved(test::Blob& a, test::Blob& b, std::size_t pad 
     const auto seq = makeTokenSequence();
 
     TokenStore store_a, store_b;
-    std::vector<std::shared_ptr<int>> ballast;
+    // ballast 는 **토큰과 같은 타입** 이어야 한다. int 로 채우면 크기 클래스가
+    // 달라 다른 리전에서 할당되고, 그러면 토큰들의 상대 주소 순서를 전혀
+    // 흔들지 못한다. ASan 처럼 크기별로 순차 할당하는 할당자에서 실제로
+    // 그랬다 - 다섯 배치가 전부 같은 결과를 냈다.
+    std::vector<std::shared_ptr<WorldToken>> ballast;
     ballast.reserve(pad * seq.size() + 1);
 
     for (const auto& in : seq) {
         const auto ra = store_a.integrate(in.detections, in.frame, in.T_world_cam, in.env);
         // 두 스토어의 토큰 할당 사이에 살아 있는 블록을 끼운다.
-        for (std::size_t k = 0; k < pad; ++k) ballast.push_back(std::make_shared<int>(0));
+        for (std::size_t k = 0; k < pad; ++k) {
+            ballast.push_back(std::make_shared<WorldToken>());
+        }
         const auto rb = store_b.integrate(in.detections, in.frame, in.T_world_cam, in.env);
         a.put(ra.ok());
         b.put(rb.ok());
