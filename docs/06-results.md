@@ -1653,6 +1653,18 @@ that repairing fusion did not bring it back.
 
 ## 22. The first external baseline — 12 sequences, head to head
 
+> ### ⚠ Every ATE in this section was measured on a fraction of its sequence.
+>
+> Thirteen of the sixteen TUM sequences were truncated on disk while their frame indexes stayed
+> intact, so each run scored a prefix — an average of 35 %, as little as 6.4 % — and reported it
+> as a whole-sequence result. **§25.22 has the corrected numbers**, the coverage table, and the
+> five verdicts that flip (in both directions). The section below is left as written because what
+> it concluded from the bad data is part of the record; read it against §25.22, not instead of it.
+>
+> What survives unchanged: the RPE-versus-ATE mechanism in §22.1, which holds on 17 of 17
+> scorable sequences instead of 12 of 12. What does not: the 12–4 tally, the fr2 claim in §22.2,
+> and the per-sequence numbers in §22.4's table.
+
 Every number before this section compares WME to ablations of itself and to a do-nothing
 floor. §22 in its earlier form named that as the largest remaining gap. It is now closed on
 one axis: a classical descriptor pipeline runs on the same data, through the same code path.
@@ -2981,6 +2993,141 @@ is §19.3's failure mode wearing a different hat. Marker removed.
 
 ---
 
+### 25.22 §22 was measured on a fraction of the data, and the tally moves both ways
+
+`python/tools/tum_fetch.py` writes a sequence's `rgb.txt` / `depth.txt` index from the archive
+listing and then extracts the frames. If the extraction is interrupted the index survives intact
+and the frames do not, so the directory still *looks* complete: every loader reads the index,
+finds the files that exist, associates those, and reports a clean run over them. Nothing in the
+pipeline compares the index against the disk, so a sequence truncated to a tenth of its length
+produces a plausible ATE with no warning anywhere.
+
+**13 of the 16 TUM sequences behind §22 were in that state.** Coverage, counting scorable
+rgb↔depth pairs against what the index declares:
+
+| sequence | frames scored | frames available | coverage |
+|---|---|---|---|
+| fr2_desk_with_person | 258 | 4042 | **6.4 %** |
+| fr2_desk | 256 | 2965 | **8.6 %** |
+| fr1_teddy | 165 | 1419 | 11.6 % |
+| fr1_plant | 165 | 1141 | 14.5 % |
+| fr3_sitting_xyz | 258 | 1215 | 21.2 % |
+| fr1_360 | 165 | 756 | 21.8 % |
+| fr3_sitting_halfsphere | 259 | 1069 | 24.2 % |
+| fr3_walking_halfsphere | 253 | 1017 | 24.9 % |
+| fr1_desk | 164 | 596 | 27.5 % |
+| fr3_walking_xyz | 258 | 826 | 31.2 % |
+| fr1_xyz | 250 | 798 | 31.3 % |
+| fr3_structure_texture_far | 720 | 904 | 79.6 % |
+| fr3_structure_notexture_far | 722 | 789 | 91.5 % |
+| fr1_room, fr3_nostructure_{notexture,texture}_far | — | — | **100 %** |
+
+Every archive was re-fetched and all 20 sequences were re-scored end to end.
+`python/tools/check_datasets.py` reports the mismatch — but it already existed when §22 was
+written and nothing called it, so `bench_run.py` now performs the same comparison itself and
+refuses to score a short sequence unless `--allow-partial` says that is intended. Verified by
+hiding three of `fr1_xyz`'s 1596 frames: the run stops at 99.8 %.
+
+**The three sequences that were already complete are the control, and they pass.** They should
+reproduce exactly, and they do — ORB 48.06 → 48.06, 146.26 → 146.26, 34.12 → 34.12; WME 7.21 →
+7.21 and 21.17 → 21.18 cm. The two at 80–92 % move by under 3 %. Everything below 35 % moves by
+factors. **The disagreement is monotone in coverage**, which is what makes this a data defect
+rather than a scoring change.
+
+#### The corrected tally
+
+ATE cm, WME's better variant against ORB+PnP, all 20 sequences:
+
+| sequence | ORB, old | ORB, new | WME, old | WME, new | old winner | new winner |
+|---|---|---|---|---|---|---|
+| fr1_360 | 13.62 | *diverged* | 10.37 | 29.71 | WME | — |
+| fr1_desk | 3.55 | 8.84 | 2.53 | 5.60 | WME | WME |
+| fr1_plant | 3.37 | 15.01 | 4.51 | 6.19 | ORB | **WME** |
+| fr1_room | 48.06 | 48.06 | 21.17 | 21.18 | WME | WME |
+| fr1_teddy | 6.22 | 22.02 | 5.30 | 53.97 | WME | **ORB** |
+| fr1_xyz | 2.61 | 4.05 | 1.53 | 4.54 | WME | **ORB** |
+| fr2_desk | 0.98 | 29.06 | 2.38 | 11.14 | ORB | **WME** |
+| fr2_desk_with_person | 0.73 | 9.59 | 0.94 | 7.42 | ORB | **WME** |
+| fr3_nostructure_notexture_far | 146.26 | 146.26 | *no output* | *no output* | — | — |
+| fr3_nostructure_texture_far | 34.12 | 34.12 | 7.21 | 7.21 | WME | WME |
+| fr3_sitting_halfsphere | 1.26 | 101.47 | 1.50 | 9.54 | ORB | **WME** |
+| fr3_sitting_xyz | 8.85 | 19.69 | 1.01 | 4.35 | WME | WME |
+| fr3_structure_notexture_far | *diverged* | *diverged* | 12.20 | 12.58 | — | — |
+| fr3_structure_texture_far | 3.30 | 3.12 | 1.95 | 2.00 | WME | WME |
+| fr3_walking_halfsphere | 17.86 | 50.97 | 10.77 | 33.60 | WME | WME |
+| fr3_walking_xyz | 19.34 | 38.50 | 6.48 | 33.88 | WME | WME |
+| kitti_00 / 04 / 05 / 07 | — | 129.03 / 5056.93 / 160.25 / 304.09 | — | 94.32 / 954.78 / 141.48 / 107.93 | WME ×4 | WME ×4 |
+
+**Against ORB alone: WME 15, ORB 2, 3 unscorable, across 20 sequences** — on TUM only, 11–2 with
+3 unscorable, where §22 reported 12–4 across 14. Five verdicts flipped, and **they flipped in
+both directions**: `fr1_plant`, `fr2_desk`, `fr2_desk_with_person` and `fr3_sitting_halfsphere`
+moved to WME; `fr1_teddy` and `fr1_xyz` moved to ORB. A truncation that favoured one system
+would have been easier to reason about than one that does not.
+
+**And §22's own headline did not add up.** "12 to 4 across 14 scorable sequences" is sixteen
+verdicts over fourteen sequences. Counting §22.4's table by hand gives **10–4**, and 10 + the two
+unscorable rows = 12 — so the headline counted `nostructure_notexture` (where WME produced *no
+output*) and `structure_notexture` (where ORB diverged) as WME wins, in the same section whose
+closing paragraph says it excluded them. §22.5 wrote the rule and §22's summary line did not
+apply it. That is independent of the data defect and was checkable at the time from the table
+printed directly above it.
+
+This retires a claim §22.2 made. "Where the baseline wins, it wins on fr2" was a statement about
+256 of 2965 frames. On the complete sequence ORB goes 0.98 → 29.06 cm while WME goes 2.38 →
+11.14, and fr2 becomes a WME win. §20.2's separate finding — that fr2 is where WME's *uncertainty
+model* breaks — is untouched; it was measured elsewhere. What is gone is the ATE result that
+§22.2 read as agreeing with it.
+
+**What does not change is the mechanism.** §22.1 reported WME with lower RPE on every sequence
+while losing ATE on four. On complete data that is **17 of 17 scorable sequences, ORB 0**, and
+both remaining ATE losses carry the same signature — `fr1_teddy` at RPE 6.56 mm against 9.20 and
+ATE 53.97 against 22.02 is 1.4× better per frame and 2.5× worse over the trajectory. The
+structural claim about signed versus unsigned error survived a tenfold increase in data, which
+is more than the tally can say for itself.
+
+Medians move as expected once long sequences carry their real weight: RPE 6.91 → 8.77 mm (ORB),
+4.62 → 6.71 (WME), 4.82 → 6.30 (WME+mask); ms/frame 29.9 → 42.7, 35.5 → 37.8, 108.6 → 127.2.
+
+#### The token mask is not a free layer
+
+Complete data makes something visible that 250-frame windows hid. The mask is what earns the
+`walking` sequences — `walking_xyz` 124.61 → 33.88 cm, `walking_halfsphere` 63.29 → 33.60. It
+also destroys three others: `fr1_plant` 6.19 → 48.33, `fr3_structure_texture_far` 2.00 → 8.55,
+and `fr3_sitting_halfsphere` **9.54 → 4888.94 cm**. That last is a 48.9 m excursion in a
+sequence where the camera orbits a fixed point at arm's length.
+
+§22 credited the mask for the dynamic wins and did not price this, because on truncated data the
+worst case was 8×. It is 512×. **A layer that is decisive on two sequences and catastrophic on
+three is not a component, it is an open problem**, and §26 now says so.
+
+That matters for the tally, because 15–2 is a *per-sequence best-of* — it takes the mask where
+it helps and drops it where it does not, which is a choice no deployed system gets to make.
+Scored the other way, one configuration everywhere:
+
+| what is counted | WME | ORB | unscorable |
+|---|---|---|---|
+| best of {Tier 0, Tier 0 + mask} per sequence | **15** | 2 | 3 |
+| Tier 0 alone, same configuration on all 20 | **13** | 4 | 3 |
+
+The mask converts exactly the two `walking` sequences and nothing else. **13–4 is the number
+that corresponds to a system rather than to a selection**, and it is the one §22's headline
+should have been reporting all along.
+
+It also exposes a gap in §22.5's own detector. `run_status()` flags `diverged` above 1 km,
+chosen because an indoor 45 s sequence cannot travel that far. 48.9 m cannot happen either, and
+it is scored as an ordinary number. The threshold is sound in kind and far too loose in degree;
+tightening it needs a per-sequence bound from ground-truth path length rather than a constant,
+which is not yet written.
+
+> The rule this section adds to §10.4: **a dataset is an input, and inputs get validated.**
+> Every guard in this repository points at the code. Nothing pointed at whether the data the
+> code consumed was the data it claimed to consume, and twenty sections of results were scored
+> on an average of 35 % of TUM before anything noticed. The check that catches it compares two
+> counts that were both already on disk — and a version of it had been sitting in `tools/` the
+> whole time, never called. **A check that is not on the execution path is documentation.**
+
+---
+
 ## 26. What is not established
 
 - **Two dataset families now, and they disagree.** §12–§17 were five 9-second windows; §22 onward
@@ -3015,13 +3162,21 @@ is §19.3's failure mode wearing a different hat. Marker removed.
   loop. Tier 1 accepted one loop in 45 s and it was wrong; Tier 2 helps only where Tier 0 has
   already diverged. **§1's three-tier result remains unreproduced on a real sensor** — the slope
   survives, the magnitude does not (§23.4).
-- **The depth front-end exists and KITTI is on disk; the run has not happened yet.**
-  `StereoDepth` (§25.19) supplies the missing piece, `wme_kitti_convert` turns a KITTI odometry
-  sequence into the TUM layout every existing tool already consumes, and the 21.6 GB grayscale
-  set is downloaded. What is *not* done is running it: **no KITTI ATE number exists**, and the
-  stereo depth's accuracy has only been checked against TUM's measured depth on a
-  self-consistently warped right view, which is an optimistic bound (§25.19). EuRoC's dataset
-  host (`robotics.ethz.ch`) still times out from here, so that data remains unreachable.
+- **The stereo depth front-end is validated only against itself.** §25.20–25.21 ran KITTI, so
+  the ATE numbers this bullet used to say were missing now exist — but the depth those numbers
+  rest on has been checked against TUM's measured depth on a *self-consistently warped right
+  view*, which is an optimistic bound (§25.19), and never against KITTI's own Velodyne. The
+  4–0 result therefore inherits an unquantified depth error. EuRoC's dataset host
+  (`robotics.ethz.ch`) still times out from here, so that family remains unreachable.
+- **The token mask is decisive on two sequences and catastrophic on three** (§25.22). It buys
+  `walking_xyz` 124.61 → 33.88 cm and `walking_halfsphere` 63.29 → 33.60, and costs `fr1_plant`
+  6.19 → 48.33, `structure_texture_far` 2.00 → 8.55, and `sitting_halfsphere` 9.54 → **4888.94**.
+  Truncated data capped the worst case at 8× and hid the failure mode entirely, and nothing
+  here predicts which sequences it will ruin. This is load-bearing rather than incidental: the
+  headline tally scores WME's *better variant*, so the mask is inside the published number on
+  every sequence where it helps and silently discarded where it does not. A per-sequence
+  best-of is a weaker claim than a single configuration run everywhere, and §22 does not
+  currently say so.
 - **ORB-SLAM3 is routed but not built.** Six Windows forks were checked and every one is stale —
   the newest MSVC-capable port (`lydieusang/orbslam3-windows`) last moved in 2022 and predates
   ORB-SLAM3 v1.0; there is **no vcpkg port**, and vcpkg's `g2o`/`DBoW2` cannot substitute for
