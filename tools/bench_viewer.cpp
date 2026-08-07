@@ -457,9 +457,21 @@ struct Column {
     float vert{0.0f};        // 법선이 수평에 가까운 정도 (1 = 수직면)
     Stuff cls{Stuff::Unknown};
 
-    int topBin() const {
+    // 최고 점유 칸. 이상치 하나에 그대로 끌려간다.
+    int topBinRaw() const {
         for (int b = kBins - 1; b >= 0; --b) if (bins & (1u << b)) return b;
         return -1;
+    }
+    // **지지받는 최고 칸.** 바로 아래 칸도 차 있어야 인정한다.
+    //
+    // 최고점을 그대로 쓰면 복셀 하나짜리 스파이크가 기둥을 하늘까지 늘리고,
+    // 평평한 노면도 그 꼭대기를 따라 울퉁불퉁해진다 - 하늘이 덮이고 바닥이
+    // 이상하게 보이던 것이 둘 다 여기서 나왔다. 두 칸이 이어져야 구조다.
+    int topBin() const {
+        for (int b = kBins - 1; b >= 1; --b) {
+            if ((bins & (1u << b)) && (bins & (1u << (b - 1)))) return b;
+        }
+        return (bins & 1u) ? 0 : -1;
     }
 };
 
@@ -616,6 +628,20 @@ inline void labelScene(const std::unordered_map<std::int64_t, Splat>& cells,
         const float rel = v.p.dot(g.up) - it->second.ground;
         const int b = static_cast<int>(std::floor(rel / kBinH));
         if (b >= 0 && b < kBins) it->second.bins |= (1u << b);
+    }
+
+    // 대표점의 **높이를 지지받는 꼭대기로 내린다.** 수평 위치는 그대로 둔다.
+    //
+    // rep 은 1 차에서 최고 높이 복셀로 잡혔는데, 그것은 기둥에서 가장 잡음이
+    // 심한 값이다. 하늘에 뜬 복셀 하나가 그 칸의 대표가 되면 건물 덩어리가
+    // 하늘까지 솟고, 노면 칸 하나가 1 m 위 잡음을 대표로 삼으면 평평한
+    // 도로가 울퉁불퉁해진다. 지지받는 꼭대기는 그런 스파이크를 무시한다.
+    for (auto& [k, c] : fresh) {
+        const int t = c.topBin();
+        if (t < 0) continue;
+        const float want = c.ground + static_cast<float>(t + 1) * kBinH;
+        const float have = c.rep.dot(g.up);
+        c.rep += g.up * (want - have);
     }
 
     // 4 차: 구조 텐서. **국소 3 차원 이웃에서** 계산한다.
@@ -1311,12 +1337,17 @@ public:
     // 나무를 이으면 있지도 않은 구조가 생긴다.
     void stuffVectors(const std::unordered_map<std::int64_t, Column>& cols,
                       const Eigen::Vector3d& up_d, float cell,
-                      const Orbit& orb, double f, int layer = 0) {
+                      const Orbit& orb, double f, int layer = 0,
+                      const Eigen::Vector3d& ego = Eigen::Vector3d::Zero(),
+                      double radius = 0.0) {
+        const float r2f = static_cast<float>(radius * radius);
+        const Eigen::Vector3f egof = ego.cast<float>();
         const GroundGrid g(up_d.cast<float>(), cell);
         const Eigen::Vector3f& up = g.up;
 
         for (const auto& [k, c] : cols) {
             if (c.cls == Stuff::Unknown) continue;
+            if (r2f > 0.0f && (c.rep - egof).squaredNorm() > r2f) continue;
             // 레이어 격리: 4 는 구조물만, 5 는 지면만.
             if (layer == 4 && c.cls == Stuff::Ground) continue;
             if (layer == 5 && c.cls != Stuff::Ground) continue;
@@ -1329,11 +1360,17 @@ public:
             // 크기대로 채우면 도로가 도로로 보이고, 그 위에 선 구조의
             // 발치가 어디인지도 읽힌다.
             if (c.cls == Stuff::Ground) {
+                // **노면은 지면 높이에 그린다.** rep 은 그 칸에서 관측된 가장
+                // 높은 것이라, 도로 위 잡음이나 연석이 있으면 그 높이로 판이
+                // 뜬다. 평평한 도로가 계단처럼 보이던 이유다. 지면 높이는
+                // 이웃 중앙값이므로 잡음에 흔들리지 않는다.
+                const Eigen::Vector3f gp =
+                    c.rep + g.up * (c.ground - c.rep.dot(g.up));
                 const Eigen::Vector3f q[4] = {
-                    c.rep - g.a * (cell * 0.5f) - g.b * (cell * 0.5f),
-                    c.rep + g.a * (cell * 0.5f) - g.b * (cell * 0.5f),
-                    c.rep + g.a * (cell * 0.5f) + g.b * (cell * 0.5f),
-                    c.rep - g.a * (cell * 0.5f) + g.b * (cell * 0.5f)};
+                    gp - g.a * (cell * 0.5f) - g.b * (cell * 0.5f),
+                    gp + g.a * (cell * 0.5f) - g.b * (cell * 0.5f),
+                    gp + g.a * (cell * 0.5f) + g.b * (cell * 0.5f),
+                    gp - g.a * (cell * 0.5f) + g.b * (cell * 0.5f)};
                 cv::Point poly[4];
                 bool ok = true;
                 for (int i = 0; i < 4 && ok; ++i) {
@@ -2138,7 +2175,11 @@ int main(int argc, char** argv) {
                 // 1 인칭은 눈이 자차에 있어야 하므로 궤도 반지름이 거의 0 이다.
                 // 3 인칭은 자차가 화면 아래쪽에 오도록 조금 뒤에 선다.
                 if (cam_mode == 0)      orb.dist = base_dist * 0.06;
-                else if (cam_mode == 1) orb.dist = base_dist * 0.35;
+                // 3 인칭은 **지도 반경보다 멀리** 선다. 24.5 m 에서 반경 55 m
+                // 짜리 지도를 보면 프레임이 통째로 지도가 되고, 그것이 "하늘이
+                // 채워졌다" 로 읽혔다. 라이다 시각화가 늘 높고 멀리서 보는
+                // 이유는 취향이 아니라 이것이다 - 구조는 전체가 보여야 구조다.
+                else if (cam_mode == 1) orb.dist = base_dist * 0.95;
                 else if (cam_mode == 3) orb.dist = base_dist * 1.1;
                 else                    orb.dist = base_dist;
             }
@@ -2526,10 +2567,30 @@ int main(int argc, char** argv) {
                 // 큐브만 그리면 2 px 미만으로 작아지는 먼 구조가 통째로
                 // 사라져 "저기엔 아무 것도 없다" 로 읽힌다 - 없는 것과 너무
                 // 작아 못 그린 것은 다르다.
+                // **지도는 자차 주변 반경까지만 그린다.**
+                //
+                // 8 m 위 복셀은 756680 개 중 489 개(0.06 %)뿐인데도 화면 위쪽이
+                // 꽉 차 보였다. 그것은 하늘 잡음이 아니라 **멀리까지 이어진
+                // 지도** 다 - 시선각이 낮으면 지평선이 높이 걸리고 원거리
+                // 지도가 프레임을 다 채운다.
+                //
+                // 라이다 뷰어가 예외 없이 센서 주변 일정 반경만 그리는 이유가
+                // 이것이다. 지도가 사라지는 것이 아니라, 지금 볼 수 있는 만큼만
+                // 보여 주는 것이다.
+                const double map_r = (s.dataset == "kitti") ? 55.0 : 7.0;
+                const double map_r2 = map_r * map_r;
+                std::vector<Splat> near_pts;
+                near_pts.reserve(flat.size() / 2 + 1);
+                {
+                    const Eigen::Vector3f e = ego_k.cast<float>();
+                    for (const auto& sp : flat) {
+                        if ((sp.p - e).squaredNorm() <= map_r2) near_pts.push_back(sp);
+                    }
+                }
                 const bool L_map = (layer == 0 || layer == 1);
-                if (L_map) cloud[k].draw(flat, ob, vp.width * 0.9, 0.62);
+                if (L_map) cloud[k].draw(near_pts, ob, vp.width * 0.9, 0.62);
                 if (show_cubes && L_map) {
-                    cloud[k].voxelCubes(flat, acc[k].voxel, ob, vp.width * 0.9,
+                    cloud[k].voxelCubes(near_pts, acc[k].voxel, ob, vp.width * 0.9,
                                         ob.world_up, 0.45);
                 }
                 prof_cloud[k] = std::chrono::duration<double, std::milli>(
@@ -2576,7 +2637,8 @@ int main(int argc, char** argv) {
                         const auto t_vec = std::chrono::steady_clock::now();
                         if (layer == 0 || layer == 4 || layer == 5) {
                             cloud[k].stuffVectors(stuff[k], ob.world_up, ccell,
-                                                  ob, vp.width * 0.9, layer);
+                                                  ob, vp.width * 0.9, layer,
+                                                  ego_k, map_r);
                         }
                         const auto t_end = std::chrono::steady_clock::now();
                         prof_label[k] = std::chrono::duration<double, std::milli>(
