@@ -965,12 +965,17 @@ struct SurfMesh {
 using DensField = std::unordered_map<std::int64_t, std::uint8_t>;
 
 inline DensField buildDensity(const std::unordered_map<std::int64_t, Splat>& cells,
-                              float voxel, const Eigen::Vector3f& e, float r2) {
+                              float voxel, const Eigen::Vector3f& e, float r2,
+                              const Eigen::Vector3f& up, float hmin) {
     DensField d;
     d.reserve(cells.size() * 3);
     const float inv = 1.0f / voxel;
     for (const auto& [k, v] : cells) {
         if ((v.p - e).squaredNorm() > r2) continue;
+        // **노면은 메시에 넣지 않는다.** 도로는 이미 밝기 텍스처로 그린다.
+        // 같은 것을 메시로 또 만들면, 평평해야 할 노면이 스테레오 잡음을 따라
+        // 울퉁불퉁한 바위 덩어리가 된다 - 실제로 그렇게 나왔다.
+        if (v.p.dot(up) < hmin) continue;
         for (int dx = -1; dx <= 1; ++dx) {
             for (int dy = -1; dy <= 1; ++dy) {
                 for (int dz = -1; dz <= 1; ++dz) {
@@ -997,7 +1002,8 @@ inline float sdfAt(const DensField& dens, const Eigen::Vector3f& p,
 // 만들 이유가 없고, 결과는 캐시된다.
 inline void surfaceNets(const std::unordered_map<std::int64_t, Splat>& cells,
                         float voxel, const Eigen::Vector3d& ego, double radius,
-                        SurfMesh& out) {
+                        const Eigen::Vector3d& up_d, double ground_h,
+                        double min_above, SurfMesh& out) {
     out.clear();
     if (cells.empty()) return;
     const float inv = 1.0f / voxel;
@@ -1005,7 +1011,9 @@ inline void surfaceNets(const std::unordered_map<std::int64_t, Splat>& cells,
     const Eigen::Vector3f e = ego.cast<float>();
     const float r2 = static_cast<float>(radius * radius);
     // 밀도장을 먼저 한 패스로 만든다. 이후 모든 조회가 O(1) 이 된다.
-    const DensField dens = buildDensity(cells, voxel, e, r2);
+    const Eigen::Vector3f upf = up_d.cast<float>().normalized();
+    const float hmin = static_cast<float>(ground_h + min_above);
+    const DensField dens = buildDensity(cells, voxel, e, r2, upf, hmin);
 
     // 셀 -> 정점 인덱스. 셀마다 정점 하나이므로 중복 제거가 필요 없다.
     std::unordered_map<std::int64_t, int> vidx;
@@ -1016,6 +1024,7 @@ inline void surfaceNets(const std::unordered_map<std::int64_t, Splat>& cells,
     cand.reserve(cells.size() * 2);
     for (const auto& [k, v] : cells) {
         if ((v.p - e).squaredNorm() > r2) continue;
+        if (v.p.dot(upf) < hmin) continue;      // 노면 제외
         // **표면 복셀만 후보로 삼는다.**
         //
         // 복셀마다 여덟 칸을 후보로 넣으면 70 만 복셀에서 후보가 560 만 개가
@@ -1094,6 +1103,57 @@ inline void surfaceNets(const std::unordered_map<std::int64_t, Splat>& cells,
                                             : Eigen::Vector3f(0, 1, 0));
     }
 
+    // **제약 이완.** Gibson 논문의 핵심이고, "Naive" 판이 생략한 부분이다.
+    //
+    // 교차점 무게중심만 쓰면 표면이 입력만큼 거칠다. 스테레오 지도는 원래
+    // 거칠므로 결과가 각진 바위 덩어리로 나온다 - 실제로 그렇게 나왔다.
+    //
+    // 각 정점을 이웃 정점들의 평균 쪽으로 조금씩 당기되, **자기 셀 밖으로는
+    // 못 나가게** 묶는다. 그 제약이 Gibson 이 말한 요점이다: 제약이 없으면
+    // 표면이 수축해 얇은 것들이 사라지고, 제약이 있으면 세부는 남으면서
+    // 잡음만 펴진다.
+    {
+        // 정점 이웃 관계는 셀 격자에서 온다. 여섯 면 이웃의 정점이 이웃이다.
+        std::vector<Eigen::Vector3f> home = out.vert;
+        const Eigen::Vector3f ax6[6] = {{voxel,0,0},{-voxel,0,0},{0,voxel,0},
+                                        {0,-voxel,0},{0,0,voxel},{0,0,-voxel}};
+        std::vector<std::int64_t> keys(out.vert.size());
+        for (const auto& [key, idx] : vidx) keys[static_cast<std::size_t>(idx)] = key;
+
+        std::vector<Eigen::Vector3f> next(out.vert.size());
+        for (int iter = 0; iter < 4; ++iter) {
+            for (std::size_t i = 0; i < out.vert.size(); ++i) {
+                Eigen::Vector3f sum = Eigen::Vector3f::Zero();
+                int n = 0;
+                for (const auto& d : ax6) {
+                    const auto it = vidx.find(voxKey(home[i] + d, inv));
+                    if (it == vidx.end()) continue;
+                    sum += out.vert[static_cast<std::size_t>(it->second)];
+                    ++n;
+                }
+                if (n < 2) { next[i] = out.vert[i]; continue; }
+                Eigen::Vector3f p = out.vert[i] * 0.5f + (sum / static_cast<float>(n)) * 0.5f;
+                // 자기 셀 안으로 되돌린다. 이것이 수축을 막는 제약이다.
+                const Eigen::Vector3f lo = home[i] - Eigen::Vector3f::Constant(voxel * 0.5f);
+                const Eigen::Vector3f hi = home[i] + Eigen::Vector3f::Constant(voxel * 0.5f);
+                next[i] = p.cwiseMax(lo).cwiseMin(hi);
+            }
+            out.vert.swap(next);
+        }
+        // 이완 후 법선을 다시 잡는다. 옛 법선은 옛 위치의 것이다.
+        for (std::size_t i = 0; i < out.vert.size(); ++i) {
+            const float h = voxel * 0.5f;
+            const Eigen::Vector3f g(
+                sdfAt(dens, out.vert[i] + Eigen::Vector3f(h,0,0), inv, iso) -
+                sdfAt(dens, out.vert[i] - Eigen::Vector3f(h,0,0), inv, iso),
+                sdfAt(dens, out.vert[i] + Eigen::Vector3f(0,h,0), inv, iso) -
+                sdfAt(dens, out.vert[i] - Eigen::Vector3f(0,h,0), inv, iso),
+                sdfAt(dens, out.vert[i] + Eigen::Vector3f(0,0,h), inv, iso) -
+                sdfAt(dens, out.vert[i] - Eigen::Vector3f(0,0,h), inv, iso));
+            if (g.norm() > 1e-9f) out.norm[i] = g.normalized();
+        }
+    }
+
     // 면: 부호가 바뀌는 격자 엣지마다, 그 엣지를 공유하는 네 셀의 정점을 잇는다.
     const Eigen::Vector3f ax[3] = {{voxel,0,0}, {0,voxel,0}, {0,0,voxel}};
     for (const auto& [key, c] : cand) {
@@ -1105,6 +1165,18 @@ inline void surfaceNets(const std::unordered_map<std::int64_t, Splat>& cells,
             const auto i2 = vidx.find(voxKey(c - ax[b] - ax[d2], inv));
             const auto i3 = vidx.find(voxKey(c - ax[d2], inv));
             if (i1 == vidx.end() || i2 == vidx.end() || i3 == vidx.end()) continue;
+            // **빈 공간을 가로지르는 삼각형을 만들지 않는다.**
+            //
+            // 격자에서 이웃한 셀이라도 그 안의 정점은 셀 안 어디에나 놓일 수
+            // 있다. 두 정점이 멀면 삼각형이 관측이 없는 구간을 건너뛰어,
+            // 화면에는 있지도 않은 커다란 각진 덩어리가 생긴다.
+            const float lim2 = 4.0f * voxel * voxel;
+            const Eigen::Vector3f& v0 = out.vert[static_cast<std::size_t>(self->second)];
+            if ((out.vert[static_cast<std::size_t>(i1->second)] - v0).squaredNorm() > lim2 ||
+                (out.vert[static_cast<std::size_t>(i2->second)] - v0).squaredNorm() > lim2 ||
+                (out.vert[static_cast<std::size_t>(i3->second)] - v0).squaredNorm() > lim2) {
+                continue;
+            }
             out.tri.push_back({self->second, i1->second, i2->second});
             out.tri.push_back({self->second, i2->second, i3->second});
         }
@@ -1449,10 +1521,15 @@ public:
             // 격자면이 대신한다.
             if (w < 1.0) continue;
 
-            // 제곱으로 대비를 세운다. 아스팔트는 배경으로 가라앉고 흰 페인트만
-            // 남아야 선이 선으로 읽힌다.
+            // **밑바닥을 올린다.** 아스팔트는 실제로 어둡다. 밝기를 그대로
+            // 옮기면 노면 전체가 검은 격자로 보이고, 도로가 있는 자리와 아무
+            // 것도 없는 자리가 화면에서 구분되지 않는다 - 실제로 그렇게
+            // 나왔다. 노면은 여기 도로가 있다는 사실부터 보여야 한다.
+            //
+            // 제곱은 그대로 둔다. 흰 페인트가 아스팔트보다 확실히 밝게 남는
+            // 것이 이 층의 목적이기 때문이다.
             const double t = std::clamp((c.intensity - lo) / span, 0.0, 1.0);
-            const double v = 22.0 + 225.0 * t * t;
+            const double v = 58.0 + 190.0 * t * t;
             cv::fillConvexPoly(img_, poly, 4, cv::Scalar(v, v, v), cv::LINE_8);
             const double zz = (M * (c3 - eye)).z();
             if (zz > 1e-3) cv::fillConvexPoly(zbuf_, poly, 4, cv::Scalar(zz), cv::LINE_8);
@@ -3399,8 +3476,11 @@ int main(int argc, char** argv) {
                     if ((ego_k - surf_at[k]).norm() > acc[k].voxel * 4.0) {
                         // 표면은 자차 주변만 만든다. 먼 곳은 화면에서
                         // 삼각형이 픽셀보다 작아 큐브와 구분되지 않는다.
+                        // 노면 위 40 cm 부터가 구조물이다. 그 아래는 도로이고,
+                        // 도로는 밝기 텍스처가 이미 맡고 있다.
                         surfaceNets(acc[k].cells, acc[k].voxel, ego_k,
-                                    std::min(map_r, 22.0), surf[k]);
+                                    std::min(map_r, 22.0), ob.world_up,
+                                    plane_h, 0.40, surf[k]);
                         surf_at[k] = ego_k;
                     }
                     cloud[k].surface(surf[k], ob, vp.width * 0.9,
