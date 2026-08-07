@@ -332,6 +332,17 @@ struct Splat {
     float depth_norm;      // turbo 입력 (0..1)
     float age;             // 0 = 최신, 1 = 가장 오래됨
     int   seen{0};         // 마지막으로 관측된 프레임. 복셀 병합 시 최신을 남긴다
+    // **얼마나 멀리서 본 것인가.**
+    //
+    // 스테레오 깊이 오차는 sigma_Z = c*Z^2 이므로 거리의 **제곱** 으로 커진다.
+    // 60 m 에서 본 점은 6 m 에서 본 점보다 분산이 100 배다. 그래서 먼 관측은
+    // 하늘로도 땅속으로도 튀고, 그것이 지금까지 "하늘에 뭔가 생긴다" 로
+    // 보이던 것의 정체다.
+    //
+    // 거리를 같이 들고 있으면 두 가지를 할 수 있다: 먼 것은 흐리게 그려
+    // 잠정임을 표시하고, 나중에 가까이 가서 같은 자리를 다시 보면 **먼 관측을
+    // 폐기** 할 수 있다. 지도가 시간이 지나며 좋아지는 것이 그 뜻이다.
+    float range{0.0f};     // 관측 당시 카메라로부터의 거리 (m)
 };
 
 // ---------------------------------------------------------------------------
@@ -362,11 +373,55 @@ struct VoxelMap {
     float voxel{0.3f};     // m
     int   grown{0};        // 상한 때문에 복셀을 키운 횟수
 
-    void clear() { cells.clear(); grown = 0; }
+    void clear() { cells.clear(); grown = 0; revised = 0; }
+
+    // 가까이서 본 관측이 멀리서 본 관측을 **이긴다.**
+    long long revised{0};      // 폐기한 먼 관측의 수. 개선이 일어났다는 증거다.
 
     void insert(const Splat& s, std::size_t cap) {
-        cells[voxKey(s.p, 1.0f / voxel)] = s;
+        const float inv = 1.0f / voxel;
+        const auto key = voxKey(s.p, inv);
+        const auto it = cells.find(key);
+        if (it != cells.end() && it->second.range > 0.0f && s.range > 0.0f &&
+            it->second.range < s.range * 0.8f) {
+            // 같은 칸에 이미 더 가까이서 본 관측이 있다. 먼 것으로 덮으면
+            // 좋은 값을 나쁜 값으로 바꾸는 것이다 - 최신이 항상 나은 것은
+            // 아니고, 여기서 나은 것은 **가까운** 것이다.
+            return;
+        }
+        cells[key] = s;
         if (cells.size() > cap) coarsen();
+    }
+
+    // **가까이 와서 다시 본 자리의 먼 관측을 지운다.**
+    //
+    // 멀리서 본 점은 자기 칸에만 틀리게 앉는 것이 아니라 **엉뚱한 칸에**
+    // 앉는다 - 깊이가 몇 m 씩 어긋나므로 아예 다른 자리에 찍힌다. 그래서
+    // 같은 칸을 덮어쓰는 것만으로는 지워지지 않고, 유령이 그 자리에 남는다.
+    //
+    // 가까운 관측이 들어오면 그 주변에서 훨씬 멀리서 찍힌 것들을 걷어낸다.
+    // "지금 바로 앞에서 보고 있는데 저기 있다던 것이 없다" 는 뜻이므로,
+    // 지우는 것이 맞다.
+    void supersede(const Eigen::Vector3f& p, float new_range, int reach) {
+        if (!(new_range > 0.0f)) return;
+        const float inv = 1.0f / voxel;
+        for (int dx = -reach; dx <= reach; ++dx) {
+            for (int dy = -reach; dy <= reach; ++dy) {
+                for (int dz = -reach; dz <= reach; ++dz) {
+                    if (dx == 0 && dy == 0 && dz == 0) continue;
+                    const Eigen::Vector3f q = p + Eigen::Vector3f(
+                        dx * voxel, dy * voxel, dz * voxel);
+                    const auto it = cells.find(voxKey(q, inv));
+                    if (it == cells.end()) continue;
+                    // 지금 관측보다 2.5 배 넘게 멀리서 찍힌 것만 걷어낸다.
+                    // 비슷한 거리에서 본 것은 둘 다 믿을 만하므로 남긴다.
+                    if (it->second.range > new_range * 2.5f) {
+                        cells.erase(it);
+                        ++revised;
+                    }
+                }
+            }
+        }
     }
 
     // 복셀 두 배로 키우고 전부 다시 담는다.
@@ -1966,6 +2021,7 @@ void backProject(const cv::Mat& depth16, const wme_tools::DatasetCalib& cal,
             s.depth_norm = static_cast<float>(
                 std::clamp((z - cmin) / std::max(1e-6, cmax - cmin), 0.0, 1.0));
             s.age = 0.0f;
+            s.range = static_cast<float>(z);   // 관측 당시 거리
             out.push_back(s);
         }
     }
@@ -2479,8 +2535,19 @@ int main(int argc, char** argv) {
                         p.depth_norm = static_cast<float>(
                             std::clamp((h - h0) / (h1 - h0), 0.0, 1.0));
                         p.seen = fi;
+                        // **가까이서 본 것이 먼저 들어간다.** 가까운 관측이
+                        // 자리를 잡은 뒤에 주변의 먼 유령을 걷어내야, 방금
+                        // 넣은 좋은 값까지 같이 지우는 일이 없다.
                         acc[k].insert(p, static_cast<std::size_t>(cloud_cap));
                         mesh[k].insert(p, 120000);
+                    }
+                    // 가까운 관측만 정정 권한을 갖는다. 30 m 에서 본 것으로
+                    // 60 m 짜리를 지우면, 둘 다 못 믿을 값인데 하나가 다른
+                    // 하나를 심판하는 꼴이 된다.
+                    const float trust_r = (s.dataset == "kitti") ? 18.0f : 2.0f;
+                    for (const auto& p : pts) {
+                        if (p.range > trust_r) continue;
+                        acc[k].supersede(p.p, p.range, 1);
                     }
 
                     // 이 프레임에서 본 물체를 월드에 **남긴다.** 지나온 곳의
@@ -2583,8 +2650,26 @@ int main(int argc, char** argv) {
                 near_pts.reserve(flat.size() / 2 + 1);
                 {
                     const Eigen::Vector3f e = ego_k.cast<float>();
+                    // **노면에는 점을 찍지 않는다.**
+                    //
+                    // 지면은 라벨 쪽에서 격자면으로 그린다. 같은 자리에 점까지
+                    // 뿌리면 면 위에 잡티가 앉아 평평한 도로가 지저분해지고,
+                    // 정작 도로 위에 선 것들이 그 잡티에 묻힌다.
+                    const GroundGrid gg(ob.world_up.cast<float>(),
+                                        (s.dataset == "kitti") ? 1.0f : 0.25f);
                     for (const auto& sp : flat) {
-                        if ((sp.p - e).squaredNorm() <= map_r2) near_pts.push_back(sp);
+                        if ((sp.p - e).squaredNorm() > map_r2) continue;
+                        if (show_stuff) {
+                            const auto it = stuff[k].find(gg.key(sp.p));
+                            if (it != stuff[k].end() &&
+                                it->second.cls == Stuff::Ground) {
+                                // 그 칸의 지면 높이 근처면 노면이다. 도로 위에
+                                // 선 물체는 같은 칸이어도 높이가 다르므로 남는다.
+                                const float rel = sp.p.dot(gg.up) - it->second.ground;
+                                if (rel < 0.45f) continue;
+                            }
+                        }
+                        near_pts.push_back(sp);
                     }
                 }
                 const bool L_map = (layer == 0 || layer == 1);
@@ -3261,7 +3346,8 @@ int main(int argc, char** argv) {
             // 데이터가 없는 것은 그림만 봐서는 구분되지 않는다.
             for (int k = 0; k < 2; ++k) {
                 std::cerr << "  패널 " << k << ": 복셀 " << acc[k].cells.size()
-                          << " (" << acc[k].voxel << " m, coarsen " << acc[k].grown << ")"
+                          << " (" << acc[k].voxel << " m, coarsen " << acc[k].grown
+                          << ", 원거리 정정 " << acc[k].revised << ")"
                           << ", 라벨 " << [&] {
                                  int n[6] = {0,0,0,0,0,0};
                                  for (const auto& [ck, c] : stuff[k]) {
