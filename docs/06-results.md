@@ -3113,11 +3113,33 @@ The mask converts exactly the two `walking` sequences and nothing else. **13–4
 that corresponds to a system rather than to a selection**, and it is the one §22's headline
 should have been reporting all along.
 
-It also exposes a gap in §22.5's own detector. `run_status()` flags `diverged` above 1 km,
-chosen because an indoor 45 s sequence cannot travel that far. 48.9 m cannot happen either, and
-it is scored as an ordinary number. The threshold is sound in kind and far too loose in degree;
-tightening it needs a per-sequence bound from ground-truth path length rather than a constant,
-which is not yet written.
+#### The divergence detector was measuring the wrong thing
+
+`sitting_halfsphere`'s 4888.94 cm exposed a hole in §22.5's own guard. `run_status()` flagged
+`diverged` when any *coordinate* exceeded 1 km — an indoor 45 s sequence cannot travel that far.
+That run wandered **1105 m of path length inside a small box**, so no coordinate ever crossed the
+line and a 48.9 m error was scored as an ordinary number. The check was on the wrong quantity,
+and the constant was borrowed from one dataset's intuition anyway; it means nothing on a KITTI
+drive where 550 m is correct.
+
+The bound is now the ground truth's own path length, and the multiplier comes from the measured
+gap rather than a guess. Across 56 runs the ratio splits cleanly in two:
+
+| | ratio (estimated path ÷ ground-truth path) |
+|---|---|
+| healthy | 0.62 … **3.67** (worst: `nostructure_texture_far` / ORB) |
+| *gap* | — |
+| failures | **10.70**, 153.03, 7.3 × 10¹¹, 5.0 × 10¹³ |
+
+6× sits inside that gap, 1.6× above the worst healthy run and 1.8× below the nearest failure —
+roughly centred on a log scale. 10× would have landed within 7 % of the 10.70 case, and §10.4 is
+the standing rule against thresholds placed where they measure rounding.
+
+Re-scoring with it relabels exactly two runs — `sitting_halfsphere`/mask (153×) and
+`nostructure_notexture_far`/ORB (10.7×, a camera jittering 33 m of path across 3 m of truth on a
+blank wall) — and **moves no verdict**: 15–2 best-of and 13–4 single-configuration before and
+after. A guard that catches more failures while changing no conclusion is the only kind that can
+be added to a document of published numbers without re-opening all of them.
 
 > The rule this section adds to §10.4: **a dataset is an input, and inputs get validated.**
 > Every guard in this repository points at the code. Nothing pointed at whether the data the

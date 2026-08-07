@@ -169,7 +169,7 @@ def read_diag(path: Path) -> list[dict]:
         return [dict(r) for r in csv.DictReader(f)]
 
 
-def run_status(est: Trajectory) -> str:
+def run_status(est: Trajectory, gt: Trajectory | None = None) -> str:
     """ATE 를 숫자로 보고해도 되는 실행인가.
 
     두 경우는 측정이 아니라 신호이고, 숫자로 적으면 둘 다 그럴듯해 보인다:
@@ -178,8 +178,31 @@ def run_status(est: Trajectory) -> str:
       "카메라가 안 움직였다" 바닥값과 **정확히 같은 점수**를 받으므로 표에서는
       선전하는 것처럼 보인다. 실제로 `nostructure_notexture_far` 에서 WME 가
       바닥값과 소수점까지 같은 값을 냈고, 그것이 이 검사를 만든 이유다.
-    - **diverged**: 실내 45 초 시퀀스가 1 km 를 움직일 수는 없다. 정렬 후 ATE 는
-      유한한 값으로 나오지만 그 수치는 아무 것도 뜻하지 않는다.
+    - **diverged**: 정렬 후 ATE 는 유한한 값으로 나오지만 그 수치는 아무 것도
+      뜻하지 않는다.
+
+    발산 판정의 기준은 **진리값 자신** 이다. 예전에는 1 km 짜리 상수였는데,
+    그 숫자는 "실내 45 초 시퀀스가 1 km 를 갈 수는 없다" 는 한 데이터셋에 대한
+    직관이고 KITTI 같은 실외 주행에는 아무 의미가 없다. 게다가 너무 헐거웠다 -
+    `sitting_halfsphere` 에서 마스크 변형이 **48.9 m** 를 돌아다녔는데, 카메라가
+    팔 길이 반경으로 도는 시퀀스에서 그것도 불가능하다. 1 km 아래라는 이유로
+    보통 숫자로 실렸다 (25.22).
+
+    경로 길이 비는 시퀀스마다 스스로 스케일을 갖는다. 실제 오도메트리 드리프트는
+    경로를 늘리는 것이 아니라 굽히는 것이고, 길이를 유지한 채 틀린 방향으로 가는
+    실패는 ATE 가 잡는다.
+
+    문턱 6 배는 추측이 아니라 **측정된 빈 구간에서** 골랐다. 20 시퀀스 x 3 시스템
+    56 개 실행의 비 분포는 두 덩어리로 갈라진다:
+
+        건강한 쪽  0.62 ... 3.67   (최대: nostructure_texture_far / ORB)
+        --------- 빈 구간 ---------
+        실패한 쪽  10.70, 153.03, 7.3e11, 5.0e13
+
+    6 은 그 사이에 있고 로그 척도로 양쪽에서 비슷하게 떨어져 있다 - 최악의 건강한
+    실행보다 1.6 배 위, 가장 가까운 실패보다 1.8 배 아래. 10 을 쓰면 10.70 과 7 %
+    차이가 되는데, 이 저장소가 반복해 적은 대로 **경계에서 재면 재는 것이 현상이
+    아니라 반올림이다** (10.4).
     """
     P = est.positions
     if len(P) < 2:
@@ -187,7 +210,14 @@ def run_status(est: Trajectory) -> str:
     path = float(np.linalg.norm(np.diff(P, axis=0), axis=1).sum())
     if path <= 1e-9:
         return "no_output"
-    if not np.all(np.isfinite(P)) or float(np.abs(P).max()) > 1e3:
+    if not np.all(np.isfinite(P)):
+        return "diverged"
+    if gt is not None and len(gt.positions) >= 2:
+        gt_path = float(np.linalg.norm(np.diff(gt.positions, axis=0), axis=1).sum())
+        if gt_path > 1e-6 and path > 6.0 * gt_path:
+            return "diverged"
+    elif float(np.abs(P).max()) > 1e3:
+        # 진리값이 없을 때만 옛 상수로 물러난다.
         return "diverged"
     return "ok"
 
@@ -331,7 +361,7 @@ def main() -> int:
                 return out
 
             ms = col("ms")
-            status = run_status(est)
+            status = run_status(est, gt)
             entry["runs"][key] = {
                 "ok": True,
                 "status": status,
