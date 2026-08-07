@@ -54,6 +54,7 @@
 #include <iomanip>
 #include <iostream>
 #include <map>
+#include <unordered_map>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -269,7 +270,11 @@ Rigid kabsch(const std::vector<Eigen::Vector3d>& a, const std::vector<Eigen::Vec
 // 점을 깊이순으로 정렬하면 30 만 점에서 프레임당 수십 ms 가 든다. z-버퍼는
 // O(n) 이고 결과가 같다.
 struct Orbit {
-    double yaw{0.6}, pitch{0.40}, dist{1.0};
+    // dist 는 0 으로 시작한다. 0 이 "아직 정해지지 않음" 의 표시이고, 아래
+    // 초기화 분기가 데이터셋에 맞는 거리를 넣는다. 기본값을 1.0 으로 두면
+    // 그 분기가 최초 프레임에 실행되지 않아 실내 장면에서 카메라가 점군
+    // 안쪽에 놓이고, 화면이 통째로 비어 버린다 - 실제로 그렇게 나왔다.
+    double yaw{0.6}, pitch{0.40}, dist{0.0};
     Eigen::Vector3d center{Eigen::Vector3d::Zero()};
 
     // 세계의 "위". TUM/KITTI 의 정답 포즈는 **카메라 좌표계** 라서 +y 가
@@ -301,6 +306,81 @@ struct Splat {
     Eigen::Vector3f p;
     float depth_norm;      // turbo 입력 (0..1)
     float age;             // 0 = 최신, 1 = 가장 오래됨
+    int   seen{0};         // 마지막으로 관측된 프레임. 복셀 병합 시 최신을 남긴다
+};
+
+// ---------------------------------------------------------------------------
+// 복셀 누적 지도
+// ---------------------------------------------------------------------------
+// 왜 링버퍼가 아니라 복셀인가.
+//
+// 프레임마다 5만 점이 들어오므로 링버퍼로는 최근 열 몇 프레임밖에 못 담는다.
+// 그러면 화면에는 "지금 보이는 것" 만 남고 지나온 곳은 사라진다 - 그건 SLAM
+// 이 아니라 깊이 카메라 뷰어다. WME 의 주장 자체가 "세계를 기억한다" 이므로,
+// 지나온 곳이 남지 않는 그림은 그 주장을 보여 주지 못한다.
+//
+// 같은 표면을 다시 보면 같은 복셀에 떨어지므로, 메모리는 지나온 **거리** 가
+// 아니라 실제로 본 **표면적** 에 비례해서 자란다. 상한을 넘으면 복셀을 키워
+// 다시 병합한다 - 잘라내면 지나온 곳이 사라지지만, 키우면 해상도만 낮아진다.
+inline std::int64_t voxKey(const Eigen::Vector3f& p, float inv) {
+    const auto q = [inv](float v) {
+        return static_cast<std::int64_t>(std::floor(static_cast<double>(v) * inv));
+    };
+    // 축당 21 비트 = +-1,048,576 복셀. 0.3 m 복셀이면 +-314 km 로 충분하다.
+    return ((q(p.x()) & 0x1FFFFF) << 42) |
+           ((q(p.y()) & 0x1FFFFF) << 21) |
+            (q(p.z()) & 0x1FFFFF);
+}
+
+struct VoxelMap {
+    std::unordered_map<std::int64_t, Splat> cells;
+    float voxel{0.3f};     // m
+    int   grown{0};        // 상한 때문에 복셀을 키운 횟수
+
+    void clear() { cells.clear(); grown = 0; }
+
+    void insert(const Splat& s, std::size_t cap) {
+        cells[voxKey(s.p, 1.0f / voxel)] = s;
+        if (cells.size() > cap) coarsen();
+    }
+
+    // 복셀 두 배로 키우고 전부 다시 담는다.
+    void coarsen() {
+        voxel *= 2.0f;
+        ++grown;
+        std::unordered_map<std::int64_t, Splat> next;
+        next.reserve(cells.size() / 2 + 1);
+        const float inv = 1.0f / voxel;
+        for (const auto& [k, v] : cells) {
+            auto& slot = next[voxKey(v.p, inv)];
+            // 같은 복셀이면 더 최근에 본 쪽을 남긴다.
+            if (slot.seen <= v.seen) slot = v;
+        }
+        cells.swap(next);
+    }
+};
+
+// 월드에 고정되는 물체 기억. 지나온 곳에서 본 물체가 그 자리에 남는다.
+//
+// **관측마다 위치를 덮어쓰면 안 된다.** 그러면 카메라가 움직일 때마다 물체가
+// 따라 움직이는 것처럼 보인다 - 월드에 고정된 기억이 아니라 그때그때의 관측을
+// 다시 그리는 것이 된다. 여러 관측의 평균을 유지해야 자리에 가만히 있는다.
+struct MemoryObject {
+    std::string cls;
+    Eigen::Vector3d sum_c{Eigen::Vector3d::Zero()};    // 관측 중심의 합
+    Eigen::Vector3d sum_s{Eigen::Vector3d::Zero()};    // 관측 크기의 합
+    int    seen{0};        // 마지막 관측 프레임
+    int    count{0};       // 몇 번 봤는가. 여러 번 본 것일수록 진하게 그린다
+
+    Eigen::Vector3d center() const { return sum_c / std::max(1, count); }
+    Eigen::Vector3d size()   const { return sum_s / std::max(1, count); }
+
+    void observe(const Eigen::Vector3d& c, const Eigen::Vector3d& sz, int frame) {
+        sum_c += c;
+        sum_s += sz;
+        ++count;
+        seen = frame;
+    }
 };
 
 class CloudView {
@@ -371,6 +451,98 @@ public:
         const cv::Point pb(static_cast<int>(cx + f * vb.x() / vb.z()),
                            static_cast<int>(cy - f * vb.y() / vb.z()));
         cv::line(img_, pa, pb, col, th, cv::LINE_AA);
+    }
+
+    // 복셀 격자를 **선으로 이어** 표면처럼 보이게 한다.
+    //
+    // 점만 찍으면 밀도가 낮은 곳이 빈 공간처럼 보이고, 무엇이 벽이고 무엇이
+    // 흩어진 잡음인지 구분되지 않는다. 이웃한 복셀이 있을 때만 선을 그으면
+    // 연결된 표면에서만 격자가 생기므로, 구조가 있는 곳과 없는 곳이 갈린다.
+    //
+    // 이웃 판정은 +x/+y/+z 세 방향만 본다. 여섯 방향을 다 보면 같은 선을 두 번
+    // 긋게 된다. basis 와 eye 는 한 번만 계산한다 - 선마다 다시 구하면 수만 번
+    // 행렬 곱이 돈다.
+    void lattice(const std::unordered_map<std::int64_t, Splat>& cells, float voxel,
+                 const Orbit& orb, double f, double fade) {
+        const Eigen::Matrix3d M = orb.basis();
+        const Eigen::Vector3d eye = orb.center - M.row(2).transpose() * orb.dist;
+        const double cx = img_.cols * 0.5, cy = img_.rows * 0.5;
+        const float inv = 1.0f / voxel;
+
+        auto toScreen = [&](const Eigen::Vector3f& p, cv::Point& out) {
+            const Eigen::Vector3d v = M * (p.cast<double>() - eye);
+            if (v.z() < 1e-3) return false;
+            out = {static_cast<int>(cx + f * v.x() / v.z()),
+                   static_cast<int>(cy - f * v.y() / v.z())};
+            return true;
+        };
+
+        static const Eigen::Vector3f kStep[3] = {
+            {1.f, 0.f, 0.f}, {0.f, 1.f, 0.f}, {0.f, 0.f, 1.f}};
+
+        for (const auto& [key, v] : cells) {
+            cv::Point pa;
+            if (!toScreen(v.p, pa)) continue;
+            cv::Scalar col = turbo(v.depth_norm);
+            const double a = 1.0 - fade * static_cast<double>(v.age);
+            col = {col[0] * a + C_BG[0] * (1 - a),
+                   col[1] * a + C_BG[1] * (1 - a),
+                   col[2] * a + C_BG[2] * (1 - a)};
+            for (const auto& d : kStep) {
+                const auto it = cells.find(voxKey(v.p + d * voxel, inv));
+                if (it == cells.end()) continue;
+                cv::Point pb;
+                if (!toScreen(it->second.p, pb)) continue;
+                // 화면 밖으로 크게 벗어난 선은 그리지 않는다. 투영이 튀면
+                // 화면을 가로지르는 긴 선이 생겨 없는 구조를 만들어 낸다.
+                if (std::abs(pa.x - pb.x) > img_.cols / 3 ||
+                    std::abs(pa.y - pb.y) > img_.rows / 3) continue;
+                cv::line(img_, pa, pb, col, 1, cv::LINE_AA);
+            }
+        }
+    }
+
+    // 3D 점을 화면 좌표로. 카메라 뒤면 false.
+    // 라벨처럼 2D 로 그려야 하는 것들이 이걸 쓴다.
+    bool project3(const Eigen::Vector3d& p, const Orbit& orb, double f,
+                  cv::Point& out) const {
+        const Eigen::Matrix3d M = orb.basis();
+        const Eigen::Vector3d eye = orb.center - M.row(2).transpose() * orb.dist;
+        const Eigen::Vector3d v = M * (p - eye);
+        if (v.z() < 1e-3) return false;
+        out = {static_cast<int>(img_.cols * 0.5 + f * v.x() / v.z()),
+               static_cast<int>(img_.rows * 0.5 - f * v.y() / v.z())};
+        return true;
+    }
+
+    // 지면 투영 발자국(footprint). 항공뷰에서 물체의 점유 면적을 읽는 단위다.
+    // 상자만 그리면 위에서 볼 때 선 네 개로 뭉개지고, 무엇이 어디를 차지하는지
+    // 알 수 없다 - 자율주행 BEV 시각화가 늘 발자국을 그리는 이유다.
+    void footprint(const Eigen::Isometry3d& T, const Eigen::Vector3d& c,
+                   const Eigen::Vector3d& s, const Eigen::Vector3d& up,
+                   const Orbit& orb, double f, const cv::Scalar& col, int th = 2) {
+        // 발자국은 **지면 평면 위** 사각형이다. up 에 수직인 두 축으로 만든다 -
+        // 카메라계 축을 그대로 쓰면 물체가 기울어진 판처럼 보인다.
+        Eigen::Vector3d a = up.cross(Eigen::Vector3d::UnitZ());
+        if (a.norm() < 1e-6) a = up.cross(Eigen::Vector3d::UnitX());
+        a.normalize();
+        const Eigen::Vector3d b = up.cross(a).normalized();
+        const double hw = 0.5 * std::max(s.x(), 0.05);
+        const double hl = 0.5 * std::max(s.z(), 0.05);
+        // 물체 바닥으로 내린다.
+        const Eigen::Vector3d base = c - up * (0.5 * s.y());
+        const Eigen::Vector3d q[4] = {
+            T * (base + a * hw + b * hl), T * (base + a * hw - b * hl),
+            T * (base - a * hw - b * hl), T * (base - a * hw + b * hl)};
+        for (int i = 0; i < 4; ++i) line3(q[i], q[(i + 1) % 4], orb, f, col, th);
+    }
+
+    // 속도 벡터. 화살촉까지 그려 방향이 보이게 한다.
+    void arrow3(const Eigen::Vector3d& a, const Eigen::Vector3d& b,
+                const Orbit& orb, double f, const cv::Scalar& col, int th = 2) {
+        cv::Point pa, pb;
+        if (!project3(a, orb, f, pa) || !project3(b, orb, f, pb)) return;
+        cv::arrowedLine(img_, pa, pb, col, th, cv::LINE_AA, 0, 0.3);
     }
 
     // 3D 상자 (차량/사람). 12 개 모서리를 그린다.
@@ -639,6 +811,7 @@ int main(int argc, char** argv) {
     std::string shot_path;
     int shot_frame = 0;
     int cloud_cap = 260000;
+    int start_cam = 0;      // 0 추격 / 1 항공 / 2 자유
 
     for (int i = 1; i + 1 < argc; i += 2) {
         const std::string k = argv[i];
@@ -648,6 +821,7 @@ int main(int argc, char** argv) {
         else if (k == "--screenshot") shot_path = argv[i + 1];
         else if (k == "--frame") shot_frame = std::atoi(argv[i + 1]);
         else if (k == "--cloud-cap") cloud_cap = std::atoi(argv[i + 1]);
+        else if (k == "--cam") start_cam = std::atoi(argv[i + 1]);
     }
 
     const fs::path scene_dir = fs::path(manifest).parent_path();
@@ -670,13 +844,26 @@ int main(int argc, char** argv) {
     int pick[2] = {0, 1};          // 각 패널이 보여 줄 시스템 인덱스
     bool playing = autoplay;
     int shot = 0;
-    int view_mode = 0;             // 0 = 점군, 1 = 궤적
+    // 카메라 모드. 0 = 추격(진행 방향), 1 = 항공(바로 위에서), 2 = 자유.
+    //   추격: 지금 무엇을 보고 있는가. 점군의 구조가 잘 읽힌다.
+    //   항공: 무엇이 어디를 차지하는가. 물체 배치와 궤적 형상이 잘 읽힌다.
+    // 둘은 서로 다른 질문에 답하므로 한쪽으로 고정하지 않는다.
+    int cam_mode = start_cam;
+    constexpr bool kDrawCloud = true;
 
     Orbit orb;
     double user_yaw = 0.0;         // A/D 가 더하는 시선 오프셋
+    double base_dist = 0.0;        // 모드 전환 시 되돌아갈 기준 거리
+    Eigen::Vector3d ego_pos = Eigen::Vector3d::Zero();   // 지금 프레임의 자차 위치
+    bool   user_zoomed = false;    // W/S 를 눌렀으면 자동 거리 조정을 멈춘다
+    bool   show_mesh = true;       // 표면 격자 (M 으로 토글)
     cv::Mat canvas(WIN_H, WIN_W, CV_8UC3);
     CloudView cloud[2];
-    std::deque<Splat> acc[2];
+    VoxelMap acc[2];
+    // 표면 격자용 굵은 복셀. acc 를 그대로 이으면 선분이 300 만 개가
+    // 되어 프레임을 못 채운다. 구조를 보여 주는 데는 성긴 격자로 충분하다.
+    VoxelMap mesh[2];
+    std::vector<MemoryObject> mem[2];
     int acc_frame[2] = {-1, -1};
     std::vector<double> err_series[2];
 
@@ -709,34 +896,55 @@ int main(int argc, char** argv) {
             const int j = nearestIdx(s.gt, stamp);
             const Eigen::Vector3d target = (j >= 0)
                 ? s.gt[static_cast<std::size_t>(j)].p : Eigen::Vector3d::Zero();
-            // 부드럽게 따라간다. 즉시 스냅하면 화면이 튄다.
-            orb.center = (acc_frame[0] < 0) ? target : orb.center * 0.85 + target * 0.15;
+            ego_pos = target;
+
+            // 시점은 **인식 시점(자차)에 고정** 한다.
+            //
+            // 자차를 화면 중앙에 두고, 시선 방향은 흔들지 않는다. 두 가지를
+            // 각각 틀려 봤다:
+            //   - 궤적 전체 중심에 고정 -> 자차가 화면 구석으로 밀려나 지금
+            //     무엇을 보고 있는지 알 수 없다.
+            //   - 진행 방향을 따라 yaw 를 돌림 -> 코너마다 화면이 통째로 회전해
+            //     쌓인 지도가 읽히지 않는다.
+            // 자차 중앙 + 고정 방위가 자율주행 BEV 의 기본형인 이유가 이것이다.
+            orb.center = (acc_frame[0] < 0) ? target
+                                            : orb.center * 0.80 + target * 0.20;
             if (orb.dist <= 0.0) {
                 // 장면이 화면을 채우는 거리. 유효 깊이 상한(KITTI 80 m)을 그대로
                 // 쓰면 너무 멀어 점군이 먼지처럼 보인다.
-                orb.dist = (s.dataset == "kitti") ? 46.0 : 4.6;
+                orb.dist = (s.dataset == "kitti") ? 70.0 : 5.0;
+                base_dist = orb.dist;
+
+                // 세계의 "위" 는 데이터셋마다 다르다. 하나로 고정하면 한쪽에서
+                // 카메라가 옆으로 누워 점군이 화면 구석으로 밀려난다.
+                //   KITTI: 정답 포즈가 **카메라 좌표계** 라 +y 가 아래 -> up = -y
+                //   TUM  : 정답 포즈가 모션캡처 **월드 좌표계** 이고 z 가 위
+                orb.world_up = (s.dataset == "kitti") ? Eigen::Vector3d(0, -1, 0)
+                                                      : Eigen::Vector3d(0, 0, 1);
+                // 표면 격자는 성기게. 촘촘하면 선이 뭉쳐 면처럼 뭉개진다.
+                mesh[0].voxel = mesh[1].voxel =
+                    (s.dataset == "kitti") ? 2.2f : 0.16f;
             }
-            // 시선을 **진행 방향에 건다.** 고정 yaw 를 쓰면 장면이 돌 때마다
-            // 옆이나 뒤를 보게 되고, 그러면 점군이 "지금 무엇을 보고 있는가" 를
-            // 말해 주지 못한다. 자율주행 시각화가 자차 뒤 위에서 진행 방향을
-            // 보는 것과 같은 이유다.
-            if (j > 2 && j + 2 < static_cast<int>(s.gt.size())) {
-                const Eigen::Vector3d fwd =
-                    s.gt[static_cast<std::size_t>(j + 2)].p
-                    - s.gt[static_cast<std::size_t>(j - 2)].p;
-                if (fwd.norm() > 1e-6) {
-                    // 중심을 진행 방향으로 조금 밀어 둔다. 자차를 화면 한가운데
-                    // 두면 앞쪽(=지금 보고 있는 곳)이 절반밖에 안 남는다.
-                    const double lead = (s.dataset == "kitti") ? 14.0 : 1.2;
-                    orb.center += fwd.normalized() * lead;
-                    const double want = std::atan2(fwd.x(), fwd.z());
-                    // 최단 회전으로 감아 들어간다 (±pi 경계에서 튀지 않게).
-                    double d = want + user_yaw - orb.yaw;
-                    while (d >  3.14159265) d -= 6.28318531;
-                    while (d < -3.14159265) d += 6.28318531;
-                    orb.yaw += (acc_frame[0] < 0) ? d : d * 0.2;
-                }
+
+            // 카메라 모드별 시선각. 항공뷰는 거의 수직으로 내려다보되 완전한
+            // 90 도는 피한다 - 정확히 수직이면 지면 위 높이가 전부 한 점에
+            // 겹쳐 물체의 높이 정보가 사라진다.
+            //   0 MAP   비스듬히 내려다보는 고정 지도. 구조와 높이가 같이 보인다
+            //   1 BIRD  거의 수직. 배치와 궤적 형상이 가장 잘 읽힌다
+            //   2 CHASE 자차 추종. "지금 무엇을 보고 있는가"
+            const double want_pitch = (cam_mode == 1) ? 1.30
+                                    : (cam_mode == 0) ? 0.85 : 0.40;
+            // headless 는 루프를 한 번만 돈다. 보간만 하면 목표각에
+            // 도달하지 못한 그림이 저장된다.
+            orb.pitch += (want_pitch - orb.pitch) * (headless ? 1.0 : 0.25);
+            if (cam_mode == 1 && !user_zoomed) {
+                // 위에서 보면 같은 거리라도 훨씬 좁은 영역만 담긴다.
+                orb.dist = base_dist * 1.1;
             }
+            // yaw 는 사용자 조작(A/D)에만 반응한다. 진행 방향을 따라
+            // 돌리면 코너마다 지도가 통째로 회전해서, 무엇이 쌓였는지가 아니라
+            // 차가 어느 쪽을 향하는지만 보이게 된다.
+            orb.yaw = 0.6 + user_yaw;
         }
 
         // 두 카드의 오차 그래프가 같은 세로 스케일을 쓰도록 여기서 잡는다.
@@ -782,7 +990,7 @@ int main(int argc, char** argv) {
             const Run& run = s.runs.at(sys);
 
             // 카드 머리
-            label(canvas, k == 0 ? "left  /model 1" : "right  /model 2",
+            label(canvas, k == 0 ? "left  /  existing slam" : "right  /  worldvision (this project)",
                   {box.x + 18, box.y + 28}, C_INK3);
             text(canvas, run.label, {box.x + 18, box.y + 58}, T_TITLE, accent, 2);
             {
@@ -796,10 +1004,29 @@ int main(int argc, char** argv) {
             const cv::Rect vp(box.x + 14, box.y + 74, box.width - 28, vp_h);
             cloud[k].reset(vp.width, vp.height);
 
+            // **왼쪽에는 세계 모델이 없다.**
+            //
+            // ORB+PnP 는 포즈를 추정할 뿐 세계를 기억하지 않는다. 누적 지도도,
+            // 물체 토큰도, 평면도 그 파이프라인의 산출물이 아니다. 그것들을
+            // 양쪽에 똑같이 그리면 WME 의 기능을 대조군에 공짜로 붙여 주는
+            // 것이고, 비교의 대상 자체가 지워진다.
+            //
+            // 그래서 descriptor 계열은 **지금 프레임의 성긴 점만** 보여 준다.
+            // ORB 가 프레임당 다루는 1000 점 규모에 맞춘 것이고, 프레임이
+            // 지나가면 사라진다 - 실제로 그 파이프라인이 남기는 것이 없다.
+            const bool has_memory = (run.kind != "descriptor");
+
             // 점군 누적. 프레임이 뒤로 가면 다시 쌓는다.
-            if (view_mode == 0) {
-                if (acc_frame[k] > frame || acc_frame[k] < 0) {
+            if (kDrawCloud) {
+                if (!has_memory) {
+                    // 기억이 없으므로 매 프레임 지운다. 지금 프레임만 남는다.
                     acc[k].clear();
+                    mesh[k].clear();
+                    mem[k].clear();
+                    acc_frame[k] = frame - 1;
+                } else if (acc_frame[k] > frame || acc_frame[k] < 0) {
+                    acc[k].clear();
+                    mesh[k].clear();
                     acc_frame[k] = -1;
                 }
                 const int from = acc_frame[k] + 1;
@@ -821,20 +1048,94 @@ int main(int argc, char** argv) {
                     std::vector<Splat> pts;
                     const double cmin = (s.dataset == "kitti") ? 4.0 : 0.6;
                     const double cmax = (s.dataset == "kitti") ? 24.0 : 3.6;
+                    // 기억이 없는 쪽은 성기게. ORB 가 프레임당 쓰는 점 수에 맞춘다.
+                    const int stride = has_memory ? (s.dataset == "kitti" ? 3 : 2)
+                                                  : (s.dataset == "kitti" ? 22 : 16);
                     backProject(d16, s.calib, run.aligned[static_cast<std::size_t>(pi)],
-                                s.dataset == "kitti" ? 3 : 2,
+                                stride,
                                 s.calib.depth_min, s.calib.depth_max, cmin, cmax, pts);
-                    for (auto& p : pts) acc[k].push_back(p);
-                    while (static_cast<int>(acc[k].size()) > cloud_cap) acc[k].pop_front();
+                    // 색을 **관측 거리가 아니라 월드 높이** 로 다시 칠한다.
+                    //
+                    // 누적 지도에서 "카메라로부터 몇 m" 는 지도의 성질이 아니라
+                    // 그때 어디서 봤는지의 성질이다. 같은 벽을 멀리서 한 번,
+                    // 가까이서 한 번 보면 색이 달라지고, 전진하는 차량은 먼
+                    // 관측을 훨씬 많이 만들어 내므로 지도 전체가 붉게 덮인다 -
+                    // 실제로 그렇게 나왔다.
+                    //
+                    // 높이는 월드에 고정된 값이라 언제 어디서 봐도 같다. 그래서
+                    // 노면은 낮고 건물은 높은, 구조가 읽히는 지도가 된다.
+                    const double h0 = (s.dataset == "kitti") ? -1.8 : -0.6;
+                    const double h1 = (s.dataset == "kitti") ?  6.0 :  1.6;
+                    const Eigen::Vector3f up_f = orb.world_up.cast<float>();
+                    const float ego_h = static_cast<float>(ego_pos.dot(orb.world_up));
+                    for (auto& p : pts) {
+                        const float h = p.p.dot(up_f) - ego_h;
+                        p.depth_norm = static_cast<float>(
+                            std::clamp((h - h0) / (h1 - h0), 0.0, 1.0));
+                        p.seen = fi;
+                        acc[k].insert(p, static_cast<std::size_t>(cloud_cap));
+                        mesh[k].insert(p, 120000);
+                    }
+
+                    // 이 프레임에서 본 물체를 월드에 **남긴다.** 지나온 곳의
+                    // 물체가 그 자리에 계속 있어야 "세계를 기억한다" 가 화면에
+                    // 보인다. 같은 자리의 같은 클래스는 하나로 합치고, 몇 번
+                    // 봤는지를 센다 - 여러 번 본 것일수록 확실한 관측이다.
+                    if (has_memory && !s.boxes.empty()) {
+                        const Eigen::Isometry3d& Tw =
+                            run.aligned[static_cast<std::size_t>(pi)];
+                        // 병합 반경. 복셀 키에 클래스 해시를 섞으면 인접 판정이
+                        // 깨져 같은 물체가 여러 개로 늘어선다 - 실제로 그렇게
+                        // 나왔다. 물체 수는 수백 개뿐이므로 최근접 탐색으로
+                        // 같은 클래스 중 가장 가까운 것에 합친다.
+                        const double merge_r = (s.dataset == "kitti") ? 2.5 : 0.35;
+                        for (const auto& b : s.boxes) {
+                            if (b.frame != fi) continue;
+                            const double mx = b.size.maxCoeff();
+                            if (!(mx > 0.2) || mx > 14.0) continue;
+                            const Eigen::Vector3d wc = Tw * b.center;
+
+                            MemoryObject* hit = nullptr;
+                            double bestd = merge_r;
+                            for (auto& m : mem[k]) {
+                                if (m.cls != b.cls) continue;
+                                const double d = (m.center() - wc).norm();
+                                if (d < bestd) { bestd = d; hit = &m; }
+                            }
+                            if (hit == nullptr) {
+                                MemoryObject m;
+                                m.cls = b.cls;
+                                m.observe(wc, b.size, fi);
+                                mem[k].push_back(std::move(m));
+                            } else {
+                                hit->observe(wc, b.size, fi);
+                            }
+                        }
+                    }
                 }
                 acc_frame[k] = frame;
 
-                std::vector<Splat> flat(acc[k].begin(), acc[k].end());
-                const auto n = static_cast<double>(std::max<std::size_t>(1, flat.size()));
-                for (std::size_t i = 0; i < flat.size(); ++i) {
-                    flat[i].age = static_cast<float>(1.0 - static_cast<double>(i) / n);
+                std::vector<Splat> flat;
+                flat.reserve(acc[k].cells.size());
+                for (const auto& [key, v] : acc[k].cells) flat.push_back(v);
+                // age 는 최근성이다. 오래 전에 본 표면은 배경으로 가라앉혀
+                // 지금 보고 있는 것과 구분한다 - 지우지는 않는다.
+                const double span = std::max(1, frame);
+                for (auto& v : flat) {
+                    v.age = static_cast<float>(
+                        std::clamp(1.0 - static_cast<double>(v.seen) / span, 0.0, 1.0));
                 }
-                cloud[k].draw(flat, orb, vp.width * 0.9, 0.55);
+                cloud[k].draw(flat, orb, vp.width * 0.9, 0.62);
+                // 점 위에 표면 격자를 덧그린다. 순서가 중요하다 - 먼저 그리면
+                // 점군이 격자를 덮어 아무 것도 이어져 보이지 않는다.
+                if (show_mesh && has_memory) {
+                    for (auto& v : mesh[k].cells) {
+                        v.second.age = static_cast<float>(std::clamp(
+                            1.0 - static_cast<double>(v.second.seen) / span, 0.0, 1.0));
+                    }
+                    cloud[k].lattice(mesh[k].cells, mesh[k].voxel, orb,
+                                     vp.width * 0.9, 0.72);
+                }
             }
 
             // 궤적 (정답 + 추정)
@@ -843,7 +1144,10 @@ int main(int argc, char** argv) {
             // 거리 링. 간격은 장면 규모에서 정한다 - 실내 0.5 m, 도로 10 m.
             {
                 const double step = (s.dataset == "kitti") ? 10.0 : 0.5;
-                cloud[k].rangeRings(orb.center, orb.world_up, orb, f3, step, 5,
+                // **인식하는 그 시점** 에 링을 건다. 화면 중심(고정 지도의
+                // 중심)에 그리면 링이 자차와 따로 놀아서 "지금 어디서 무엇을
+                // 보고 있는가" 를 전혀 말해 주지 못한다.
+                cloud[k].rangeRings(ego_pos, orb.world_up, orb, f3, step, 5,
                                     cv::Scalar(78, 62, 50));
             }
 
@@ -863,7 +1167,7 @@ int main(int argc, char** argv) {
                 // 평면(건물 벽/지면)과 물체 상자(차량/사람)를 **이 시스템의
                 // 추정 포즈** 로 옮겨 그린다. 같은 관측이므로 두 패널의 차이는
                 // 곧 포즈 차이다 - 점군보다 훨씬 읽기 쉽다.
-                if (upto > 0 && (!s.planes.empty() || !s.boxes.empty())) {
+                if (has_memory && upto > 0 && (!s.planes.empty() || !s.boxes.empty())) {
                     const Eigen::Isometry3d& T = run.aligned[static_cast<std::size_t>(upto - 1)];
 
                     // **지금 프레임 하나만** 그린다. 여러 프레임을 겹쳐 그리면
@@ -898,15 +1202,47 @@ int main(int argc, char** argv) {
                         }
                     }
 
+                    // --- 기억된 물체 (지나온 곳에 남는 것) ---
+                    // 월드에 고정된 좌표이므로 자차가 지나가도 그 자리에 남는다.
+                    // 지금 프레임에서 다시 보이는 것은 아래에서 진하게 덧그린다.
+                    for (const auto& m : mem[k]) {
+                        if (m.cls.empty() || m.count < 2) continue;   // 한 번뿐인 것은 잡음
+                        const bool vehicle = (m.cls == "car" || m.cls == "truck" ||
+                                              m.cls == "bus" || m.cls == "motorcycle" ||
+                                              m.cls == "bicycle" || m.cls == "train");
+                        const bool person = (m.cls == "person");
+                        const cv::Scalar base = vehicle ? accent
+                                              : (person ? C_WARN : C_INK3);
+                        // 오래 전에 본 것일수록 어둡게. 지우지는 않는다 -
+                        // 기억이 사라지는 것과 흐려지는 것은 다르다.
+                        const double a = std::clamp(
+                            0.30 + 0.70 * static_cast<double>(m.seen) /
+                                   std::max(1, frame), 0.25, 1.0);
+                        const cv::Scalar col{base[0] * a + C_BG[0] * (1 - a),
+                                             base[1] * a + C_BG[1] * (1 - a),
+                                             base[2] * a + C_BG[2] * (1 - a)};
+                        // 이미 월드 좌표이므로 항등 변환으로 그린다.
+                        cloud[k].footprint(Eigen::Isometry3d::Identity(), m.center(),
+                                           m.size(), orb.world_up, orb, f3, col, 1);
+                    }
+
                     if (snap >= 0) {
                         for (const auto& q : s.planes) {
                             if (q.frame != snap || q.conf < 0.25) continue;
                             // extent 는 평면 위 점들의 **평균 산포** 다. 그대로
                             // 반지름으로 쓰면 실제 패치보다 훨씬 커 보인다.
-                            const double half = std::clamp(q.extent, 0.3, 5.0);
+                            const double half = std::clamp(q.extent, 0.3,
+                                           s.dataset == "kitti" ? 5.0 : 1.2);
                             cloud[k].planeQuad(Tsnap, q.centroid, q.normal, half, orb, f3,
                                                cv::Scalar(122, 100, 82));
                         }
+                        // 이전 내보내기 프레임을 찾아 둔다. 같은 물체의
+                        // 프레임 간 이동이 곧 속도 벡터가 된다.
+                        int prev_snap = -1;
+                        for (const auto& b : s.boxes) {
+                            if (b.frame < snap && b.frame > prev_snap) prev_snap = b.frame;
+                        }
+
                         for (const auto& b : s.boxes) {
                             if (b.frame != snap) continue;
                             // 물리적으로 말이 되는 크기만. 검출 상자 안이 배경이면
@@ -919,7 +1255,45 @@ int main(int argc, char** argv) {
                             const bool person = (b.cls == "person");
                             const cv::Scalar col = vehicle ? accent
                                                  : (person ? C_WARN : C_INK3);
-                            cloud[k].box3(Tsnap, b.center, b.size, orb, f3, col, 2);
+
+                            cloud[k].box3(Tsnap, b.center, b.size, orb, f3, col, 1);
+                            // 지면 발자국. 항공뷰에서는 이것이 물체의 본체다.
+                            cloud[k].footprint(Tsnap, b.center, b.size, orb.world_up,
+                                               orb, f3, col, 2);
+
+                            // 속도 벡터: 직전 내보내기 프레임에서 가장 가까운
+                            // 같은 클래스 상자와 이어 붙인다. 추적기가 아니라
+                            // 최근접 연관이므로, 밀집 구간에서는 틀릴 수 있다 -
+                            // 그래서 화면에도 "nearest-match" 라고 적어 둔다.
+                            if (prev_snap >= 0) {
+                                const SceneBox* match = nullptr;
+                                double bd = 4.0;
+                                for (const auto& q : s.boxes) {
+                                    if (q.frame != prev_snap || q.cls != b.cls) continue;
+                                    const double d = (q.center - b.center).norm();
+                                    if (d < bd) { bd = d; match = &q; }
+                                }
+                                if (match != nullptr && bd > 0.15) {
+                                    const Eigen::Vector3d a = Tsnap * match->center;
+                                    const Eigen::Vector3d e = Tsnap * b.center;
+                                    // 3 배로 늘려 그린다. 실제 이동량은 짧아서
+                                    // 화면에서 방향이 보이지 않는다.
+                                    cloud[k].arrow3(e, e + (e - a) * 3.0, orb, f3, col, 2);
+                                }
+                            }
+
+                            // 클래스 라벨. 무엇을 잡았는지 화면에서 읽혀야
+                            // "물체를 인식한다" 는 주장이 확인 가능해진다.
+                            cv::Point at;
+                            const Eigen::Vector3d top =
+                                Tsnap * (b.center - Eigen::Vector3d(0, 0.5 * b.size.y(), 0));
+                            if (cloud[k].project3(top, orb, f3, at)) {
+                                at.x += vp.x; at.y += vp.y - 6;
+                                if (at.x > vp.x && at.x < vp.x + vp.width - 60 &&
+                                    at.y > vp.y + 12 && at.y < vp.y + vp.height) {
+                                    text(canvas, b.cls, at, T_LABEL, col, 1);
+                                }
+                            }
                         }
                     }
                 }
@@ -966,19 +1340,30 @@ int main(int argc, char** argv) {
 
             // 범례. 점군 위에 그냥 얹으면 배경색이 제각각이라 읽히지 않는다.
             {
-                const cv::Rect scrim(vp.x, vp.y, 470,
-                                     (s.boxes.empty() && s.planes.empty()) ? 74 : 94);
+                const cv::Rect scrim(vp.x, vp.y, 500,
+                                     (s.boxes.empty() && s.planes.empty()) ? 74 : 112);
                 cv::Mat roi = canvas(scrim & cv::Rect(0, 0, canvas.cols, canvas.rows));
                 roi *= 0.35;
                 label(canvas, "ground truth", {vp.x + 14, vp.y + 24}, C_GT, T_MICRO, 1);
                 label(canvas, "estimate  rigidly aligned, scale untouched",
                       {vp.x + 14, vp.y + 44}, accent, T_MICRO, 1);
-                label(canvas, "cloud = depth back-projected by this system's pose",
+                label(canvas, has_memory ? "map = depth back-projected by this system's pose, accumulated"
+                         : "points = depth back-projected by this system's pose",
                       {vp.x + 14, vp.y + 64}, C_INK2, T_MICRO, 1);
-                if (!s.boxes.empty() || !s.planes.empty()) {
-                    std::ostringstream ss;
-                    ss << "boxes = detected objects (tier 1)   quads = planes (tier 2)";
-                    label(canvas, ss.str(), {vp.x + 14, vp.y + 84}, C_INK3, T_MICRO, 1);
+                if (!has_memory) {
+                    label(canvas,
+                          "pose only - this pipeline keeps no world model",
+                          {vp.x + 14, vp.y + 84}, C_WARN, T_MICRO, 1);
+                    label(canvas,
+                          "sparse points, current frame only. nothing persists",
+                          {vp.x + 14, vp.y + 102}, C_INK3, T_MICRO, 1);
+                } else if (!s.boxes.empty() || !s.planes.empty()) {
+                    label(canvas,
+                          "persistent map + objects (tier 1) + planes (tier 2)",
+                          {vp.x + 14, vp.y + 84}, C_INK2, T_MICRO, 1);
+                    label(canvas,
+                          "arrows = frame-to-frame motion, nearest-match (not a tracker)",
+                          {vp.x + 14, vp.y + 102}, C_INK3, T_MICRO, 1);
                 }
             }
 
@@ -1046,6 +1431,7 @@ int main(int argc, char** argv) {
         // 하단 바
         // ---------------------------------------------------------------
         const int fy = WIN_H - BOTTOM_H;
+        constexpr int W_MODE_X = WIN_W - 320;
         fill(canvas, {0, fy, WIN_W, BOTTOM_H}, C_RAISED);
         fill(canvas, {0, fy, WIN_W, 1}, C_LINE);
 
@@ -1059,6 +1445,10 @@ int main(int argc, char** argv) {
             std::ostringstream ss;
             ss << "FRAME " << (frame + 1) << " / " << nframes;
             text(canvas, ss.str(), {PAD, fy + 58}, T_BODY, C_INK);
+            const char* mode = (cam_mode == 1) ? "BIRD'S EYE"
+                             : (cam_mode == 2) ? "CHASE" : "MAP";
+            label(canvas, "camera", {W_MODE_X, fy + 40}, C_INK3);
+            text(canvas, mode, {W_MODE_X, fy + 62}, T_BODY, C_INK2);
             const std::string st = playing ? "RUNNING" : "PAUSED";
             text(canvas, st, {WIN_W - PAD - textW(st, T_BODY, 1), fy + 58}, T_BODY,
                  playing ? C_GOOD : C_INK3);
@@ -1090,7 +1480,7 @@ int main(int argc, char** argv) {
             label(canvas, "controls", {hx, fy + 72}, C_INK3);
             text(canvas, "SPACE play    , . step    N/P sequence    1/2 swap model",
                  {hx, fy + 100}, T_BODY, C_INK2);
-            text(canvas, "A/D orbit     W/S zoom    R restart        F screenshot    Q quit",
+            text(canvas, "A/D orbit     W/S zoom    V camera (chase/bird)    R restart    F shot    Q quit",
                  {hx, fy + 126}, T_BODY, C_INK2);
         }
         {
@@ -1102,6 +1492,17 @@ int main(int argc, char** argv) {
         }
 
         if (headless) {
+            // 왜 비었는지 사후에 물어볼 수 있어야 한다. 화면이 검은 것과
+            // 데이터가 없는 것은 그림만 봐서는 구분되지 않는다.
+            for (int k = 0; k < 2; ++k) {
+                std::cerr << "  패널 " << k << ": 복셀 " << acc[k].cells.size()
+                          << " (" << acc[k].voxel << " m, coarsen " << acc[k].grown << ")"
+                          << ", 기억물체 " << mem[k].size()
+                          << ", 평면 " << s.planes.size()
+                          << ", 상자 " << s.boxes.size()
+                          << ", orbit dist " << orb.dist
+                          << " pitch " << orb.pitch << "\n";
+            }
             if (!cv::imwrite(shot_path, canvas)) {
                 std::cerr << "스크린샷 저장 실패: " << shot_path << "\n";
                 return 1;
@@ -1116,24 +1517,31 @@ int main(int argc, char** argv) {
 
         if (key == 'q' || key == 'Q' || key == 27) break;
         else if (key == ' ') playing = !playing;
-        else if (key == 'r' || key == 'R') { frame = 0; acc_frame[0] = acc_frame[1] = -1; }
-        else if (key == 'v' || key == 'V') { view_mode = 1 - view_mode; }
+        else if (key == 'r' || key == 'R') { frame = 0; acc_frame[0] = acc_frame[1] = -1;
+            mem[0].clear(); mem[1].clear(); acc[0].clear(); acc[1].clear();
+            mesh[0].clear(); mesh[1].clear(); }
+        else if (key == 'v' || key == 'V') { cam_mode = (cam_mode + 1) % 3; }
+        else if (key == 'm' || key == 'M') show_mesh = !show_mesh;
         else if (key == 'n' || key == 'N') {
             si = (si + 1) % static_cast<int>(seqs.size());
-            frame = 0; acc_frame[0] = acc_frame[1] = -1; orb.dist = 0.0;
+            frame = 0; acc_frame[0] = acc_frame[1] = -1; orb.dist = 0.0; user_zoomed = false;
+            mem[0].clear(); mem[1].clear(); acc[0].clear(); acc[1].clear();
+            mesh[0].clear(); mesh[1].clear();
         } else if (key == 'p' || key == 'P') {
             si = (si + static_cast<int>(seqs.size()) - 1) % static_cast<int>(seqs.size());
-            frame = 0; acc_frame[0] = acc_frame[1] = -1; orb.dist = 0.0;
+            frame = 0; acc_frame[0] = acc_frame[1] = -1; orb.dist = 0.0; user_zoomed = false;
+            mem[0].clear(); mem[1].clear(); acc[0].clear(); acc[1].clear();
+            mesh[0].clear(); mesh[1].clear();
         } else if (key == '1') {
             pick[0] = (pick[0] + 1) % static_cast<int>(s.systems.size());
-            acc_frame[0] = -1;
+            acc_frame[0] = -1; mem[0].clear(); acc[0].clear(); mesh[0].clear();
         } else if (key == '2') {
             pick[1] = (pick[1] + 1) % static_cast<int>(s.systems.size());
-            acc_frame[1] = -1;
+            acc_frame[1] = -1; mem[1].clear(); acc[1].clear(); mesh[1].clear();
         } else if (key == 'a' || key == 'A') user_yaw -= 0.12;
         else if (key == 'd' || key == 'D') user_yaw += 0.12;
-        else if (key == 'w' || key == 'W') orb.dist *= 0.88;
-        else if (key == 's' || key == 'S') orb.dist *= 1.14;
+        else if (key == 'w' || key == 'W') { orb.dist *= 0.88; user_zoomed = true; }
+        else if (key == 's' || key == 'S') { orb.dist *= 1.14; user_zoomed = true; }
         else if (key == 'f' || key == 'F') {
             const std::string f2 = "viewer_" + s.name + "_" + std::to_string(shot++) + ".png";
             if (cv::imwrite(f2, canvas)) std::cout << "저장: " << f2 << "\n";
