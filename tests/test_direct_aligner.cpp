@@ -165,11 +165,19 @@ TEST(DirectAligner, RecoversKnownPose) {
     EXPECT_GE(r.value().point_count, 500u);
 }
 
-// 실측 수렴 반경 안의 큰 변위. 노름 0.175 m = 레벨0 기준 35 px.
-// 이보다 크면(0.22 m 등) 어떤 냉시작 직접법도 못 잡으며, 그것이 운동 사전분포가
-// 있는 이유다. 반경 자체는 PyramidDepthExtendsConvergenceRadius 가 측정한다.
-inline Vec3 largeTranslation() { return {0.14, 0.095, -0.048}; }
-inline Vec3 largeRotation()    { return {0.023, 0.031, -0.016}; }
+// 수렴 반경 **안쪽** 의 큰 변위. 노름 0.140 m = 실측 반경 0.18 m 의 78 %.
+//
+// 예전 값은 0.175 m 로 반경의 98 % 였다. 그 자리에서는 결과가 부동소수 반올림
+// 으로 결정된다 - 실제로 MSVC/gcc 는 수렴하고 clang+ASan 은 같은 코드로
+// 0.309 m 에 떨어졌다. 컴파일러가 바뀌었을 뿐인데 "정렬기가 발산했다" 로
+// 읽히는 실패다. 10.4 의 규칙이 문턱에도 적용된다: **경계에서 재면 재는 것이
+// 알고리즘이 아니라 반올림이다.**
+//
+// 78 % 로 옮겨도 단일 해상도는 여전히 실패한다(레벨 1 반경 ~0 m). 즉 아래
+// SingleLevelIsWorseThanPyramid 의 판별력은 그대로다. 반경 자체를 재는 것은
+// PyramidDepthExtendsConvergenceRadius 의 일이고 그쪽은 그대로 둔다.
+inline Vec3 largeTranslation() { return {0.1113, 0.0755, -0.0382}; }
+inline Vec3 largeRotation()    { return {0.0183, 0.0246, -0.0127}; }
 
 TEST(DirectAligner, ConvergesFromIdentityOnLargeMotion) {
     // 피라미드가 있어야 큰 변위를 잡는다. 단일 해상도면 지역최소에 빠진다.

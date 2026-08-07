@@ -32,18 +32,33 @@ def _read_rows(path: Path) -> list[list[str]]:
 
 
 def load_trajectory(path: str | Path) -> Trajectory:
-    """groundtruth.txt 또는 같은 형식의 추정 결과를 읽는다."""
-    rows = _read_rows(Path(path))
+    """groundtruth.txt 또는 같은 형식의 추정 결과를 읽는다.
+
+    깨진 파일은 **깨졌다고 말한다.** 예전에는 NUL 로 채워진 반쯤 쓰인 파일이
+    `could not convert string to float: '13050323\\x00\\x00...'` 로 터졌고,
+    그 메시지만 보고는 어느 파일이 왜 그런지 알 수 없었다. 두 실행이 같은
+    출력 경로에 동시에 쓰면 실제로 이렇게 된다.
+    """
+    p = Path(path)
+    rows = _read_rows(p)
     stamps, poses = [], []
-    for r in rows:
+    for i, r in enumerate(rows, 1):
         if len(r) < 8:
             continue
-        t = float(r[0])
-        tx, ty, tz, qx, qy, qz, qw = (float(v) for v in r[1:8])
+        try:
+            t = float(r[0])
+            tx, ty, tz, qx, qy, qz, qw = (float(v) for v in r[1:8])
+        except ValueError as e:
+            nul = any("\x00" in v for v in r[:8])
+            raise ValueError(
+                f"{p}: {i} 번째 데이터 줄을 숫자로 읽지 못했다"
+                + (" - NUL 바이트가 있다. 반쯤 쓰인 파일이다"
+                   " (같은 경로에 두 실행이 동시에 썼는가?)" if nul else "")
+                + f"\n  {' '.join(v[:40] for v in r[:8])}") from e
         stamps.append(t)
         poses.append(SE3(quat_to_matrix(qx, qy, qz, qw), np.array([tx, ty, tz])))
     if not poses:
-        raise ValueError(f"포즈를 읽지 못함: {path}")
+        raise ValueError(f"포즈를 읽지 못함: {p}")
     return Trajectory(np.array(stamps), poses).sorted()
 
 
