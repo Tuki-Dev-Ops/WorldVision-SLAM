@@ -1912,6 +1912,61 @@ public:
                  rt * (W * 0.42), orb, f, col, 0.78);
     }
 
+    // 나무. **줄기 + 수관** 을 입체로 세운다.
+    //
+    // 지금까지는 선 하나에 원 테두리였다. 그러면 나무가 아니라 표지판처럼
+    // 보인다 - 원은 평면이고, 평면은 어느 각도에서 봐도 같은 크기라 부피가
+    // 읽히지 않는다.
+    //
+    // 수관을 구로 그리면 부피가 생긴다. 구를 삼각형으로 쪼갤 필요는 없다 -
+    // 가장자리로 갈수록 어둡게 칠한 동심원 몇 겹이면 눈은 그것을 구로 읽는다.
+    // 조명 계산이 아니라 사람이 구를 보는 방식을 그대로 쓰는 것이다.
+    void treeModel(const Eigen::Vector3f& foot, float height, float rad,
+                   const Eigen::Vector3f& up, const Orbit& orb, double f,
+                   const cv::Scalar& col) {
+        const float canopy_h = height * 0.68f;
+        const Eigen::Vector3f cen = foot + up * canopy_h;
+
+        // 줄기: 가는 상자. 원기둥으로 그릴 값이 없다.
+        {
+            Eigen::Vector3f a = up.cross(Eigen::Vector3f::UnitZ());
+            if (a.norm() < 1e-6f) a = up.cross(Eigen::Vector3f::UnitX());
+            a.normalize();
+            const Eigen::Vector3f b = up.cross(a).normalized();
+            const float tw = std::max(0.06f, rad * 0.16f);
+            solidBox((foot + up * (canopy_h * 0.5f)).cast<double>(),
+                     (a * tw).cast<double>(),
+                     (up * (canopy_h * 0.5f)).cast<double>(),
+                     (b * tw).cast<double>(),
+                     orb, f, cv::Scalar(col[0] * 0.45, col[1] * 0.42, col[2] * 0.38), 1.0);
+        }
+
+        // 수관: 동심원을 바깥에서 안으로. 안쪽일수록 밝아 구로 읽힌다.
+        cv::Point cc, edge;
+        if (!project3(cen.cast<double>(), orb, f, cc)) return;
+        Eigen::Vector3f a2 = up.cross(Eigen::Vector3f::UnitZ());
+        if (a2.norm() < 1e-6f) a2 = up.cross(Eigen::Vector3f::UnitX());
+        a2.normalize();
+        if (!project3((cen + a2 * rad).cast<double>(), orb, f, edge)) return;
+        const int R = std::clamp(static_cast<int>(
+            std::hypot(edge.x - cc.x, edge.y - cc.y)), 2, 90);
+        if (std::abs(cc.x) > 4 * img_.cols || std::abs(cc.y) > 4 * img_.rows) return;
+
+        const int rings = std::clamp(R / 3, 3, 8);
+        for (int i = rings; i >= 1; --i) {
+            const double t = static_cast<double>(i) / rings;   // 1 = 가장자리
+            const int rr = std::max(1, static_cast<int>(R * t));
+            // 가장자리 0.45, 중심 1.0. 구의 명암이 이렇게 생겼다.
+            const double sh = 1.0 - 0.55 * t * t;
+            // 광원 쪽을 살짝 올린다. 완전 대칭이면 공이 아니라 원반이 된다.
+            const cv::Point o(cc.x - static_cast<int>(R * 0.18 * t),
+                              cc.y - static_cast<int>(R * 0.18 * t));
+            cv::circle(img_, o, rr,
+                       cv::Scalar(col[0] * sh, col[1] * sh, col[2] * sh),
+                       cv::FILLED, cv::LINE_AA);
+        }
+    }
+
     // 사람 골격.
     //
     // **관절을 추정한 것이 아니다.** 이 저장소에는 자세 추정기가 없고, 있는
@@ -2181,30 +2236,8 @@ public:
                          orb, f, col, 0.85);
             }
             if (c.cls == Stuff::Vegetation) {
-                // 나무: 줄기 + 수관. 줄기는 지면에서 수관 아래까지, 수관은
-                // 그 위의 덩어리다. 두 부분의 비율이 "나무" 를 만든다.
-                const float canopy_bot = h * 0.45f;
-                cv::Point p0, p1;
-                if (project3(foot.cast<double>(), orb, f, p0) &&
-                    project3((foot + up * canopy_bot).cast<double>(), orb, f, p1)) {
-                    lineClipped(p0, p1, cv::Scalar(col[0] * 0.55, col[1] * 0.5,
-                                                   col[2] * 0.45), 2);
-                }
-                // 수관을 원으로 얹는다. 사각형으로 그리면 건물과 구분되지 않는다.
-                cv::Point cc, edge;
-                const Eigen::Vector3f cen = foot + up * (h * 0.72f);
-                if (project3(cen.cast<double>(), orb, f, cc) &&
-                    project3((cen + g.a * (cell * 0.9f)).cast<double>(), orb, f, edge)) {
-                    const int r = std::clamp(static_cast<int>(
-                        std::hypot(edge.x - cc.x, edge.y - cc.y)), 2, 60);
-                    if (std::abs(cc.x) < 4 * img_.cols && std::abs(cc.y) < 4 * img_.rows) {
-                        // 수관은 **테두리만** 그린다. 꽉 채우면 격자칸마다
-                        // 원이 하나씩 생겨 도로변이 초록 벽이 된다 - 실측
-                        // 2640 개였고 화면이 그것으로 덮였다. 나무 한 그루가
-                        // 여러 칸에 걸치므로 채우면 중복이 그대로 쌓인다.
-                        cv::circle(img_, cc, r, col, 1, cv::LINE_AA);
-                    }
-                }
+                // 나무는 입체로. 줄기 위에 구 모양 수관이 얹힌다.
+                treeModel(foot, h, cell * 0.75f, up, orb, f, col);
                 // 나무는 여기서 끝낸다. 이웃과 면을 채우면 수관이 사각형에
                 // 묻혀 다시 건물처럼 보인다.
                 continue;
@@ -2840,7 +2873,11 @@ int main(int argc, char** argv) {
     SurfMesh surf[2];
     Eigen::Vector3d surf_at[2] = {Eigen::Vector3d::Constant(1e9),
                                   Eigen::Vector3d::Constant(1e9)};
-    bool show_surf = true;         // G 로 토글 - 삼각형 표면
+    // 아이소서피스는 기본 꺼짐. 라벨 형상(건물 평면, 나무 입체, 기둥)이
+    // 같은 자리를 이미 그리는데 둘을 겹치면 매끄러운 형상 위로 거친 메시가
+    // 삐져나온다. 메시는 잡음만큼 거칠고 형상은 그렇지 않으므로, 깔끔한
+    // 화면에서는 형상이 이긴다. G 로 켜서 비교할 수 있다.
+    bool show_surf = false;        // G 로 토글 - 삼각형 표면
     Eigen::Vector3f road_a{Eigen::Vector3f::UnitX()};
     Eigen::Vector3f road_b{Eigen::Vector3f::UnitZ()};
     // 오버레이는 기본 꺼짐. 전부 켜면 지도가 안 보이고, 사람이
@@ -2851,7 +2888,14 @@ int main(int argc, char** argv) {
     std::unordered_map<std::int64_t, Prediction> pred[2];
     PredictScore pscore[2];
     bool show_pred = false;        // O 로 토글
-    bool show_cubes = true;        // C 로 토글 - 복셀을 큐브로 채운다
+    // **기본은 의미 형상만 그리는 깔끔한 3D 맵이다.**
+    //
+    // 원시 점군과 의미 형상을 같이 그리면 점이 형상을 덮는다. 나무를 입체로
+    // 만들어도 그 위에 점 수만 개가 뿌려지면 나무로 안 보이고, 건물 평면도
+    // 점에 묻힌다. 지도가 "무엇이 있는가" 를 말하려면 그 답만 그려야 한다.
+    //
+    // 원시 점군은 C 로 켠다 - 분류가 틀렸는지 확인할 때는 그것이 근거다.
+    bool show_cubes = false;       // C 로 토글 - 원시 복셀/점군
     bool show_edl = true;          // E 로 토글 - Eye-Dome Lighting
     // 레이어 격리. 전부 한 화면에 겹치면 무엇을 보고 있는지 알 수
     // 없다. 한 층씩 떼어 보는 것이 벤치마크에서는 기본이다.
@@ -3551,8 +3595,11 @@ int main(int argc, char** argv) {
                     cloud[k].surface(surf[k], ob, vp.width * 0.9,
                                      cv::Scalar(196, 186, 170));
                 }
-                if (L_map) cloud[k].draw(near_pts, ob, vp.width * 0.9, 0.62);
-                if (show_cubes && !show_surf && L_map) {
+                // 원시 점군은 근거를 보고 싶을 때만. 기본 화면은 형상이다.
+                if (L_map && show_cubes) {
+                    cloud[k].draw(near_pts, ob, vp.width * 0.9, 0.62);
+                }
+                if (show_cubes && !show_surf && L_map && false) {
                     cloud[k].voxelCubes(near_pts, acc[k].voxel, ob, vp.width * 0.9,
                                         ob.world_up, 0.45);
                 }
