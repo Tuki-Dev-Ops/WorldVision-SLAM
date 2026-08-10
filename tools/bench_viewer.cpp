@@ -56,6 +56,7 @@
 #include <iostream>
 #include <map>
 #include <unordered_map>
+#include <unordered_set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -143,6 +144,82 @@ struct Run {
     std::vector<Eigen::Isometry3d> aligned; // 표시용 정렬 후 (정답 좌표계)
     std::vector<double> err_cm;             // 프레임별 ATE 오차 (bench_run.py 계산)
 };
+
+// ===========================================================================
+// 삼각형 모형 (Wavefront OBJ)
+// ===========================================================================
+// 자동차를 상자 둘로 그리면 "자동차 비슷한 것" 이고, 실제 차체 곡면은
+// 상자로는 안 나온다. 진짜 모형을 읽어 오면 그 부분이 해결된다.
+//
+// **파서를 직접 쓴다.** Assimp 는 40 여 종 포맷과 후처리를 들고 오는데
+// 여기서 필요한 것은 정점과 면뿐이다. OBJ 의 그 두 줄은 규격이 단순해서
+// 서른 줄이면 읽히고, 이 뷰어의 의존성은 OpenCV 와 Eigen 뿐이라는 전제를
+// 모형 하나 때문에 깨지 않는다.
+//
+// 재질·텍스처는 읽지 않는다. 화면은 클래스 색으로 칠하므로 - 검출기가
+// 자동차라고 말한 것을 자동차 색으로 그리는 것이 이 화면의 규칙이고,
+// 모형의 원래 도색은 그 규칙과 무관하다.
+struct TriMesh {
+    std::vector<Eigen::Vector3f> vert;
+    std::vector<std::array<int, 3>> tri;
+    // AABB 기준의 반크기와 중심. 검출 상자에 맞춰 넣을 때 쓴다.
+    Eigen::Vector3f half{Eigen::Vector3f::Ones()}, mid{Eigen::Vector3f::Zero()};
+    // 길이/폭/높이에 해당하는 축 번호. 길이가 가장 길고 높이가 가장 짧다는
+    // 자동차의 비례로 정한다 - 모형마다 위가 y 이기도 z 이기도 해서, 축을
+    // 고정하면 차가 옆으로 눕는다.
+    int ax_len{0}, ax_up{1}, ax_wid{2};
+    bool valid() const { return !tri.empty(); }
+};
+
+inline bool loadObj(const fs::path& path, TriMesh& out) {
+    std::ifstream in(path);
+    if (!in) return false;
+    out.vert.clear();
+    out.tri.clear();
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.size() < 2) continue;
+        std::istringstream ss(line);
+        std::string tag;
+        ss >> tag;
+        if (tag == "v") {
+            float x = 0, y = 0, z = 0;
+            ss >> x >> y >> z;
+            out.vert.emplace_back(x, y, z);
+        } else if (tag == "f") {
+            // f 는 v, v/vt, v//vn, v/vt/vn 을 다 쓴다. 슬래시 앞의 정점
+            // 번호만 필요하고, 음수는 끝에서부터 세는 상대 번호다.
+            std::vector<int> idx;
+            std::string tok;
+            while (ss >> tok) {
+                const std::size_t sl = tok.find('/');
+                if (sl != std::string::npos) tok = tok.substr(0, sl);
+                if (tok.empty()) continue;
+                int v = std::atoi(tok.c_str());
+                if (v < 0) v = static_cast<int>(out.vert.size()) + v;
+                else --v;
+                if (v >= 0 && v < static_cast<int>(out.vert.size())) idx.push_back(v);
+            }
+            // 다각형은 부채꼴로 쪼갠다. OBJ 의 면은 볼록이 보장된다.
+            for (std::size_t i = 2; i < idx.size(); ++i) {
+                out.tri.push_back({idx[0], idx[i - 1], idx[i]});
+            }
+        }
+    }
+    if (out.vert.empty() || out.tri.empty()) return false;
+
+    Eigen::Vector3f lo = out.vert.front(), hi = out.vert.front();
+    for (const auto& v : out.vert) { lo = lo.cwiseMin(v); hi = hi.cwiseMax(v); }
+    out.mid = 0.5f * (lo + hi);
+    out.half = (0.5f * (hi - lo)).cwiseMax(Eigen::Vector3f::Constant(1e-4f));
+
+    int order[3] = {0, 1, 2};
+    std::sort(order, order + 3, [&](int a, int b) { return out.half[a] > out.half[b]; });
+    out.ax_len = order[0];      // 가장 긴 축이 차의 길이
+    out.ax_wid = order[1];
+    out.ax_up  = order[2];      // 가장 짧은 축이 높이
+    return true;
+}
 
 // 의미 구조. wme_scene_export 가 만든 파일에서 읽는다. 좌표는 카메라계이므로
 // 뷰어가 각 시스템의 추정 포즈로 옮긴다 - 같은 관측이 두 시스템에서 어디로
@@ -291,7 +368,33 @@ struct Orbit {
     // 영벡터면 쓰지 않는다 (고정 방위 지도 뷰).
     Eigen::Vector3d heading{Eigen::Vector3d::Zero()};
 
-    Eigen::Matrix3d basis() const {
+    // **기억해 둔 기저.**
+    //
+    // basis() 는 sin/cos 넷에 normalize 넷이다. 한 번은 싸지만 사각형마다
+    // 부르면 싸지 않다 - 건물 기둥 하나가 면 셋이고 면마다 채우기와 모서리를
+    // 부르므로 상자 하나에 여섯 번, 기둥 2500 개면 한 프레임에 15000 번이다.
+    // 나무는 삼각형 128 개라 한 그루에 128 번 더 든다.
+    //
+    // 궤도가 그대로면 답도 그대로다. 카메라를 정하는 값들이 바뀌었을 때만
+    // 다시 계산한다 - 프레임당 한 번이 되고, 호출부는 하나도 고치지 않는다.
+    mutable Eigen::Matrix3d basis_cache_{Eigen::Matrix3d::Identity()};
+    mutable double c_yaw_{1e300}, c_pitch_{1e300};
+    mutable Eigen::Vector3d c_up_{Eigen::Vector3d::Zero()};
+    mutable Eigen::Vector3d c_head_{Eigen::Vector3d::Zero()};
+    mutable bool c_valid_{false};
+
+    const Eigen::Matrix3d& basis() const {
+        if (c_valid_ && yaw == c_yaw_ && pitch == c_pitch_ &&
+            world_up == c_up_ && heading == c_head_) {
+            return basis_cache_;
+        }
+        basis_cache_ = computeBasis();
+        c_yaw_ = yaw; c_pitch_ = pitch; c_up_ = world_up; c_head_ = heading;
+        c_valid_ = true;
+        return basis_cache_;
+    }
+
+    Eigen::Matrix3d computeBasis() const {
         const double cy = std::cos(yaw), sy = std::sin(yaw);
         const double cp = std::cos(pitch), sp = std::sin(pitch);
         // 지면 평면의 두 축 (world_up 에 수직)
@@ -575,11 +678,18 @@ struct Column {
     Eigen::Vector3f rep{Eigen::Vector3f::Zero()};   // 그릴 대표점 (기둥 꼭대기)
     float ground{0.0f};      // 이 칸에 쓰인 지면 높이
 
-    // 구조 텐서용 누적. 이웃 아홉 칸의 것을 더하면 그 자리의 공분산이 된다 -
-    // 점 목록을 따로 들고 있지 않아도 된다.
+    // 그 칸에 든 점의 수. 판정에 쓸 근거가 있는지를 묻는 데만 쓴다.
+    //
+    // **여기 있던 sum / sumsq 는 지웠다.** 원래는 칸마다 1 차·2 차 모멘트를
+    // 쌓아 두면 이웃 아홉 칸을 더해 공분산이 나온다는 계산이었는데, 구조
+    // 텐서는 결국 그 방식으로 구하지 않는다 - 기둥 아홉 칸을 더하면 바닥
+    // 1 x 1 m 에 높이 11 m 인 상자가 되어 무엇이 들었든 선형성이 1 에 가깝게
+    // 나오기 때문에, 4 차에서 복셀 +-2 칸의 **공** 으로 다시 구한다.
+    //
+    // 그래서 두 누적기는 쓰이지 않은 채 점마다 3x3 외적을 돌고 있었고,
+    // 칸마다 72 바이트를 차지한 채 누적 지도에 복사되고 있었다. 읽지 않는
+    // 값을 쌓는 비용은 전부 순손실이다.
     int    n{0};
-    Eigen::Vector3d sum{Eigen::Vector3d::Zero()};
-    Eigen::Matrix3d sumsq{Eigen::Matrix3d::Zero()};
 
     // 분류 결과와 그 근거. 근거를 남기는 이유는 화면에서 틀렸을 때 어느
     // 판별자가 틀렸는지 알아야 하기 때문이다.
@@ -591,6 +701,17 @@ struct Column {
     // 5x5 이웃 중 점유된 칸 수. 기둥과 벽을 가르는 데 쓴다 -
     // 기둥은 홀로 서 있고 벽은 이웃이 빽빽하다.
     std::uint8_t crowd{0};
+    // **한 번 구해 둔 유효 꼭대기.** min(topBin, topRun) 이다.
+    //
+    // 둘 다 최대 32 칸을 훑는 반복문인데, 밀집도 계산이 이웃 25 칸에 대해,
+    // 지붕선 계산이 다시 25 칸에 대해 부른다. 기둥 하나당 50 번, 훑는 칸으로
+    // 세면 1500 번이고 기둥이 수천 개다. bins 는 그 사이에 바뀌지 않으므로
+    // 한 번 구해 두면 그 전부가 조회 한 번이 된다.
+    std::int8_t top_eff{-1};
+    // 밀집도가 쓰는 것은 **지지받는 꼭대기 그대로** 다. top_eff 로 바꾸면
+    // 지면과 안 이어진 칸이 이웃 수에서 빠져 밀집도가 낮아지고, 8 이라는
+    // 문턱이 그만큼 헐거워진다 - 실제로 기둥이 39 에서 110 으로 늘었다.
+    std::int8_t top_raw{-1};
     Stuff cls{Stuff::Unknown};
 
     // 최고 점유 칸. 이상치 하나에 그대로 끌려간다.
@@ -825,18 +946,28 @@ inline void labelScene(const std::unordered_map<std::int64_t, Splat>& cells,
     fresh.reserve(cells.size() / 8 + 1);
 
     // 1 차: 칸마다 최저/최고 높이와 구조 텐서 누적.
+    //
+    // **점의 높이를 여기서 함께 챙긴다.** 점유 프로파일을 채우려면 그 칸에
+    // 속한 점들의 높이가 필요한데, 지면이 아직 안 정해져서 지금은 비닝할 수
+    // 없다. 그렇다고 나중에 지도 전체를 한 번 더 훑으면 31 만 칸을 두 번
+    // 도는 셈이고, 실측에서 그 두 번이 각각 32 ms 였다 - 라벨 한 번에 드는
+    // 90 ms 의 3 분의 2 다.
+    //
+    // 반경 안의 점은 전체의 일부일 뿐이므로, 그 높이만 칸별로 모아 두면
+    // 두 번째 훑기가 연속된 배열 위의 짧은 순회로 바뀐다.
+    std::unordered_map<std::int64_t, std::vector<float>> hs;
+    hs.reserve(cells.size() / 8 + 1);
     for (const auto& [k, v] : cells) {
         if ((v.p - e).squaredNorm() > r2) continue;
         const float h = v.p.dot(g.up);
         const auto [i, j] = g.ij(v.p);
-        auto& c = fresh[GroundGrid::key(i, j)];
+        const std::int64_t ck = GroundGrid::key(i, j);
+        auto& c = fresh[ck];
         c.i = i; c.j = j;
         if (h > c.high) { c.high = h; c.rep = v.p; }
         c.low = std::min(c.low, h);
-        const Eigen::Vector3d p = v.p.cast<double>();
         ++c.n;
-        c.sum += p;
-        c.sumsq += p * p.transpose();
+        hs[ck].push_back(h);
     }
 
     // 2 차: 이웃 반경 안에서 그 칸의 지면 높이를 잡는다.
@@ -866,13 +997,13 @@ inline void labelScene(const std::unordered_map<std::int64_t, Splat>& cells,
     // 3 차: 지면이 정해졌으니 점유 프로파일을 채운다. 셀을 한 번 더 훑는
     // 대가로 "어느 높이가 찼는가" 를 얻는다 - 그 정보 없이는 나무와 벽이
     // 구분되지 않는다.
-    for (const auto& [k, v] : cells) {
-        if ((v.p - e).squaredNorm() > r2) continue;
-        const auto it = fresh.find(g.key(v.p));
-        if (it == fresh.end()) continue;
-        const float rel = v.p.dot(g.up) - it->second.ground;
-        const int b = static_cast<int>(std::floor(rel / kBinH));
-        if (b >= 0 && b < kBins) it->second.bins |= (1u << b);
+    for (auto& [k, c] : fresh) {
+        const auto hit = hs.find(k);
+        if (hit == hs.end()) continue;
+        for (const float h : hit->second) {
+            const int b = static_cast<int>(std::floor((h - c.ground) / kBinH));
+            if (b >= 0 && b < kBins) c.bins |= (1u << b);
+        }
     }
 
     // 대표점의 **높이를 지지받는 꼭대기로 내린다.** 수평 위치는 그대로 둔다.
@@ -882,7 +1013,11 @@ inline void labelScene(const std::unordered_map<std::int64_t, Splat>& cells,
     // 하늘까지 솟고, 노면 칸 하나가 1 m 위 잡음을 대표로 삼으면 평평한
     // 도로가 울퉁불퉁해진다. 지지받는 꼭대기는 그런 스파이크를 무시한다.
     for (auto& [k, c] : fresh) {
+        // bins 가 다 찼으니 유효 꼭대기를 여기서 한 번만 구해 둔다. 이 뒤로
+        // 밀집도·투표·지붕선이 전부 이 값을 조회만 한다.
         const int t = c.topBin();
+        c.top_raw = static_cast<std::int8_t>(t);
+        c.top_eff = static_cast<std::int8_t>(std::min(t, c.topRun()));
         if (t < 0) continue;
         const float want = c.ground + static_cast<float>(t + 1) * kBinH;
         const float have = c.rep.dot(g.up);
@@ -950,7 +1085,7 @@ inline void labelScene(const std::unordered_map<std::int64_t, Splat>& cells,
             for (int di = -2; di <= 2; ++di) {
                 for (int dj = -2; dj <= 2; ++dj) {
                     const auto it = fresh.find(GroundGrid::key(c.i + di, c.j + dj));
-                    if (it != fresh.end() && it->second.topBin() >= 2) ++occ;
+                    if (it != fresh.end() && it->second.top_raw >= 2) ++occ;
                 }
             }
             c.crowd = static_cast<std::uint8_t>(occ);
@@ -992,7 +1127,7 @@ inline void labelScene(const std::unordered_map<std::int64_t, Splat>& cells,
             // 지면 위에 아무 것도 없는 칸이라 애초에 그릴 것이 없다.
             if (c.cls == Stuff::Unknown) {
                 voted[k] = c.cls;
-                if (c.topBin() < 0) continue;
+                if (c.top_eff < 0) continue;
                 int m[6] = {0, 0, 0, 0, 0, 0};
                 for (int di = -1; di <= 1; ++di) {
                     for (int dj = -1; dj <= 1; ++dj) {
@@ -1769,25 +1904,18 @@ public:
             const Eigen::Vector3d c = s.p.cast<double>();
             const Eigen::Vector3d q[4] = {c - a * h - b * h, c + a * h - b * h,
                                           c + a * h + b * h, c - a * h + b * h};
-            cv::Point poly[4];
-            bool ok = true;
-            for (int i = 0; i < 4 && ok; ++i) ok = project3(q[i], orb, f, poly[i]);
-            if (!ok) continue;
-            const double w = std::max({std::abs(poly[0].x - poly[2].x),
-                                       std::abs(poly[0].y - poly[2].y)});
-            if (w > img_.cols * 0.5) continue;
             // 밝기를 정규화해 회색으로. 흰 페인트는 밝게 남고 아스팔트는
             // 배경으로 가라앉는다.
             const double t = std::clamp((s.intensity - lo) / span, 0.0, 1.0);
             const double v = 26.0 + 210.0 * t * t;    // 제곱으로 대비를 세운다
-            cv::fillConvexPoly(img_, poly, 4, cv::Scalar(v, v, v), cv::LINE_8);
-            double zz;
-            const Eigen::Matrix3d M = orb.basis();
-            const Eigen::Vector3d eye = orb.center - M.row(2).transpose() * orb.dist;
-            zz = (M * (c - eye)).z();
-            if (zz > 1e-3) {
-                cv::fillConvexPoly(zbuf_, poly, 4, cv::Scalar(zz), cv::LINE_8);
-            }
+            // **한 번만 훑는다.** 앞선 판은 같은 사각형을 fillConvexPoly 로
+            // 두 번 채웠다 - 색에 한 번, 깊이에 한 번. 노면은 0.1 m 칸이라
+            // 화면에 수만 개가 깔리므로 그 두 배가 그대로 두 배였다.
+            //
+            // 깊이도 칸 중심의 상수 하나가 아니라 화소마다 보간된다. 카메라
+            // 앞으로 뻗은 노면은 한 칸 안에서도 깊이가 크게 변해서, 상수로
+            // 쓰면 그 칸의 앞뒤가 통째로 같은 값이 된다.
+            fillPoly3(q, 4, orb, f, cv::Scalar(v, v, v));
         }
     }
 
@@ -1805,7 +1933,7 @@ public:
         if (m.tri.empty()) return;
         const Eigen::Matrix3d M = orb.basis();
         const Eigen::Vector3d eye = orb.center - M.row(2).transpose() * orb.dist;
-        const double cx = img_.cols * 0.5, cy = img_.rows * 0.5;
+        const double cx = ppx(), cy = ppy();
 
         struct P { cv::Point2f s; double z; bool ok; };
         std::vector<P> pv(m.vert.size());
@@ -1949,7 +2077,7 @@ public:
                     double f, const Eigen::Vector3d& up, double fade) {
         const Eigen::Matrix3d M = orb.basis();
         const Eigen::Vector3d eye = orb.center - M.row(2).transpose() * orb.dist;
-        const double cx = img_.cols * 0.5, cy = img_.rows * 0.5;
+        const double cx = ppx(), cy = ppy();
         const double h = 0.5 * voxel;
 
         // 화면 좌표 + 카메라 깊이
@@ -2059,8 +2187,8 @@ public:
         const Eigen::Vector3d v = M * (p - eye);
         SPt s{0, 0, v.z(), v.z() > 1e-3};
         if (s.ok) {
-            s.x = img_.cols * 0.5 + f * v.x() / v.z();
-            s.y = img_.rows * 0.5 - f * v.y() / v.z();
+            s.x = ppx() + f * v.x() / v.z();
+            s.y = ppy() - f * v.y() / v.z();
         }
         return s;
     }
@@ -2079,17 +2207,33 @@ public:
         x1 = std::min(img_.cols - 1, x1); y1 = std::min(img_.rows - 1, y1);
         const double d = (b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y);
         if (std::abs(d) < 1e-9) return;
+
+        // **무게중심 좌표를 화소마다 다시 풀지 않는다.**
+        //
+        // 앞선 판은 화소마다 나눗셈을 두 번 했다. 나눗셈은 곱셈의 스무 배
+        // 남짓이고, 이 뷰어는 건물 기둥 하나에 사각형 셋, 기둥 수천 개를
+        // 채우므로 한 프레임에 수천만 화소를 지난다 - 그 자리에 나눗셈 둘이
+        // 박혀 있었다.
+        //
+        // w0, w1 은 화면 좌표의 **1 차식** 이다. x 를 하나 옮기면 상수만큼
+        // 변하므로, 행마다 시작값을 한 번 구하고 그 뒤로는 더하기만 하면
+        // 된다. 깊이도 w 의 1 차식이라 같이 따라온다. 결과는 한 비트도
+        // 달라지지 않고, 안쪽 반복이 나눗셈 둘에서 덧셈 셋이 된다.
+        const double inv = 1.0 / d;
+        const double dw0x = -(b.y - a.y) * inv;
+        const double dw1x =  (c.y - a.y) * inv;
+        const double zb = b.z - a.z, zc = c.z - a.z;
+        const double dzx = dw1x * zb + dw0x * zc;
+
         for (int y = y0; y <= y1; ++y) {
+            const double py = y + 0.5, px0 = x0 + 0.5;
+            double w0 = ((b.x - a.x) * (py - a.y) - (px0 - a.x) * (b.y - a.y)) * inv;
+            double w1 = ((px0 - a.x) * (c.y - a.y) - (c.x - a.x) * (py - a.y)) * inv;
+            double z = a.z + w1 * zb + w0 * zc;
             float* zr = zbuf_.ptr<float>(y);
             auto* pr = img_.ptr<cv::Vec3b>(y);
-            for (int x = x0; x <= x1; ++x) {
-                const double px = x + 0.5, py = y + 0.5;
-                const double w0 = ((b.x - a.x) * (py - a.y)
-                                 - (px - a.x) * (b.y - a.y)) / d;
-                const double w1 = ((px - a.x) * (c.y - a.y)
-                                 - (c.x - a.x) * (py - a.y)) / d;
+            for (int x = x0; x <= x1; ++x, w0 += dw0x, w1 += dw1x, z += dzx) {
                 if (w0 < 0.0 || w1 < 0.0 || w0 + w1 > 1.0) continue;
-                const double z = a.z + w1 * (b.z - a.z) + w0 * (c.z - a.z);
                 if (z <= 1e-3 || z >= zr[x]) continue;
                 zr[x] = static_cast<float>(z);
                 pr[x] = col;
@@ -2098,13 +2242,18 @@ public:
     }
 
     // 볼록 다각형을 부채꼴 삼각형으로 쪼개 깊이와 함께 채운다.
+    //
+    // 꼭짓점 버퍼는 **스택 배열** 이다. std::vector 를 쓰면 다각형 하나마다
+    // 힙 할당이 한 번인데, 건물 기둥 하나가 면 셋이고 기둥이 수천 개라
+    // 프레임당 만 번을 넘는다. 여기 오는 다각형은 삼각형 아니면 사각형이다.
+    static constexpr int kMaxPolyV = 8;
     void fillPoly3(const Eigen::Vector3d* q, int n, const Orbit& orb, double f,
                    const cv::Scalar& col) {
-        if (n < 3) return;
-        const Eigen::Matrix3d M = orb.basis();
+        if (n < 3 || n > kMaxPolyV) return;
+        const Eigen::Matrix3d& M = orb.basis();
         const Eigen::Vector3d eye = orb.center - M.row(2).transpose() * orb.dist;
-        std::vector<SPt> s(static_cast<std::size_t>(n));
-        for (int i = 0; i < n; ++i) s[static_cast<std::size_t>(i)] = proj(q[i], M, eye, f);
+        SPt s[kMaxPolyV];
+        for (int i = 0; i < n; ++i) s[i] = proj(q[i], M, eye, f);
         const cv::Vec3b c8(static_cast<std::uint8_t>(std::clamp(col[0], 0.0, 255.0)),
                            static_cast<std::uint8_t>(std::clamp(col[1], 0.0, 255.0)),
                            static_cast<std::uint8_t>(std::clamp(col[2], 0.0, 255.0)));
@@ -2113,6 +2262,68 @@ public:
                       s[static_cast<std::size_t>(i + 1)], c8);
         }
     }
+
+    // 다각형의 모서리를 **깊이와 함께** 긋는다.
+    //
+    // 채우기만 하면 같은 색 면 둘이 맞붙었을 때 경계가 사라진다. 벽면은
+    // 1 m 기둥이 줄줄이 맞붙은 것이고 앞면끼리는 색도 음영도 같으므로,
+    // 화면에는 아무 무늬도 없는 파란 벌판이 남는다 - 건물이 하나의 거대한
+    // 판때기로 보이던 것이 그것이다.
+    //
+    // EDL 로는 안 된다. EDL 은 깊이가 **끊기는** 곳만 어둡게 하는데, 이어진
+    // 벽면 안에는 끊김이 없다. 그래서 실루엣은 세워 주지만 벽 안쪽은 그대로
+    // 비어 있다. 앞선 판이 채우고 나서 모서리를 한 번 더 그었던 이유가
+    // 이것이고, 깊이 검사로 옮기면서 그것을 빠뜨렸다.
+    //
+    // 자기 면보다 아주 조금 앞(z * 0.999)에 긋는다. 그래야 자기 면은 이기고
+    // 앞에 있는 다른 것에는 진다 - 뒤 건물의 격자가 앞 건물을 뚫고 나오지
+    // 않는다.
+    void strokePoly3(const Eigen::Vector3d* q, int n, const Orbit& orb, double f,
+                     const cv::Scalar& col) {
+        if (n < 2) return;
+        const Eigen::Matrix3d M = orb.basis();
+        const Eigen::Vector3d eye = orb.center - M.row(2).transpose() * orb.dist;
+        const cv::Vec3b c8(static_cast<std::uint8_t>(std::clamp(col[0], 0.0, 255.0)),
+                           static_cast<std::uint8_t>(std::clamp(col[1], 0.0, 255.0)),
+                           static_cast<std::uint8_t>(std::clamp(col[2], 0.0, 255.0)));
+        for (int i = 0; i < n; ++i) {
+            const SPt a = proj(q[i], M, eye, f);
+            const SPt b = proj(q[(i + 1) % n], M, eye, f);
+            if (!a.ok || !b.ok) continue;
+            const double dx = b.x - a.x, dy = b.y - a.y;
+            const int steps = static_cast<int>(std::max(std::abs(dx), std::abs(dy)));
+            // 화면을 가로지르는 선은 투영이 튄 것이다. 긋지 않는다.
+            if (steps <= 0 || steps > 2 * std::max(img_.cols, img_.rows)) continue;
+            for (int s = 0; s <= steps; ++s) {
+                const double t = static_cast<double>(s) / steps;
+                const int x = static_cast<int>(std::lround(a.x + dx * t));
+                const int y = static_cast<int>(std::lround(a.y + dy * t));
+                if (x < 0 || y < 0 || x >= img_.cols || y >= img_.rows) continue;
+                const double z = (a.z + (b.z - a.z) * t) * 0.999;
+                float* zr = zbuf_.ptr<float>(y);
+                if (z <= 1e-3 || z >= zr[x]) continue;
+                zr[x] = static_cast<float>(z);
+                img_.ptr<cv::Vec3b>(y)[x] = c8;
+            }
+        }
+    }
+
+    // 거리 감쇠. 1.0 = 눈앞, 0.28 = 먼 곳.
+    //
+    // 완전히 0 으로 보내지 않는다 - 먼 구조가 통째로 사라지면 화면은
+    // "저기엔 아무 것도 없다" 고 말하게 되고, 그것은 관측과 다르다.
+    // 범위는 장면 규모에서 온다: 궤도 거리가 곧 지금 보고 있는 스케일이다.
+    double depthFade(double z) const {
+        const double near = std::max(3.0, fade_ref_ * 0.10);
+        const double far  = std::max(near + 6.0, fade_ref_ * 1.10);
+        const double t = std::clamp((z - near) / (far - near), 0.0, 1.0);
+        return 1.0 - 0.62 * t * t;      // 제곱이라 근거리는 거의 안 건드린다
+    }
+    void setFadeRef(double d) { fade_ref_ = std::max(6.0, d); }
+    // 주점을 화면 좌표로 넣는다. 음수면 화면 중앙을 쓴다.
+    void setPrincipal(double cx, double cy) { pcx_ = cx; pcy_ = cy; }
+    double ppx() const { return pcx_ >= 0.0 ? pcx_ : img_.cols * 0.5; }
+    double ppy() const { return pcy_ >= 0.0 ? pcy_ : img_.rows * 0.5; }
 
     // 방향이 있는 속이 찬 상자. 세 축과 반크기를 받아 카메라 쪽 세 면을 채운다.
     //
@@ -2125,7 +2336,43 @@ public:
         const Eigen::Matrix3d M = orb.basis();
         const Eigen::Vector3d eye = orb.center - M.row(2).transpose() * orb.dist;
         const Eigen::Vector3d axes[3] = {ex, ey, ez};
-        const double shade[3] = {0.95, 0.70, 0.52};
+
+        // **먼 상자는 모서리를 긋지 않는다.**
+        //
+        // 모서리는 맞붙은 같은 색 면을 갈라 놓으려고 긋는 것인데, 화면에서
+        // 몇 px 밖에 안 되는 상자에는 갈라 놓을 안쪽이 없다. 그런 상자가
+        // 수적으로는 대부분이라, 긋는 비용만 내고 보이는 것은 없다.
+        const Eigen::Vector3d v = M * (c - eye);
+        const double span = (v.z() > 1e-3)
+            ? f * std::max({ex.norm(), ey.norm(), ez.norm()}) / v.z()
+            : 0.0;
+        const bool edges = span >= 3.0;
+
+        // **거리에 따라 배경으로 가라앉힌다.**
+        //
+        // 5 m 앞의 벽과 60 m 뒤의 벽이 똑같은 밝기로 칠해지고 있었다. 그러면
+        // 화면에는 깊이 단서가 하나도 남지 않아, 겹쳐 선 벽들이 한 장의
+        // 색종이처럼 보인다 - 3D 지도 뷰어가 예외 없이 거리 감쇠를 거는
+        // 이유가 그것이다. 배경이 검정이므로 멀수록 어두워지면 된다.
+        const double fade = depthFade(v.z());
+
+        // **음영을 축 번호가 아니라 면의 방향에서 뽑는다.**
+        //
+        // 여기가 "파란 네모만 보인다" 의 원인이었다. 앞선 판은 축 번호마다
+        // 0.95 / 0.70 / 0.52 세 단계를 그냥 붙였다. 그러면 45 도로 꺾인 벽과
+        // 정면을 보는 벽이 **똑같은 밝기** 로 나온다 - 면의 방향이 화면에
+        // 전혀 안 나타나므로, 아무리 입체를 세워도 눈에는 같은 색 사각형이
+        // 늘어선 것으로만 읽힌다. 세운 것이 입체가 아니라 칠한 것이 평면이었다.
+        //
+        // 램버트를 쓰되 광원은 둘이다. 하나는 카메라(헤드라이트) - 고정
+        // 광원만 쓰면 회전할 때 어떤 면은 계속 어두워 형상이 안 읽힌다.
+        // 다른 하나는 위쪽(하늘) - 지붕과 벽을 갈라 주는 것은 이쪽이고,
+        // 헤드라이트만으로는 위를 보는 면과 옆을 보는 면이 안 갈린다.
+        //
+        // axes[1] 은 이 클래스의 모든 호출부에서 수직축이다 (기둥·차체·줄기).
+        const Eigen::Vector3d vup = axes[1].normalized();
+        const Eigen::Vector3d fwd = M.row(2).transpose();
+
         for (int k = 0; k < 3; ++k) {
             const double sgn = ((eye - c).dot(axes[k]) >= 0.0) ? 1.0 : -1.0;
             const Eigen::Vector3d n  = axes[k] * sgn;
@@ -2134,10 +2381,86 @@ public:
             const Eigen::Vector3d fc = c + n;
             const Eigen::Vector3d q[4] = {fc - u1 - u2, fc + u1 - u2,
                                           fc + u1 + u2, fc - u1 + u2};
-            const double a = std::clamp(shade[k] * bright, 0.0, 1.0);
+
+            const Eigen::Vector3d nh = n.normalized();
+            const double lam = 0.26                               // 주변광
+                             + 0.46 * std::abs(nh.dot(fwd))       // 헤드라이트
+                             + 0.28 * std::clamp(nh.dot(vup), 0.0, 1.0);  // 하늘
+            const double a = std::clamp(lam * bright, 0.0, 1.0) * fade;
             fillPoly3(q, 4, orb, f,
                       cv::Scalar(base[0] * a, base[1] * a, base[2] * a));
+            // 모서리를 한 번 더. 맞붙은 같은 색 면 둘을 갈라 놓는다.
+            if (!edges) continue;
+            const double e = a * 0.55;
+            strokePoly3(q, 4, orb, f,
+                        cv::Scalar(base[0] * e, base[1] * e, base[2] * e));
         }
+    }
+
+    // 삼각형 모형을 검출 상자에 맞춰 넣고 그린다.
+    //
+    // 모형의 축은 파일마다 다르므로 AABB 에서 뽑아 둔 길이/폭/높이 축을
+    // 진행 방향/가로/위로 각각 옮긴다. 크기는 **검출된 상자에 맞춘다** -
+    // 모형의 원래 치수를 쓰면 화면의 차가 관측과 다른 크기가 된다.
+    //
+    // 멀리 있는 차는 모형을 돌릴 값이 없다. 화면에서 작아지면 상자 모형이
+    // 대신한다 (호출부가 판단한다).
+    void meshModel(const TriMesh& m, const Eigen::Vector3d& c,
+                   const Eigen::Vector3d& size, const Eigen::Vector3d& fwd,
+                   const Eigen::Vector3d& up, const Orbit& orb, double f,
+                   const cv::Scalar& col) {
+        if (!m.valid()) return;
+        const Eigen::Vector3d u = up.normalized();
+        Eigen::Vector3d fw = fwd - u * fwd.dot(u);
+        if (fw.norm() < 1e-6) fw = Eigen::Vector3d::UnitX();
+        fw.normalize();
+        const Eigen::Vector3d rt = u.cross(fw).normalized();
+
+        const double L = std::max(0.6, size.maxCoeff());
+        const double W = std::max(0.4, std::min(size.x(), size.z()));
+        const double H = std::max(0.4, size.y());
+        // 모형 반크기 -> 목표 반크기
+        const double sl = (L * 0.5) / m.half[m.ax_len];
+        const double sw = (W * 0.5) / m.half[m.ax_wid];
+        const double sh = (H * 0.5) / m.half[m.ax_up];
+        // 발밑을 상자 바닥에 맞춘다. 중심을 맞추면 차가 도로에 반쯤 잠긴다.
+        const Eigen::Vector3d base_c = c - u * (H * 0.5);
+
+        const Eigen::Matrix3d& M = orb.basis();
+        const Eigen::Vector3d eye = orb.center - M.row(2).transpose() * orb.dist;
+        const Eigen::Vector3d vfwd = M.row(2).transpose();
+        const double fade = depthFade((M * (c - eye)).z());
+
+        auto toWorld = [&](const Eigen::Vector3f& p) {
+            const Eigen::Vector3f q = p - m.mid;
+            return base_c
+                 + fw * (q[m.ax_len] * sl)
+                 + rt * (q[m.ax_wid] * sw)
+                 + u  * ((q[m.ax_up] + m.half[m.ax_up]) * sh);
+        };
+        for (const auto& t : m.tri) {
+            const Eigen::Vector3d a = toWorld(m.vert[static_cast<std::size_t>(t[0])]);
+            const Eigen::Vector3d b = toWorld(m.vert[static_cast<std::size_t>(t[1])]);
+            const Eigen::Vector3d d = toWorld(m.vert[static_cast<std::size_t>(t[2])]);
+            Eigen::Vector3d n = (b - a).cross(d - a);
+            if (n.norm() < 1e-12) continue;
+            n.normalize();
+            if ((eye - a).dot(n) < 0.0) n = -n;      // 카메라 쪽이 바깥
+            const double lam = (0.26 + 0.46 * std::abs(n.dot(vfwd))
+                              + 0.28 * std::clamp(n.dot(u), 0.0, 1.0)) * fade;
+            const Eigen::Vector3d q[3] = {a, b, d};
+            fillPoly3(q, 3, orb, f,
+                      cv::Scalar(col[0] * lam, col[1] * lam, col[2] * lam));
+        }
+    }
+
+    // 화면에서 이 물체가 몇 px 인가. 모형과 상자를 가르는 데 쓴다.
+    double screenSpan(const Eigen::Vector3d& c, double size, const Orbit& orb,
+                      double f) const {
+        const Eigen::Matrix3d& M = orb.basis();
+        const Eigen::Vector3d eye = orb.center - M.row(2).transpose() * orb.dist;
+        const double z = (M * (c - eye)).z();
+        return (z > 1e-3) ? f * size / z : 0.0;
     }
 
     // 자동차. 차체 + 그 위에 얹힌 캐빈. 진행 방향으로 눕힌다.
@@ -2222,9 +2545,14 @@ public:
         //
         // 나무는 수관이 몸통이고 줄기는 그 아래 짧은 받침이다. 수관을 높이의
         // 위쪽 4 분의 3 에 걸치게 하면 그 비례가 저절로 맞는다.
-        const float canopy_ry = std::max(0.30f, height * 0.40f);   // 수직 반지름
-        const float canopy_c  = height * 0.58f;                    // 중심 높이
-        const float canopy_r  = std::max(rad, canopy_ry * 0.55f);  // 수평 반지름
+        // **수관 크기에도 상한이 있어야 한다.** 높이에 비례만 시키면 잘못
+        // 분류된 16 m 짜리 기둥이 반지름 6 m 짜리 초록 덩어리가 되어 화면을
+        // 통째로 덮는다 - 실제로 그렇게 나왔다. 가로수 수관은 아무리 커도
+        // 반지름 3 m 안쪽이다.
+        const float canopy_ry = std::clamp(height * 0.35f, 0.30f, 2.8f); // 수직
+        const float canopy_c  = std::min(height * 0.58f, height - canopy_ry * 0.6f);
+        const float canopy_r  = std::clamp(std::max(rad, canopy_ry * 0.70f),
+                                           0.30f, 2.8f);            // 수평
         const Eigen::Vector3f cen = foot + up * canopy_c;
         const float trunk_h = std::max(0.2f, canopy_c - canopy_ry * 0.55f);
 
@@ -2262,8 +2590,9 @@ public:
             // 뒷면은 자기 앞면에 가려진다. 그리지 않는다.
             const Eigen::Vector3d wc = (cen + wn).cast<double>();
             if ((eye - wc).dot(wn.cast<double>()) < 0.0) continue;
-            const double lam = 0.34 + 0.52 * std::abs(wn.normalized().cast<double>().dot(fwd))
-                             + 0.14 * std::clamp(static_cast<double>(n.dot(up)), 0.0, 1.0);
+            const double lam = (0.26 + 0.46 * std::abs(wn.normalized().cast<double>().dot(fwd))
+                              + 0.28 * std::clamp(static_cast<double>(n.dot(up)), 0.0, 1.0))
+                             * depthFade((M * (wc - eye)).z());
             const Eigen::Vector3d q[3] = {
                 (cen + ex * tr[0].x() + ey * tr[0].y() + ez * tr[0].z()).cast<double>(),
                 (cen + ex * tr[1].x() + ey * tr[1].y() + ez * tr[1].z()).cast<double>(),
@@ -2365,7 +2694,7 @@ public:
               double fade) {
         const Eigen::Matrix3d M = orb.basis();
         const Eigen::Vector3d eye = orb.center - M.row(2).transpose() * orb.dist;
-        const double cx = img_.cols * 0.5, cy = img_.rows * 0.5;
+        const double cx = ppx(), cy = ppy();
 
         for (const auto& s : pts) {
             const Eigen::Vector3d v = M * (s.p.cast<double>() - eye);
@@ -2411,7 +2740,7 @@ public:
         const Eigen::Vector3d eye = orb.center - M.row(2).transpose() * orb.dist;
         const Eigen::Vector3d va = M * (a - eye), vb = M * (b - eye);
         if (va.z() < 1e-3 || vb.z() < 1e-3) return;
-        const double cx = img_.cols * 0.5, cy = img_.rows * 0.5;
+        const double cx = ppx(), cy = ppy();
         const cv::Point pa(static_cast<int>(cx + f * va.x() / va.z()),
                            static_cast<int>(cy - f * va.y() / va.z()));
         const cv::Point pb(static_cast<int>(cx + f * vb.x() / vb.z()),
@@ -2445,7 +2774,7 @@ public:
                       const Eigen::Vector3d& up_d, float cell,
                       const Orbit& orb, double f, int layer = 0,
                       const Eigen::Vector3d& ego = Eigen::Vector3d::Zero(),
-                      double radius = 0.0) {
+                      double radius = 0.0, bool walls = true) {
         const float r2f = static_cast<float>(radius * radius);
         const Eigen::Vector3f egof = ego.cast<float>();
         const GroundGrid g(up_d.cast<float>(), cell);
@@ -2480,7 +2809,7 @@ public:
                 for (int dj = -2; dj <= 2; ++dj) {
                     const auto it = cols.find(GroundGrid::key(c.i + di, c.j + dj));
                     if (it == cols.end() || it->second.cls != c.cls) continue;
-                    const int tb = std::min(it->second.topBin(), it->second.topRun());
+                    const int tb = it->second.top_eff;
                     if (tb < 0) continue;
                     v[n++] = static_cast<float>(tb + 1) * kBinH;
                 }
@@ -2492,8 +2821,106 @@ public:
             return v[q];
         };
 
+        // ---------------------------------------------------------------
+        // **줄지어 선 벽은 한 장으로 그린다.**
+        // ---------------------------------------------------------------
+        // 칸마다 상자를 세우면, 라벨이 붙지 않은 칸이 하나 끼는 순간 벽에
+        // 틈이 생긴다. 관측은 늘 성기므로 그 틈이 줄줄이 생기고, 화면에는
+        // 벽이 아니라 **말뚝 울타리** 가 남는다 - 실제로 그렇게 보고되었다.
+        // 칸을 아무리 잘 그려도 칸 단위로 그리는 한 이 문제는 안 없어진다.
+        //
+        // 벽은 원래 칸의 모음이 아니라 **하나의 면** 이다. 이어진 칸들을
+        // 한 덩어리로 묶고, 그 덩어리가 한 방향으로 길면 (=벽이면) 덩어리
+        // 전체를 사각기둥 하나로 세운다. 그러면 중간의 빈 칸은 애초에
+        // 물어볼 일이 없어진다.
+        //
+        // 방향과 길이는 cv::minAreaRect 에 맡긴다. 이미 링크된 OpenCV 가
+        // 최소 넓이 회전 사각형을 주므로, 직접 PCA 를 돌릴 이유가 없다.
+        //
+        // 길지 않은 덩어리는 벽이 아니라 모서리나 뭉치이므로 손대지 않고
+        // 칸 단위로 넘긴다 - 억지로 한 장으로 펴면 없는 벽이 생긴다.
+        std::unordered_set<std::int64_t> merged;
+        if (walls) {
+            // **그리는 것의 크기에 상한이 있어야 한다.**
+            //
+            // 앞선 판은 이어진 칸 덩어리마다 minAreaRect 를 하나 씌워 통째로
+            // 세웠다. 그런데 실제 지도에서 길 한쪽 건물은 담장과 생울타리로
+            // 전부 이어져 **한 덩어리** 다. 그래서 100 m x 14 m 짜리 판
+            // 하나가 시야를 덮었고, 코너에서 L 자로 이어지면 그 사각형이
+            // 꺾인 두 변을 다 감싸 카메라에 보이는 것과 전혀 다른 그림이
+            // 되었다 - 차량이 돌 때 특히 심했던 것이 그것이다.
+            //
+            // 잘못은 사각형을 씌운 데 있지 않고 **크기에 상한이 없던 데**
+            // 있다. 관측이 뒷받침하는 범위는 국소적인데 한 번의 맞춤이
+            // 지도 전체로 번질 수 있었다.
+            //
+            // 그래서 3 m 블록으로 자른다. 블록 하나는 격자칸 아홉 개를
+            // 묶으므로 칸 사이의 빈틈은 안에서 메워지고 (말뚝 울타리가
+            // 사라진다), 블록 밖으로는 절대 번지지 않는다 (없는 벽이
+            // 생기지 않는다). 무엇을 그리든 3 m 를 넘지 않는다.
+            const float S = cell * 3.0f;
+            const auto sdiv = [](int v) { return (v >= 0) ? v / 3 : -((-v + 2) / 3); };
+
+            struct Blk {
+                std::vector<float> tops, gnds;
+                Eigen::Vector3f psum{Eigen::Vector3f::Zero()};
+                int n{0};
+                Stuff cls{Stuff::Unknown};
+            };
+            std::unordered_map<std::int64_t, Blk> blocks;
+            for (const auto& [k, c] : cols) {
+                if (c.cls != Stuff::Building && c.cls != Stuff::Fence) continue;
+                if (c.top_eff < 0) continue;
+                if (r2f > 0.0f && (c.rep - egof).squaredNorm() > r2f) continue;
+                const std::int64_t bk =
+                    GroundGrid::key(sdiv(c.i), sdiv(c.j)) * 8
+                    + static_cast<std::int64_t>(c.cls);
+                Blk& b = blocks[bk];
+                b.cls = c.cls;
+                b.tops.push_back(static_cast<float>(c.top_eff + 1) * kBinH);
+                b.gnds.push_back(c.ground);
+                b.psum += c.rep;
+                ++b.n;
+                merged.insert(k);
+            }
+
+            const auto quant = [](std::vector<float>& v, double q) {
+                const std::size_t i = std::min(
+                    v.size() - 1,
+                    static_cast<std::size_t>(static_cast<double>(v.size()) * q));
+                std::nth_element(v.begin(),
+                                 v.begin() + static_cast<std::ptrdiff_t>(i), v.end());
+                return v[i];
+            };
+
+            for (auto& [bk, b] : blocks) {
+                // 아홉 칸 중 한 칸만 찬 블록은 근거가 얇다. 잡음이 한 칸에
+                // 뭉친 것을 3 m 짜리 건물로 세우지 않는다.
+                if (b.n < 2) continue;
+                const float h  = quant(b.tops, 0.7);
+                const float wg = quant(b.gnds, 0.5);
+                if (h <= 0.3f) continue;
+
+                // 블록 중심의 수평 위치는 그 안 칸들의 평균이다. 격자에
+                // 딱 맞추면 벽이 실제보다 최대 1.5 m 옮겨 앉는다.
+                const Eigen::Vector3f pm = b.psum / static_cast<float>(b.n);
+                const Eigen::Vector3f mid =
+                    pm + up * (wg + h * 0.5f - pm.dot(up));
+
+                // 밑면은 블록보다 살짝 크게. 이웃 블록과 맞닿아 벽이 이어진다.
+                const float hw = S * 0.55f;
+                solidBox(mid.cast<double>(),
+                         (g.a * hw).cast<double>(),
+                         (up * (h * 0.5f)).cast<double>(),
+                         (g.b * hw).cast<double>(),
+                         orb, f, stuffColor(b.cls),
+                         (b.cls == Stuff::Fence) ? 0.92 : 1.0);
+            }
+        }
+
         for (const auto& [k, c] : cols) {
             if (c.cls == Stuff::Unknown) continue;
+            if (merged.count(k)) continue;      // 이미 한 장으로 그렸다
             if (r2f > 0.0f && (c.rep - egof).squaredNorm() > r2f) continue;
             // 레이어 격리: 4 는 구조물만, 5 는 지면만.
             if (layer == 4 && c.cls == Stuff::Ground) continue;
@@ -2508,6 +2935,8 @@ public:
             // 맡는다 - 관측 칸을 하나씩 그리면 성긴 곳은 구멍이, 잡음이 있는
             // 곳은 어긋난 타일이 생겨 평평한 바닥이 누더기가 된다.
             if (c.cls == Stuff::Ground) continue;
+            // 건물/담장을 내렸으면 낱칸으로도 그리지 않는다.
+            if (!walls && (c.cls == Stuff::Building || c.cls == Stuff::Fence)) continue;
 
             // **형상이 클래스를 말한다.**
             //
@@ -2515,7 +2944,7 @@ public:
             // 무엇인지가 화면에서 읽히지 않으니, 좌우의 건물이 하늘에 뜬 잡음
             // 처럼 보였다 - 실제로 그렇게 보고되었다. 건물은 덩어리로, 나무는
             // 줄기 위 수관으로, 담장은 낮은 판으로 그린다.
-            const int tb = std::min(c.topBin(), c.topRun());
+            const int tb = c.top_eff;
             if (tb < 0) continue;
             // **발치는 자기 관측에서, 지붕은 이웃과 함께.** 지면 높이는 이미
             // 반경 안의 최저점에서 왔으므로 칸마다 흔들리지 않는다. 흔들리는
@@ -2593,8 +3022,7 @@ public:
                         const auto it = cols.find(GroundGrid::key(c.i + di, c.j + dj));
                         if (it == cols.end() || it->second.cls != Stuff::Vegetation) continue;
                         ++nveg;
-                        const int nb_top = std::min(it->second.topBin(),
-                                                    it->second.topRun());
+                        const int nb_top = it->second.top_eff;
                         if (nb_top > tb || (nb_top == tb && it->first > k)) {
                             seed = false;
                             break;
@@ -2711,7 +3139,7 @@ public:
                  const Orbit& orb, double f, double fade) {
         const Eigen::Matrix3d M = orb.basis();
         const Eigen::Vector3d eye = orb.center - M.row(2).transpose() * orb.dist;
-        const double cx = img_.cols * 0.5, cy = img_.rows * 0.5;
+        const double cx = ppx(), cy = ppy();
         const float inv = 1.0f / voxel;
 
         auto toScreen = [&](const Eigen::Vector3f& p, cv::Point& out) {
@@ -2755,8 +3183,8 @@ public:
         const Eigen::Vector3d eye = orb.center - M.row(2).transpose() * orb.dist;
         const Eigen::Vector3d v = M * (p - eye);
         if (v.z() < 1e-3) return false;
-        out = {static_cast<int>(img_.cols * 0.5 + f * v.x() / v.z()),
-               static_cast<int>(img_.rows * 0.5 - f * v.y() / v.z())};
+        out = {static_cast<int>(ppx() + f * v.x() / v.z()),
+               static_cast<int>(ppy() - f * v.y() / v.z())};
         return true;
     }
 
@@ -2853,6 +3281,11 @@ public:
 
 private:
     cv::Mat img_, zbuf_;
+    // 거리 감쇠의 기준 거리. 매 프레임 궤도 거리로 맞춘다.
+    double fade_ref_{30.0};
+    // 주점. 기본은 화면 중앙이고, 1 인칭에서는 데이터셋 내부파라미터의
+    // 주점을 화면 크기로 옮겨 넣는다.
+    double pcx_{-1.0}, pcy_{-1.0};
 };
 
 // ===========================================================================
@@ -3094,6 +3527,8 @@ int main(int argc, char** argv) {
     // 거칠어져, 라이다 지도라면 있어야 할 밀도가 남지 않았다.
     int cloud_cap = 900000;
     int start_cam = 0;      // 0 1인칭 / 1 3인칭 / 2 지도 / 3 항공
+    // 자동차 3D 모형(OBJ). 없으면 상자 모형으로 그린다.
+    std::string car_obj;
 
     for (int i = 1; i + 1 < argc; i += 2) {
         const std::string k = argv[i];
@@ -3106,6 +3541,7 @@ int main(int argc, char** argv) {
         else if (k == "--dump-features") dump_feat = argv[i + 1];
         else if (k == "--all") drive_only = false;
         else if (k == "--cam") start_cam = std::atoi(argv[i + 1]);
+        else if (k == "--car-model") car_obj = argv[i + 1];
     }
 
     const fs::path scene_dir = fs::path(manifest).parent_path();
@@ -3117,6 +3553,19 @@ int main(int argc, char** argv) {
             "  python tools/bench_export.py  (-> results/bench/viewer.tsv)\n"
             "지표를 여기서 다시 계산하지 않으므로, 없으면 실행하지 않는다.\n";
         return 1;
+    }
+
+    // 자동차 모형을 한 번 읽는다. 못 읽으면 조용히 넘어가지 않고 말한다 -
+    // 지정했는데 안 나오면 왜 안 나오는지 화면에 단서가 없다.
+    TriMesh car_mesh;
+    if (!car_obj.empty()) {
+        if (loadObj(car_obj, car_mesh)) {
+            std::cout << "자동차 모형: " << car_obj << "  정점 " << car_mesh.vert.size()
+                      << ", 삼각형 " << car_mesh.tri.size() << std::endl;
+        } else {
+            std::cerr << "자동차 모형을 읽지 못했다: " << car_obj
+                      << " (상자 모형으로 그린다)" << std::endl;
+        }
     }
 
     const bool headless = !shot_path.empty();
@@ -3187,6 +3636,17 @@ int main(int argc, char** argv) {
     // 보려던 것은 지도다. L / O 로 필요할 때 켠다.
     // 라벨을 기본으로 켠다. 형상이 있어야 무엇을 인식했는지가 보인다.
     bool show_stuff = true;        // L 로 토글
+    // **건물/담장은 기본으로 그리지 않는다.** B 로 켠다.
+    //
+    // 이 클래스는 우리가 그리는 것 중 근거가 가장 약하면서 화면 면적은
+    // 가장 크다. 측정해 둔 대로 선형·밀집 가지에서 벽 조각과 나무줄기 줄이
+    // 국소 구조가 같아 갈리지 않고 (vert p75 가 겹치고 scatter 는 소수점
+    // 셋째 자리까지 같다), 그 결과가 화면 절반을 덮는 파란 직사각형이었다.
+    //
+    // 못 믿을 것을 가장 크게 그리면 나머지가 맞아도 화면 전체가 틀려 보인다.
+    // 도로 밝기·검출된 차량·나무·기둥은 각자 근거가 분명하므로 그대로 두고,
+    // 근거가 약한 것만 내린다. 분류가 좋아지면 기본값을 되돌리면 된다.
+    bool show_walls = false;       // B 로 토글
     // 앞을 내다본 것과 그 성적표.
     std::unordered_map<std::int64_t, Prediction> pred[2];
     PredictScore pscore[2];
@@ -3311,9 +3771,11 @@ int main(int argc, char** argv) {
             // 도달하지 못한 그림이 저장된다.
             orb.pitch += (want_pitch - orb.pitch) * (headless ? 1.0 : 0.25);
             if (!user_zoomed) {
-                // 1 인칭은 눈이 자차에 있어야 하므로 궤도 반지름이 거의 0 이다.
-                // 3 인칭은 자차가 화면 아래쪽에 오도록 조금 뒤에 선다.
-                if (cam_mode == 0)      orb.dist = base_dist * 0.06;
+                // 1 인칭은 눈이 **자차에** 있어야 한다. 0.06 배는 "거의 0" 을
+                // 뜻했지만 KITTI 에서 그 값이 4.2 m 다 - 진짜 카메라보다 4 m
+                // 뒤에서 보고 있었으니 가까운 것일수록 위치가 어긋난다.
+                // 옆 CAMERA 패널과 견주는 뷰이므로 눈은 카메라 자리여야 한다.
+                if (cam_mode == 0)      orb.dist = 0.05;
                 // 3 인칭은 **지도 반경보다 멀리** 선다. 24.5 m 에서 반경 55 m
                 // 짜리 지도를 보면 프레임이 통째로 지도가 되고, 그것이 "하늘이
                 // 채워졌다" 로 읽혔다. 라이다 시각화가 늘 높고 멀리서 보는
@@ -3388,6 +3850,31 @@ int main(int argc, char** argv) {
             // ---- 3D 뷰포트 ----
             const cv::Rect vp(box.x + 14, box.y + 74, box.width - 28, vp_h);
             cloud[k].reset(vp.width, vp.height);
+
+            // **1 인칭은 진짜 카메라와 같은 화각으로 그린다.**
+            //
+            // 모든 뷰가 f = vp.width * 0.9 를 쓰고 있었다. 그것은 수평 화각
+            // 58 도인데 KITTI 카메라는 fx 718.856 에 폭 1241 이라 81.6 도다.
+            // 1.55 배 확대해 놓고 옆의 CAMERA 패널과 견주고 있었던 셈이라,
+            // 같은 것을 그려도 화면 위치와 크기가 맞을 수가 없다 - "배치가
+            // 카메라와 다르다" 의 가장 큰 몫이 형상이 아니라 여기 있었다.
+            //
+            // 내부파라미터를 화면 크기로 옮기면 화각이 같아진다. 주점도
+            // 함께 옮긴다 - KITTI 는 주점이 중앙에서 13 px 벗어나 있다.
+            //
+            // 궤도/지도/항공 뷰는 카메라와 견줄 대상이 아니므로 그대로 둔다.
+            double fpx = vp.width * 0.9;
+            if (cam_mode == 0 && s.calib.K.valid()) {
+                const double sx = static_cast<double>(vp.width)
+                                / static_cast<double>(s.calib.K.width);
+                fpx = s.calib.K.fx * sx;
+                cloud[k].setPrincipal(s.calib.K.cx * sx,
+                                      vp.height * 0.5
+                                      + (s.calib.K.cy
+                                         - s.calib.K.height * 0.5) * sx);
+            } else {
+                cloud[k].setPrincipal(-1.0, -1.0);
+            }
 
             // **각 패널은 자기 인식 시점에 걸린다.**
             //
@@ -3857,7 +4344,14 @@ int main(int argc, char** argv) {
                 }
                 // **바닥 격자를 먼저 깐다.** 지도보다 나중에 그리면 격자선이
                 // 구조 위를 가로질러 지나간다.
-                cloud[k].groundPlane(ego_k, plane_h, ob.world_up, ob, vp.width * 0.9,
+                // 거리 감쇠의 기준은 **장면 규모** 다. 실내 3 m 장면과 도로
+                // 55 m 장면에 같은 상수를 쓰면 한쪽은 전부 어둡고 다른 쪽은
+                // 감쇠가 아예 안 걸린다.
+                //
+                // 궤도 거리를 쓰면 안 된다 - 1 인칭에서 그 값은 4 m 라서
+                // 12 m 밖이 통째로 어두워진다. 화면에 담으려는 범위가 기준이다.
+                cloud[k].setFadeRef(map_r);
+                cloud[k].groundPlane(ego_k, plane_h, ob.world_up, ob, fpx,
                                      (s.dataset == "kitti") ? 5.0 : 0.5, map_r);
 
                 // **노면은 밝기로 칠한다.**
@@ -3872,7 +4366,7 @@ int main(int argc, char** argv) {
                     // 칸은 멀어지면 화면에서 사라지므로 그릴 값이 없고, 그
                     // 자리는 아래 격자면이 이미 채우고 있다.
                     cloud[k].roadTexture(road[k], road_a, road_b, ob.world_up,
-                                         ob, vp.width * 0.9, ego_k,
+                                         ob, fpx, ego_k,
                                          std::min(map_r, (s.dataset == "kitti")
                                                          ? 28.0 : 5.0));
                 }
@@ -3895,15 +4389,15 @@ int main(int argc, char** argv) {
                                     plane_h, 0.40, stuff[k], gg, surf[k]);
                         surf_at[k] = ego_k;
                     }
-                    cloud[k].surface(surf[k], ob, vp.width * 0.9,
+                    cloud[k].surface(surf[k], ob, fpx,
                                      cv::Scalar(196, 186, 170));
                 }
                 // 원시 점군은 근거를 보고 싶을 때만. 기본 화면은 형상이다.
                 if (L_map && show_cubes) {
-                    cloud[k].draw(near_pts, ob, vp.width * 0.9, 0.62);
+                    cloud[k].draw(near_pts, ob, fpx, 0.62);
                 }
                 if (show_cubes && !show_surf && L_map && false) {
-                    cloud[k].voxelCubes(near_pts, acc[k].voxel, ob, vp.width * 0.9,
+                    cloud[k].voxelCubes(near_pts, acc[k].voxel, ob, fpx,
                                         ob.world_up, 0.45);
                 }
                 prof_cloud[k] = std::chrono::duration<double, std::milli>(
@@ -3954,8 +4448,8 @@ int main(int argc, char** argv) {
                         const auto t_vec = std::chrono::steady_clock::now();
                         if (layer == 0 || layer == 4 || layer == 5) {
                             cloud[k].stuffVectors(stuff[k], ob.world_up, ccell,
-                                                  ob, vp.width * 0.9, layer,
-                                                  ego_k, map_r);
+                                                  ob, fpx, layer,
+                                                  ego_k, map_r, show_walls);
                         }
                         const auto t_end = std::chrono::steady_clock::now();
                         prof_label[k] = std::chrono::duration<double, std::milli>(
@@ -3993,7 +4487,7 @@ int main(int argc, char** argv) {
                             }
                             const auto t_p1 = std::chrono::steady_clock::now();
                             cloud[k].predictions(pred[k], ob.world_up, ob,
-                                                 vp.width * 0.9, ego_k,
+                                                 fpx, ego_k,
                                                  (s.dataset == "kitti") ? 130.0 : 14.0,
                                                  ccell);
                             const auto t_p2 = std::chrono::steady_clock::now();
@@ -4009,13 +4503,13 @@ int main(int argc, char** argv) {
                                 1.0 - static_cast<double>(v.second.seen) / span, 0.0, 1.0));
                         }
                         cloud[k].lattice(mesh[k].cells, mesh[k].voxel, ob,
-                                         vp.width * 0.9, 0.72);
+                                         fpx, 0.72);
                     }
                 }
             }
 
             // 궤적 (정답 + 추정)
-            const double f3 = vp.width * 0.9;
+            const double f3 = fpx;
 
             // 거리 링. 간격은 장면 규모에서 정한다 - 실내 0.5 m, 도로 10 m.
             {
@@ -4126,6 +4620,19 @@ int main(int argc, char** argv) {
                                               m.cls == "bicycle" || m.cls == "train");
                         const bool person = (m.cls == "person");
 
+                        // **사람은 지도 가구가 아니다.**
+                        //
+                        // 잔상 방지는 dynamic 으로 판정된 것에만 걸려 있었다.
+                        // 그런데 서 있는 사람은 움직이지 않았으므로 dynamic 이
+                        // 되지 않고, 그러면 한 번 검출된 사람이 그 자리에
+                        // **영원히** 서 있게 된다 - 카메라에는 아무도 없는
+                        // 골목에 골격 둘이 서 있던 것이 그것이다.
+                        //
+                        // 주차된 차는 다시 가 보면 그 자리에 있지만 사람은
+                        // 아니다. 지금 보고 있지 않은 사람을 계속 그리는 것은
+                        // 관측이 뒷받침하지 않는 주장이다. 최근에 본 것만 그린다.
+                        if (person && frame - m.seen > 12) continue;
+
                         // **움직인다고 판정된 것은 지도의 일부가 아니다.**
                         // 지나온 자리에 남기지 않고, 지금 있는 자리에만 그린다.
                         // 그 자리에 쌓였던 복셀은 이미 지워졌다.
@@ -4137,9 +4644,17 @@ int main(int argc, char** argv) {
                             // 이동 방향은 첫 관측에서 지금까지의 변위다.
                             const Eigen::Vector3d mv = m.cur_c - m.first_c;
                             if (vehicle) {
-                                cloud[k].carModel(m.center(), m.size(),
-                                                  mv.norm() > 0.2 ? mv : pan_head[k],
-                                                  ob.world_up, ob, f3, C_WARN);
+                                const Eigen::Vector3d hd =
+                                    mv.norm() > 0.2 ? mv : pan_head[k];
+                                if (car_mesh.valid() &&
+                                    cloud[k].screenSpan(m.center(), m.size().maxCoeff(),
+                                                        ob, f3) > 24.0) {
+                                    cloud[k].meshModel(car_mesh, m.center(), m.size(),
+                                                       hd, ob.world_up, ob, f3, C_WARN);
+                                } else {
+                                    cloud[k].carModel(m.center(), m.size(), hd,
+                                                      ob.world_up, ob, f3, C_WARN);
+                                }
                             } else if (person) {
                                 cloud[k].personSkeleton(m.center(), m.size(),
                                                         ob.world_up,
@@ -4178,9 +4693,19 @@ int main(int argc, char** argv) {
                         // 항등 변환으로 그린다.
                         if (vehicle) {
                             const Eigen::Vector3d mv = m.cur_c - m.first_c;
-                            cloud[k].carModel(m.center(), m.size(),
-                                              mv.norm() > 0.3 ? mv : pan_head[k],
-                                              ob.world_up, ob, f3, col);
+                            const Eigen::Vector3d hd =
+                                mv.norm() > 0.3 ? mv : pan_head[k];
+                            // 화면에서 충분히 클 때만 삼각형 모형을 돌린다.
+                            // 멀리서는 상자 모형이 보이는 것과 같고 훨씬 싸다.
+                            if (car_mesh.valid() &&
+                                cloud[k].screenSpan(m.center(), m.size().maxCoeff(),
+                                                    ob, f3) > 24.0) {
+                                cloud[k].meshModel(car_mesh, m.center(), m.size(),
+                                                   hd, ob.world_up, ob, f3, col);
+                            } else {
+                                cloud[k].carModel(m.center(), m.size(), hd,
+                                                  ob.world_up, ob, f3, col);
+                            }
                         } else if (person) {
                             const Eigen::Vector3d mv2 = m.cur_c - m.first_c;
                             cloud[k].personSkeleton(m.center(), m.size(), ob.world_up,
@@ -4231,7 +4756,23 @@ int main(int argc, char** argv) {
                             const cv::Scalar col = vehicle ? accent
                                                  : (person ? C_WARN : C_INK3);
 
-                            cloud[k].box3(Tsnap, b.center, b.size, ob, f3, col, 1);
+                            // **몸통은 여기서 그리지 않는다.**
+                            //
+                            // 이 자리는 와이어프레임 상자였고, 한때 차 모형으로
+                            // 바꿔 봤다. 둘 다 틀렸다 - 기억 물체 쪽이 이미
+                            // 같은 차를 형상으로 그리고 있어서, 상자면 차 위에
+                            // 상자가 덮이고 형상이면 **차가 두 대로 겹쳐 보인다.**
+                            // 실제로 그렇게 보고되었다.
+                            //
+                            // 이 루프가 기억 쪽에 없는 것은 하나뿐이다: 이번
+                            // 프레임에 그 자리를 **지금 보고 있다** 는 사실.
+                            // 그것은 지면 발자국으로 충분하고, 발자국은 항공뷰
+                            // 에서 물체의 점유 면적을 읽는 단위이기도 하다.
+                            // 몸통을 두 번 그리는 것은 관측이 두 개라는 뜻이
+                            // 아니라 같은 관측을 두 번 그린 것이다.
+                            if (!vehicle && !person) {
+                                cloud[k].box3(Tsnap, b.center, b.size, ob, f3, col, 1);
+                            }
                             // 지면 발자국. 항공뷰에서는 이것이 물체의 본체다.
                             cloud[k].footprint(Tsnap, b.center, b.size, ob.world_up,
                                                ob, f3, col, 2);
@@ -4273,8 +4814,12 @@ int main(int argc, char** argv) {
                     }
                 }
 
-                // 현재 카메라 프러스텀
-                if (upto > 0) {
+                // 현재 카메라 프러스텀.
+                //
+                // **1 인칭에서는 그리지 않는다.** 눈이 곧 그 카메라 자리이므로
+                // 프러스텀은 눈앞 몇 cm 에 놓이고, 화면을 가로지르는 거대한
+                // X 가 된다 - 자기 눈을 그리는 셈이다.
+                if (upto > 0 && cam_mode != 0) {
                     const Eigen::Isometry3d& T = run.aligned[static_cast<std::size_t>(upto - 1)];
                     const double sc3 = std::max(0.05, ob.dist * 0.03);
                     const Eigen::Vector3d o = T.translation();
@@ -4556,7 +5101,7 @@ int main(int argc, char** argv) {
             label(canvas, "controls", {hx, fy + 72}, C_INK3);
             text(canvas, "SPACE play    , . step    N/P sequence    1/2 swap model",
                  {hx, fy + 100}, T_BODY, C_INK2);
-            text(canvas, "A/D orbit  W/S zoom  V camera  T layer  C cubes  L labels  O lookahead  R restart  F shot  Q quit",
+            text(canvas, "A/D orbit  W/S zoom  V camera  T layer  C cubes  L labels  B walls  O lookahead  R restart  F shot  Q quit",
                  {hx, fy + 126}, T_BODY, C_INK2);
         }
         {
@@ -4718,6 +5263,7 @@ int main(int argc, char** argv) {
         else if (key == 'v' || key == 'V') { cam_mode = (cam_mode + 1) % 4; user_zoomed = false; }
         else if (key == 'm' || key == 'M') show_mesh = !show_mesh;
         else if (key == 'l' || key == 'L') show_stuff = !show_stuff;
+        else if (key == 'b' || key == 'B') show_walls = !show_walls;
         // 예측 토글은 O 다. P 는 **이전 시퀀스** 로 이미 잡혀 있었고, 여기에
         // 토글을 얹으니 아래 분기가 영영 안 닿아 시퀀스 되감기가 통째로
         // 죽었다 - if/else 사슬에서 같은 키를 두 번 쓰면 뒤엣것은 없는 코드다.
