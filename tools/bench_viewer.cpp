@@ -588,6 +588,9 @@ struct Column {
     // 구조 텐서가 준 평면 법선. 건물 벽면을 평면으로 그릴 때 쓴다 -
     // 잡음을 펴는 것과 원래 평면인 것을 평면으로 그리는 것은 다르다.
     Eigen::Vector3f normal{Eigen::Vector3f::Zero()};
+    // 5x5 이웃 중 점유된 칸 수. 기둥과 벽을 가르는 데 쓴다 -
+    // 기둥은 홀로 서 있고 벽은 이웃이 빽빽하다.
+    std::uint8_t crowd{0};
     Stuff cls{Stuff::Unknown};
 
     // 최고 점유 칸. 이상치 하나에 그대로 끌려간다.
@@ -605,6 +608,40 @@ struct Column {
             if ((bins & (1u << b)) && (bins & (1u << (b - 1)))) return b;
         }
         return (bins & 1u) ? 0 : -1;
+    }
+
+    // **아래에서부터 이어져 올라간 꼭대기.**
+    //
+    // topBin 은 아래 칸이 찼는지만 묻지, 그 두 칸이 지면과 이어져 있는지는
+    // 묻지 않는다. 나뭇가지나 전선처럼 공중에 뜬 두 칸이 있으면 그 칸의
+    // 높이가 통째로 그리로 끌려가고, 화면에는 8 m 짜리 집 위에 16 m 짜리
+    // 탑이 선다 - 지도가 막대그래프처럼 보이던 이유의 절반이 이것이다.
+    //
+    // 첫 점유 칸에서 출발해 위로 올라가되, 빈 칸이 셋(1.5 m) 넘게 이어지면
+    // 거기서 멈춘다. 한두 칸의 구멍은 관측이 성겨서 생기므로 넘어간다.
+    // 출발을 첫 점유 칸으로 잡는 것도 같은 이유다 - 주차된 차에 가려 벽의
+    // 발치를 못 본 칸이 흔한데, 지면부터 요구하면 그 벽이 통째로 사라진다.
+    // 지면부터 그 칸까지 몇 층이 찼는가. 0..1.
+    //
+    // 지붕과 수관은 둘 다 "위쪽에 있는 수평 평면 조각" 이라 구조 텐서로는
+    // 갈리지 않는다 - 스테레오가 보는 것은 수관의 **겉면** 이고 겉면은
+    // 평면이기 때문이다. 갈리는 곳은 그 **아래** 다: 지붕 밑에는 벽이 있어
+    // 기둥이 위아래로 차 있고, 수관 밑에는 공기와 가는 줄기뿐이라 비어 있다.
+    float fillTo(int top) const {
+        if (top < 0) return 0.0f;
+        int occ = 0;
+        for (int b = 0; b <= top; ++b) if (bins & (1u << b)) ++occ;
+        return static_cast<float>(occ) / static_cast<float>(top + 1);
+    }
+
+    int topRun() const {
+        int best = -1, gap = 0;
+        bool started = false;
+        for (int b = 0; b < kBins; ++b) {
+            if (bins & (1u << b)) { best = b; gap = 0; started = true; }
+            else if (started && ++gap > 3) break;
+        }
+        return best;
     }
 };
 
@@ -663,22 +700,97 @@ inline Stuff classifyColumn(const Column& c) {
     // 눈대중으로 정하면 분포의 어디에 걸리는지 알 수 없고, 한 클래스가 90 %
     // 를 먹는 일이 조용히 일어난다 - 실제로 두 번 그랬다.
 
-    // 법선이 위를 향하는 평면이고 낮으면 지면.
-    if (c.vert < 0.30f && c.planarity > 0.25f && top_m < 1.2f) return Stuff::Ground;
+    // **독립 문턱을 차례로 묻지 않는다. 무엇이 지배적인가를 묻는다.**
+    //
+    // 앞서는 scatter > 0.36 을 먼저 물었고, 그것은 p75 이라 전체의 4 분의 1 이
+    // 무조건 통과했다. 벽면의 스테레오 잡음으로 그 선을 넘으면 **평면성과
+    // 법선을 보기도 전에** 나무가 되었다 - 건물 41 칸에 나무 388 칸이 그
+    // 순서의 결과다. 한 칸이 동시에 "퍼져 있고" "납작하다" 일 수 있는데
+    // 먼저 물은 쪽이 이기는 구조였다.
+    //
+    // 세 값은 고유값에서 나오고 합이 1 이다. 즉 서로 배타적인 후보이므로
+    // 가장 큰 것을 고르는 것이 원래 맞는 사용법이다 (Weinmann 등이 쓰는
+    // 차원 특징의 표준 형태다).
+    const float pl = c.planarity, li = c.linearity, sc = c.scatter;
 
-    // 세 방향으로 고르게 퍼진 것은 면도 선도 아니다 - 잎이다. p75 위.
-    if (c.scatter > 0.36f && top_m >= 1.5f) return Stuff::Vegetation;
+    if (pl >= li && pl >= sc) {
+        // 평면이다. 법선의 방향이 바닥과 벽을 가른다.
+        if (c.vert > 0.55f) {
+            // 수직면. 높으면 건물, 낮으면 담장.
+            return (top_m >= 2.5f) ? Stuff::Building : Stuff::Fence;
+        }
+        if (top_m < 1.2f) return Stuff::Ground;
 
-    // 납작하고 법선이 수평이면 수직면. 높으면 건물, 낮으면 담장.
-    if (c.planarity > 0.34f && c.vert > 0.60f) {
-        return (top_m >= 3.0f) ? Stuff::Building : Stuff::Fence;
+        // **서 있지도 누워 있지도 않은, 기울어진 면.**
+        //
+        // 여기가 나무가 사라지던 자리다. 스테레오가 보는 것은 수관의 **겉면**
+        // 이고, 겉면은 국소적으로 평면이다. 그래서 가로수길인 kitti_04 에서
+        // 이 가지에 502 칸이 몰렸고 전부 건물이 되었다 - 화면에는 나무가
+        // 스물네 그루뿐인 파란 블록 숲이 남았다.
+        //
+        // 프로파일의 빈 칸으로는 못 가른다. 실측에서 나무길 쪽이 오히려 더
+        // 꽉 차 있었다 (fill p50 = 1.00 대 주택가 0.94) - 길가 덤불부터
+        // 수관까지 이어져 보이기 때문이다.
+        //
+        // 가르는 것은 **법선의 기울기** 다. 같은 가지 안에서:
+        //
+        //   kitti_04 (가로수길)  vert p25 0.24  p50 0.42  p75 0.47
+        //   kitti_00 (주택가)    vert p25 0.01  p50 0.04  p75 0.13
+        //
+        // 도로면과 지붕은 진짜로 수평이라 vert 가 0 에 붙는다. 잎 덩어리의
+        // 겉면은 어느 쪽으로든 기울어 있어 0.4 근처에 앉는다. 0.30 은 두
+        // 분포 사이의 빈 구간이다.
+        if (c.vert > 0.30f) return Stuff::Vegetation;
+        return Stuff::Building;
     }
-    // 한 방향으로 길고 가늘다. p90 위.
-    if (c.linearity > 0.63f && top_m >= 1.5f) return Stuff::Pole;
-    // 법선이 위를 향하는 평면 - 지면이거나 그 위의 평평한 것.
-    if (c.vert < 0.30f && c.planarity > 0.25f) return Stuff::Ground;
-    if (top_m >= 2.0f) return Stuff::Vegetation;
-    return Stuff::Fence;
+    if (li >= sc) {
+        // 선형이다. 그런데 **선형이라고 다 기둥은 아니다.**
+        //
+        // 벽면을 부분적으로만 관측하면 3 m 폭의 점이 세로로 한 줄만 남아
+        // 선형으로 나온다. 그것 전부를 기둥으로 부르면 주택가 도로에 기둥이
+        // 1804 개 서게 된다 - 실제로 그렇게 나왔다.
+        //
+        // 진짜 기둥은 홀로 서 있다. 가로등 하나가 차지하는 지면칸은 서너
+        // 칸이고 그 주위는 비어 있다. 벽은 반대로 이웃이 빽빽하다. 이웃
+        // 밀집도가 그 둘을 가른다.
+        //
+        // 문턱 21 은 밀집도가 "칸이 있는가" 를 세던 시절의 값이라 사실상
+        // 아무 것도 거르지 못했다. 솟은 칸만 세도록 고친 뒤 다시 재니
+        // kitti_00 에서 기둥 판정 칸의 밀집도가 p25 14 / p50 16 이었고,
+        // **확실한 벽면(vert > 0.55)이 p25 15 / p50 16 으로 같았다.**
+        // 기둥이라고 부르던 312 칸이 전부 벽·덤불 조각이었다는 뜻이다.
+        //
+        // 가로등이라면 자기 칸 서넛뿐이라 밀집도가 한 자릿수여야 한다.
+        // 8 로 자르면 주택가 한 구간에 기둥 스무남은 개가 남는다 - 가로등과
+        // 표지판의 수가 원래 그 정도다.
+        if (top_m < 1.5f) return Stuff::Ground;
+        if (c.crowd >= 8) {
+            // 이웃이 빽빽하다 - 홀로 선 것이 아니라 덩어리의 일부다.
+            //
+            // **여기서 덩어리가 벽인지 나무인지는 가르지 못한다.** 세 가지를
+            // 재 봤고 셋 다 갈라지지 않았다 (kitti_00 주택가 vs kitti_04
+            // 가로수길, 이 가지에 든 칸만):
+            //
+            //           kitti_00(벽)          kitti_04(나무)
+            //   vert    p25 .03 p50 .13 p75 .44   p25 .07 p50 .29 p75 .44
+            //   scatter p25 .07 p50 .118 p75 .21  p25 .04 p50 .121 p75 .20
+            //   밝기    p25 55  p50 85   p75 121   p25 55  p50 100  p75 148
+            //
+            // vert 는 중앙값만 벌어지고 p75 가 겹친다. 산포는 소수점 셋째
+            // 자리까지 같다. 밝기는 가설과 **반대로** 나무 쪽이 밝다 -
+            // 하늘을 등진 잎이 회백색으로 날아가기 때문이다.
+            //
+            // 0.3 m 복셀에 1 m 격자에서, 옆에서 본 벽 조각과 나무줄기 줄은
+            // 국소 구조가 실제로 같다. 여기서 문턱을 만들면 kitti_04 에서
+            // 170 칸을 얻고 kitti_00 에서 160 칸을 잃는 맞바꾸기일 뿐이라,
+            // 가르지 못한다는 사실을 그대로 두고 덩어리 기본값을 쓴다.
+            return (top_m >= 2.5f) ? Stuff::Building : Stuff::Fence;
+        }
+        return Stuff::Pole;
+    }
+    // 산포가 지배적이다 - 면도 선도 아닌 부피. 잎이 그렇다.
+    if (top_m >= 1.5f) return Stuff::Vegetation;
+    return Stuff::Ground;
 }
 
 // 지도 전체를 기둥으로 접어 라벨을 붙인다.
@@ -741,7 +853,7 @@ inline void labelScene(const std::unordered_map<std::int64_t, Splat>& cells,
         for (int di = -ground_radius; di <= ground_radius; ++di) {
             for (int dj = -ground_radius; dj <= ground_radius; ++dj) {
                 const auto it = fresh.find(GroundGrid::key(c.i + di, c.j + dj));
-                if (it != cols.end()) nb.push_back(it->second.low);
+                if (it != fresh.end()) nb.push_back(it->second.low);
             }
         }
         if (nb.empty()) { c.ground = c.low; continue; }
@@ -757,7 +869,7 @@ inline void labelScene(const std::unordered_map<std::int64_t, Splat>& cells,
     for (const auto& [k, v] : cells) {
         if ((v.p - e).squaredNorm() > r2) continue;
         const auto it = fresh.find(g.key(v.p));
-        if (it == cols.end()) continue;
+        if (it == fresh.end()) continue;
         const float rel = v.p.dot(g.up) - it->second.ground;
         const int b = static_cast<int>(std::floor(rel / kBinH));
         if (b >= 0 && b < kBins) it->second.bins |= (1u << b);
@@ -821,6 +933,28 @@ inline void labelScene(const std::unordered_map<std::int64_t, Splat>& cells,
         // 법선이 "위" 와 이루는 각. 수직면이면 법선이 수평이라 내적이 0 이다.
         c.vert = static_cast<float>(1.0 - std::abs(nrm.dot(g.up.cast<double>())));
         c.normal = nrm.cast<float>();
+        // 이웃 밀집도. 5x5 = 25 칸 중 **지면 위로 솟은** 칸이 몇인가.
+        //
+        // 선형으로 나온 칸이 홀로 선 기둥인지 옆에서 본 벽인지는 이것으로만
+        // 갈린다 - 구조 텐서는 그 칸 안만 보므로 답을 줄 수 없다.
+        //
+        // **칸이 있는지를 세면 안 된다.** 처음에 그렇게 했더니 도로 위에서는
+        // 노면 칸이 25 칸을 다 채워, 인도에 홀로 선 가로등이 벽면보다 높은
+        // 밀집도를 받았다 - 재려던 것과 정확히 반대다. 실측에서 기둥으로
+        // 판정된 칸의 중앙값이 18 이었고 문턱 21 은 그 바로 위였다.
+        //
+        // 세어야 하는 것은 **솟은 것이 몇 칸인가** 다. 가로등은 자기 한두
+        // 칸뿐이고 벽은 한 줄이 통째로 솟는다.
+        {
+            int occ = 0;
+            for (int di = -2; di <= 2; ++di) {
+                for (int dj = -2; dj <= 2; ++dj) {
+                    const auto it = fresh.find(GroundGrid::key(c.i + di, c.j + dj));
+                    if (it != fresh.end() && it->second.topBin() >= 2) ++occ;
+                }
+            }
+            c.crowd = static_cast<std::uint8_t>(occ);
+        }
         c.cls = classifyColumn(c);
     }
 
@@ -835,14 +969,47 @@ inline void labelScene(const std::unordered_map<std::int64_t, Splat>& cells,
         std::unordered_map<std::int64_t, Stuff> voted;
         voted.reserve(fresh.size());
         for (const auto& [k, c] : fresh) {
-            // **Unknown 은 투표에 넣지 않는다.**
+            // **Unknown 은 투표에서 남을 덮지 못한다. 다만 덮일 수는 있다.**
             //
             // Unknown 은 "점이 부족해 판정을 못 했다" 이지 하나의 클래스가
             // 아니다. 그것을 표로 세면 성긴 칸이 다수를 이루는 곳에서 멀쩡히
             // 분류된 벽면까지 Unknown 으로 덮인다 - 실제로 미상이 2897 에서
             // 10776 으로 늘고 건물이 382 에서 100 으로 줄었다. 모른다는 것이
-            // 안다는 것을 이길 수는 없다.
-            if (c.cls == Stuff::Unknown) { voted[k] = c.cls; continue; }
+            // 안다는 것을 이길 수는 없다. 그래서 Unknown 은 위 집계에서 빠진다.
+            //
+            // 그런데 **반대 방향은 막을 이유가 없다.** 벽면 한가운데의 칸이
+            // 구조 텐서에 필요한 점 여덟 개를 못 모았다고 해서 그 자리가
+            // 벽이 아닌 것은 아니다. 그 칸은 화면에서 통째로 빠지고, 이어져야
+            // 할 벽면이 빗살처럼 뚫린다.
+            //
+            // 두 가지를 요구한다. 첫째, 그 칸이 **자기 관측을 가질 것**
+            // (topBin >= 0) - 아무 것도 못 본 칸을 이웃으로 메우면 그것은
+            // 없는 구조를 지어내는 것이다. 둘째, 여덟 이웃 중 **넷 이상이
+            // 한 클래스일 것** - 덩어리 가장자리가 아니라 안쪽이어야 한다.
+            //
+            // 실측(kitti_00 한 패스): 미상 1354 칸 중 자기 관측이 있는 것이
+            // 789, 그중 이웃 다수가 셋 이상인 것이 300 이다. 나머지 565 는
+            // 지면 위에 아무 것도 없는 칸이라 애초에 그릴 것이 없다.
+            if (c.cls == Stuff::Unknown) {
+                voted[k] = c.cls;
+                if (c.topBin() < 0) continue;
+                int m[6] = {0, 0, 0, 0, 0, 0};
+                for (int di = -1; di <= 1; ++di) {
+                    for (int dj = -1; dj <= 1; ++dj) {
+                        if (di == 0 && dj == 0) continue;
+                        const auto it = fresh.find(GroundGrid::key(c.i + di, c.j + dj));
+                        if (it == fresh.end()) continue;
+                        const Stuff s = it->second.cls;
+                        if (s != Stuff::Unknown) m[static_cast<int>(s)]++;
+                    }
+                }
+                int fill_best = 0, fill_n = 0;
+                for (int ci = 1; ci < 6; ++ci) {
+                    if (m[ci] > fill_n) { fill_n = m[ci]; fill_best = ci; }
+                }
+                if (fill_n >= 4) voted[k] = static_cast<Stuff>(fill_best);
+                continue;
+            }
             int n[6] = {0, 0, 0, 0, 0, 0};
             for (int di = -2; di <= 2; ++di) {
                 for (int dj = -2; dj <= 2; ++dj) {
@@ -1502,7 +1669,17 @@ public:
                      const Eigen::Vector3d& ego, double radius) {
         const Eigen::Vector3d up = up_d.normalized();
         const Eigen::Vector3d ad = a.cast<double>(), bd = b.cast<double>();
-        const double h = 0.5 * kRoadCell;
+        // **칸을 칸보다 크게 그린다.**
+        //
+        // 정확히 칸 크기로 그리면 관측되지 않은 칸이 검은 구멍으로 남고,
+        // 도로가 아스팔트가 아니라 자갈밭으로 보인다 - 화면에서 가장 넓은
+        // 면적이 그 얼룩이었다.
+        //
+        // 구멍은 노면이 없어서가 아니라 그 0.1 m 칸을 못 봐서 생긴다. 도로는
+        // 연속면이므로 이웃 칸의 밝기로 덮는 것이 관측에 더 가깝다. 1.7 배로
+        // 겹쳐 그리면 한 칸짜리 구멍이 사라지고, 그보다 넓게 빈 곳은 그대로
+        // 남는다 - 정말로 못 본 곳까지 메우지는 않는다.
+        const double h = 0.85 * kRoadCell;
         const double r2 = radius * radius;
         const Eigen::Matrix3d M = orb.basis();
         const Eigen::Vector3d eye = orb.center - M.row(2).transpose() * orb.dist;
@@ -1859,7 +2036,88 @@ public:
     // 형상이 클래스를 말하게 한다. 자동차는 차체 위에 캐빈이 얹힌 실루엣이고,
     // 사람은 좁고 높은 몸통에 머리가 붙는다. 멀리서 실루엣만 봐도 갈린다.
 
+    // --- 깊이를 지키는 채우기 ---
+    //
+    // **이 클래스에서 3D 로 보이지 않던 것의 원인은 전부 여기 하나였다.**
+    //
+    // 지금까지 클래스 형상(건물·담장·나무)과 물체 모형은 cv::fillConvexPoly 로
+    // 화면에 직접 칠했다. 그리는 순서는 unordered_map 의 순회 순서, 즉 해시
+    // 순서다. 그러면 100 m 뒤의 건물이 눈앞의 건물 위에 칠해지는 일이 매
+    // 프레임 무작위로 일어난다 - 화면이 "떠 있는 판자 더미" 로 보이던 것이
+    // 그것이다. 형상이 나빠서가 아니라 가려짐이 없어서였다.
+    //
+    // 점군(draw)·복셀(voxelCubes)·삼각형 표면(surface)·노면(roadTexture)은
+    // 이미 z 버퍼를 쓰고 있었다. 클래스 형상만 쓰지 않아서, 지도에서 가장 큰
+    // 면적을 차지하는 바로 그것이 깊이 없이 떠 있었다.
+    //
+    // 화소마다 깊이를 비교하고 통과한 자리에만 색과 깊이를 함께 쓴다. EDL 이
+    // 읽는 것도 이 깊이라, 채우는 순간 외곽선과 음영이 같이 따라온다.
+    struct SPt { double x, y, z; bool ok; };
+
+    SPt proj(const Eigen::Vector3d& p, const Eigen::Matrix3d& M,
+             const Eigen::Vector3d& eye, double f) const {
+        const Eigen::Vector3d v = M * (p - eye);
+        SPt s{0, 0, v.z(), v.z() > 1e-3};
+        if (s.ok) {
+            s.x = img_.cols * 0.5 + f * v.x() / v.z();
+            s.y = img_.rows * 0.5 - f * v.y() / v.z();
+        }
+        return s;
+    }
+
+    // 삼각형 하나. surface() 가 쓰던 래스터라이저와 같은 것이다.
+    void rasterTri(const SPt& a, const SPt& b, const SPt& c, const cv::Vec3b& col) {
+        if (!a.ok || !b.ok || !c.ok) return;
+        int x0 = static_cast<int>(std::floor(std::min({a.x, b.x, c.x})));
+        int x1 = static_cast<int>(std::ceil (std::max({a.x, b.x, c.x})));
+        int y0 = static_cast<int>(std::floor(std::min({a.y, b.y, c.y})));
+        int y1 = static_cast<int>(std::ceil (std::max({a.y, b.y, c.y})));
+        if (x1 < 0 || y1 < 0 || x0 >= img_.cols || y0 >= img_.rows) return;
+        // 투영이 튄 삼각형은 화면을 가로지른다. 그리지 않는다.
+        if ((x1 - x0) > img_.cols || (y1 - y0) > img_.rows) return;
+        x0 = std::max(0, x0); y0 = std::max(0, y0);
+        x1 = std::min(img_.cols - 1, x1); y1 = std::min(img_.rows - 1, y1);
+        const double d = (b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y);
+        if (std::abs(d) < 1e-9) return;
+        for (int y = y0; y <= y1; ++y) {
+            float* zr = zbuf_.ptr<float>(y);
+            auto* pr = img_.ptr<cv::Vec3b>(y);
+            for (int x = x0; x <= x1; ++x) {
+                const double px = x + 0.5, py = y + 0.5;
+                const double w0 = ((b.x - a.x) * (py - a.y)
+                                 - (px - a.x) * (b.y - a.y)) / d;
+                const double w1 = ((px - a.x) * (c.y - a.y)
+                                 - (c.x - a.x) * (py - a.y)) / d;
+                if (w0 < 0.0 || w1 < 0.0 || w0 + w1 > 1.0) continue;
+                const double z = a.z + w1 * (b.z - a.z) + w0 * (c.z - a.z);
+                if (z <= 1e-3 || z >= zr[x]) continue;
+                zr[x] = static_cast<float>(z);
+                pr[x] = col;
+            }
+        }
+    }
+
+    // 볼록 다각형을 부채꼴 삼각형으로 쪼개 깊이와 함께 채운다.
+    void fillPoly3(const Eigen::Vector3d* q, int n, const Orbit& orb, double f,
+                   const cv::Scalar& col) {
+        if (n < 3) return;
+        const Eigen::Matrix3d M = orb.basis();
+        const Eigen::Vector3d eye = orb.center - M.row(2).transpose() * orb.dist;
+        std::vector<SPt> s(static_cast<std::size_t>(n));
+        for (int i = 0; i < n; ++i) s[static_cast<std::size_t>(i)] = proj(q[i], M, eye, f);
+        const cv::Vec3b c8(static_cast<std::uint8_t>(std::clamp(col[0], 0.0, 255.0)),
+                           static_cast<std::uint8_t>(std::clamp(col[1], 0.0, 255.0)),
+                           static_cast<std::uint8_t>(std::clamp(col[2], 0.0, 255.0)));
+        for (int i = 1; i + 1 < n; ++i) {
+            rasterTri(s[0], s[static_cast<std::size_t>(i)],
+                      s[static_cast<std::size_t>(i + 1)], c8);
+        }
+    }
+
     // 방향이 있는 속이 찬 상자. 세 축과 반크기를 받아 카메라 쪽 세 면을 채운다.
+    //
+    // 카메라를 향한 세 면만 그린다 - 나머지 셋은 어차피 자기 앞면에 가려지고,
+    // 깊이 검사가 그것을 보장한다.
     void solidBox(const Eigen::Vector3d& c, const Eigen::Vector3d& ex,
                   const Eigen::Vector3d& ey, const Eigen::Vector3d& ez,
                   const Orbit& orb, double f, const cv::Scalar& base,
@@ -1876,18 +2134,9 @@ public:
             const Eigen::Vector3d fc = c + n;
             const Eigen::Vector3d q[4] = {fc - u1 - u2, fc + u1 - u2,
                                           fc + u1 + u2, fc - u1 + u2};
-            cv::Point poly[4];
-            bool ok = true;
-            for (int i = 0; i < 4 && ok; ++i) ok = project3(q[i], orb, f, poly[i]);
-            if (!ok) continue;
             const double a = std::clamp(shade[k] * bright, 0.0, 1.0);
-            cv::fillConvexPoly(img_, poly, 4,
-                               cv::Scalar(base[0] * a, base[1] * a, base[2] * a),
-                               cv::LINE_AA);
-            // 모서리를 한 번 더 그어 실루엣을 세운다. 채우기만 하면 같은 색의
-            // 물체 둘이 붙어 있을 때 하나로 뭉쳐 보인다.
-            cv::polylines(img_, std::vector<cv::Point>(poly, poly + 4), true,
-                          base, 1, cv::LINE_AA);
+            fillPoly3(q, 4, orb, f,
+                      cv::Scalar(base[0] * a, base[1] * a, base[2] * a));
         }
     }
 
@@ -1912,58 +2161,115 @@ public:
                  rt * (W * 0.42), orb, f, col, 0.78);
     }
 
-    // 나무. **줄기 + 수관** 을 입체로 세운다.
+    // 단위 구를 삼각형으로. 팔면체를 두 번 쪼갠다 - 128 면.
     //
-    // 지금까지는 선 하나에 원 테두리였다. 그러면 나무가 아니라 표지판처럼
-    // 보인다 - 원은 평면이고, 평면은 어느 각도에서 봐도 같은 크기라 부피가
-    // 읽히지 않는다.
+    // 한 번만 만들어 두고 나무마다 이동·확대해서 쓴다. 나무 한 그루가 128
+    // 삼각형이면 화면에 100 그루가 있어도 12800 개이고, 이미 30 만 점을
+    // 래스터하고 있는 파이프라인에서 그것은 반올림 오차다.
+    static const std::vector<std::array<Eigen::Vector3f, 3>>& unitSphere() {
+        static const std::vector<std::array<Eigen::Vector3f, 3>> tris = [] {
+            std::vector<std::array<Eigen::Vector3f, 3>> t;
+            const Eigen::Vector3f v[6] = {{1,0,0},{-1,0,0},{0,1,0},
+                                          {0,-1,0},{0,0,1},{0,0,-1}};
+            const int face[8][3] = {{0,2,4},{2,1,4},{1,3,4},{3,0,4},
+                                    {2,0,5},{1,2,5},{3,1,5},{0,3,5}};
+            for (const auto& fc : face) {
+                t.push_back({v[fc[0]], v[fc[1]], v[fc[2]]});
+            }
+            // 두 번 쪼갠다. 쪼갤 때마다 새 꼭짓점을 구면으로 밀어낸다.
+            for (int it = 0; it < 2; ++it) {
+                std::vector<std::array<Eigen::Vector3f, 3>> next;
+                next.reserve(t.size() * 4);
+                for (const auto& tr : t) {
+                    const Eigen::Vector3f ab = (tr[0] + tr[1]).normalized();
+                    const Eigen::Vector3f bc = (tr[1] + tr[2]).normalized();
+                    const Eigen::Vector3f ca = (tr[2] + tr[0]).normalized();
+                    next.push_back({tr[0], ab, ca});
+                    next.push_back({ab, tr[1], bc});
+                    next.push_back({ca, bc, tr[2]});
+                    next.push_back({ab, bc, ca});
+                }
+                t.swap(next);
+            }
+            return t;
+        }();
+        return tris;
+    }
+
+    // 나무. **줄기 + 수관** 을 진짜 입체로 세운다.
     //
-    // 수관을 구로 그리면 부피가 생긴다. 구를 삼각형으로 쪼갤 필요는 없다 -
-    // 가장자리로 갈수록 어둡게 칠한 동심원 몇 겹이면 눈은 그것을 구로 읽는다.
-    // 조명 계산이 아니라 사람이 구를 보는 방식을 그대로 쓰는 것이다.
+    // 앞선 판은 수관을 동심원 몇 겹으로 칠했다. 정면에서는 구처럼 보였지만
+    // 그것은 화면에 그린 원반이라 깊이가 없었다 - 뒤에 있는 나무가 앞 건물을
+    // 덮었고, 카메라를 돌려도 수관의 실루엣이 변하지 않았다. 부피가 있는
+    // 것처럼 **칠한** 것과 부피가 **있는** 것은 다르다.
+    //
+    // 구를 삼각형으로 쪼개면 그 차이가 사라진다. 법선은 구면 위치 그대로이고
+    // (구의 법선은 반지름 방향이다), 음영은 카메라를 광원으로 둔 램버트다 -
+    // 고정 광원이면 회전할 때 어떤 면이 계속 어두워 형상이 안 읽힌다.
     void treeModel(const Eigen::Vector3f& foot, float height, float rad,
                    const Eigen::Vector3f& up, const Orbit& orb, double f,
                    const cv::Scalar& col) {
-        const float canopy_h = height * 0.68f;
-        const Eigen::Vector3f cen = foot + up * canopy_h;
+        Eigen::Vector3f a = up.cross(Eigen::Vector3f::UnitZ());
+        if (a.norm() < 1e-6f) a = up.cross(Eigen::Vector3f::UnitX());
+        a.normalize();
+        const Eigen::Vector3f b = up.cross(a).normalized();
+
+        // **수관의 크기는 나무 높이에서 온다.**
+        //
+        // 앞선 판은 반지름을 격자칸에서만 가져왔다. 그러면 8 m 짜리 나무가
+        // 반지름 1 m 짜리 공을 꼭대기에 얹은 6 m 바늘이 되고, 화면에는 검은
+        // 가시 두 개가 꽂힌 것처럼 보였다 - 실제로 그렇게 나왔다.
+        //
+        // 나무는 수관이 몸통이고 줄기는 그 아래 짧은 받침이다. 수관을 높이의
+        // 위쪽 4 분의 3 에 걸치게 하면 그 비례가 저절로 맞는다.
+        const float canopy_ry = std::max(0.30f, height * 0.40f);   // 수직 반지름
+        const float canopy_c  = height * 0.58f;                    // 중심 높이
+        const float canopy_r  = std::max(rad, canopy_ry * 0.55f);  // 수평 반지름
+        const Eigen::Vector3f cen = foot + up * canopy_c;
+        const float trunk_h = std::max(0.2f, canopy_c - canopy_ry * 0.55f);
 
         // 줄기: 가는 상자. 원기둥으로 그릴 값이 없다.
         {
-            Eigen::Vector3f a = up.cross(Eigen::Vector3f::UnitZ());
-            if (a.norm() < 1e-6f) a = up.cross(Eigen::Vector3f::UnitX());
-            a.normalize();
-            const Eigen::Vector3f b = up.cross(a).normalized();
-            const float tw = std::max(0.06f, rad * 0.16f);
-            solidBox((foot + up * (canopy_h * 0.5f)).cast<double>(),
+            const float tw = std::max(0.05f, canopy_r * 0.14f);
+            solidBox((foot + up * (trunk_h * 0.5f)).cast<double>(),
                      (a * tw).cast<double>(),
-                     (up * (canopy_h * 0.5f)).cast<double>(),
+                     (up * (trunk_h * 0.5f)).cast<double>(),
                      (b * tw).cast<double>(),
-                     orb, f, cv::Scalar(col[0] * 0.45, col[1] * 0.42, col[2] * 0.38), 1.0);
+                     orb, f, cv::Scalar(col[0] * 0.42, col[1] * 0.40, col[2] * 0.36), 1.0);
         }
 
-        // 수관: 동심원을 바깥에서 안으로. 안쪽일수록 밝아 구로 읽힌다.
-        cv::Point cc, edge;
-        if (!project3(cen.cast<double>(), orb, f, cc)) return;
-        Eigen::Vector3f a2 = up.cross(Eigen::Vector3f::UnitZ());
-        if (a2.norm() < 1e-6f) a2 = up.cross(Eigen::Vector3f::UnitX());
-        a2.normalize();
-        if (!project3((cen + a2 * rad).cast<double>(), orb, f, edge)) return;
-        const int R = std::clamp(static_cast<int>(
-            std::hypot(edge.x - cc.x, edge.y - cc.y)), 2, 90);
-        if (std::abs(cc.x) > 4 * img_.cols || std::abs(cc.y) > 4 * img_.rows) return;
-
-        const int rings = std::clamp(R / 3, 3, 8);
-        for (int i = rings; i >= 1; --i) {
-            const double t = static_cast<double>(i) / rings;   // 1 = 가장자리
-            const int rr = std::max(1, static_cast<int>(R * t));
-            // 가장자리 0.45, 중심 1.0. 구의 명암이 이렇게 생겼다.
-            const double sh = 1.0 - 0.55 * t * t;
-            // 광원 쪽을 살짝 올린다. 완전 대칭이면 공이 아니라 원반이 된다.
-            const cv::Point o(cc.x - static_cast<int>(R * 0.18 * t),
-                              cc.y - static_cast<int>(R * 0.18 * t));
-            cv::circle(img_, o, rr,
-                       cv::Scalar(col[0] * sh, col[1] * sh, col[2] * sh),
-                       cv::FILLED, cv::LINE_AA);
+        // 수관. 위아래로 살짝 눌러 공이 아니라 나무로 읽히게 한다.
+        const Eigen::Matrix3d M = orb.basis();
+        const Eigen::Vector3d eye = orb.center - M.row(2).transpose() * orb.dist;
+        const Eigen::Vector3d fwd = M.row(2).transpose();
+        // 화면에서 2 px 도 안 되는 수관은 삼각형 128 개를 돌릴 값이 없다.
+        {
+            const double zc = (M * (cen.cast<double>() - eye)).z();
+            if (zc < 1e-3) return;
+            if (f * canopy_r / zc < 2.0) return;
+        }
+        const Eigen::Vector3f ex = a * canopy_r;
+        const Eigen::Vector3f ey = up * canopy_ry;
+        const Eigen::Vector3f ez = b * canopy_r;
+        // 위쪽 잎은 하늘을, 아래쪽 잎은 그늘을 본다. 균일하게 칠하면 수관이
+        // 초록 공 하나로 뭉친다.
+        for (const auto& tr : unitSphere()) {
+            Eigen::Vector3f n = (tr[0] + tr[1] + tr[2]) / 3.0f;
+            if (n.norm() < 1e-6f) continue;
+            n.normalize();
+            const Eigen::Vector3f wn =
+                (ex * n.x() + ey * n.y() + ez * n.z());
+            // 뒷면은 자기 앞면에 가려진다. 그리지 않는다.
+            const Eigen::Vector3d wc = (cen + wn).cast<double>();
+            if ((eye - wc).dot(wn.cast<double>()) < 0.0) continue;
+            const double lam = 0.34 + 0.52 * std::abs(wn.normalized().cast<double>().dot(fwd))
+                             + 0.14 * std::clamp(static_cast<double>(n.dot(up)), 0.0, 1.0);
+            const Eigen::Vector3d q[3] = {
+                (cen + ex * tr[0].x() + ey * tr[0].y() + ez * tr[0].z()).cast<double>(),
+                (cen + ex * tr[1].x() + ey * tr[1].y() + ez * tr[1].z()).cast<double>(),
+                (cen + ex * tr[2].x() + ey * tr[2].y() + ez * tr[2].z()).cast<double>()};
+            fillPoly3(q, 3, orb, f,
+                      cv::Scalar(col[0] * lam, col[1] * lam, col[2] * lam));
         }
     }
 
@@ -2122,23 +2428,19 @@ public:
     // 이웃 판정은 +x/+y/+z 세 방향만 본다. 여섯 방향을 다 보면 같은 선을 두 번
     // 긋게 된다. basis 와 eye 는 한 번만 계산한다 - 선마다 다시 구하면 수만 번
     // 행렬 곱이 돈다.
-    // 화면 밖으로 크게 벗어난 선은 그리지 않는다. 투영이 튀면 화면을
-    // 가로지르는 긴 선이 생겨 없는 구조를 만들어 낸다 - lattice 가 같은
-    // 이유로 같은 검사를 한다.
-    void lineClipped(const cv::Point& a, const cv::Point& b,
-                     const cv::Scalar& col, int th) {
-        const int m = 4 * std::max(img_.cols, img_.rows);
-        if (std::abs(a.x) > m || std::abs(a.y) > m ||
-            std::abs(b.x) > m || std::abs(b.y) > m) return;
-        cv::line(img_, a, b, col, th, cv::LINE_AA);
-    }
 
-    // 장면 라벨을 3 차원 벡터로 그린다.
+    // 장면 라벨을 **입체 모형** 으로 그린다.
     //
-    // 점으로 찍으면 클래스가 색 얼룩으로만 보인다. 같은 클래스의 이웃 기둥을
-    // **선으로 이어야** 벽이 벽으로, 가로수가 줄로 읽힌다 - 그것이 "공간을
-    // 벡터로 그린다" 의 내용이다. 서로 다른 클래스는 잇지 않는다: 건물과
-    // 나무를 이으면 있지도 않은 구조가 생긴다.
+    // 앞선 판은 이웃한 같은 클래스의 대표점 네 개를 사각형으로 채웠다. 그
+    // 사각형은 기둥 **꼭대기** 들을 이은 것이라 지붕 껍질 한 겹이었고,
+    // 지면까지 내려오는 몸통이 없었다 - 그래서 건물이 공중에 뜬 판자로
+    // 보였다. 게다가 대표점의 높이는 칸마다 조금씩 다르므로 그 껍질은
+    // 울퉁불퉁했고, 이웃이 셋 다 있어야 채워지므로 가장자리에는 구멍이 났다.
+    //
+    // 기둥은 원래 **지면에서 꼭대기까지의 부피** 다. 그것을 그대로 세우면
+    // 껍질이 아니라 몸통이 생기고, 격자 간격과 밑면 크기가 같으므로 이웃한
+    // 기둥끼리 저절로 맞붙어 연속된 벽면이 된다. 이을 것을 찾을 필요가
+    // 없어지고, 구멍도 생기지 않는다.
     void stuffVectors(const std::unordered_map<std::int64_t, Column>& cols,
                       const Eigen::Vector3d& up_d, float cell,
                       const Orbit& orb, double f, int layer = 0,
@@ -2149,14 +2451,53 @@ public:
         const GroundGrid g(up_d.cast<float>(), cell);
         const Eigen::Vector3f& up = g.up;
 
+        // **지붕선은 이웃과 함께 정한다.**
+        //
+        // 기둥마다 제 꼭대기를 그대로 세우면 같은 벽면이 칸마다 다른 높이로
+        // 서고, 지도가 건물이 아니라 막대그래프가 된다 - 실제로 그렇게 나왔다.
+        // 한 칸의 top 은 "그 칸에서 마지막으로 무엇을 봤는가" 일 뿐이라
+        // 관측이 성긴 칸은 낮게, 잡음이 튄 칸은 높게 나온다.
+        //
+        // 5x5 이웃 중 **같은 클래스** 인 칸들에서 고른다. 클래스가 다른 이웃을
+        // 섞으면 건물이 옆 나무 높이로 끌려간다.
+        //
+        // **중앙값이 아니라 상위 분위수를 쓴다.** 관측된 꼭대기는 진짜 높이의
+        // **하한** 이기 때문이다: 스쳐 지나가며 본 칸, 앞차에 가린 칸, 시야
+        // 밖으로 나간 칸은 전부 실제보다 낮게 나오고, 실제보다 높게 나오는
+        // 경로는 topRun 이 이미 막았다. 한쪽으로만 치우친 오차에 중앙값을
+        // 쓰면 벽 전체가 가장 덜 본 칸을 따라 내려앉는다.
+        //
+        // p70 은 "이 벽면을 가장 잘 본 이웃 몇 칸이 본 높이" 이고, 그것은
+        // 여전히 관측이다 - 없는 높이를 지어내는 것이 아니라 같은 벽의 더
+        // 나은 관측을 옆 칸에 나눠 주는 것이다.
+        //
+        // 같은 클래스 이웃의 수도 함께 돌려준다. 홀로 선 칸을 가려내는 데
+        // 쓴다 - 이웃 없이 혼자 서 있는 1 m 짜리 건물은 건물이 아니다.
+        auto smoothTop = [&](const Column& c, float own, int& nsame) {
+            float v[25];
+            int n = 0;
+            for (int di = -2; di <= 2; ++di) {
+                for (int dj = -2; dj <= 2; ++dj) {
+                    const auto it = cols.find(GroundGrid::key(c.i + di, c.j + dj));
+                    if (it == cols.end() || it->second.cls != c.cls) continue;
+                    const int tb = std::min(it->second.topBin(), it->second.topRun());
+                    if (tb < 0) continue;
+                    v[n++] = static_cast<float>(tb + 1) * kBinH;
+                }
+            }
+            nsame = std::max(0, n - 1);            // 자기 자신을 뺀 수
+            if (n < 4) return own;
+            const int q = n * 7 / 10;
+            std::nth_element(v, v + q, v + n);
+            return v[q];
+        };
+
         for (const auto& [k, c] : cols) {
             if (c.cls == Stuff::Unknown) continue;
             if (r2f > 0.0f && (c.rep - egof).squaredNorm() > r2f) continue;
             // 레이어 격리: 4 는 구조물만, 5 는 지면만.
             if (layer == 4 && c.cls == Stuff::Ground) continue;
             if (layer == 5 && c.cls != Stuff::Ground) continue;
-            cv::Point pa;
-            if (!project3(c.rep.cast<double>(), orb, f, pa)) continue;
             const cv::Scalar col = stuffColor(c.cls);
 
             // **지면도 면이다.** 점 하나만 찍으면 노면이 화면에서 사라져,
@@ -2174,146 +2515,108 @@ public:
             // 무엇인지가 화면에서 읽히지 않으니, 좌우의 건물이 하늘에 뜬 잡음
             // 처럼 보였다 - 실제로 그렇게 보고되었다. 건물은 덩어리로, 나무는
             // 줄기 위 수관으로, 담장은 낮은 판으로 그린다.
-            const float h = static_cast<float>(c.topBin() + 1) * kBinH;
-            const Eigen::Vector3f foot = c.rep - up * h;
+            const int tb = std::min(c.topBin(), c.topRun());
+            if (tb < 0) continue;
+            // **발치는 자기 관측에서, 지붕은 이웃과 함께.** 지면 높이는 이미
+            // 반경 안의 최저점에서 왔으므로 칸마다 흔들리지 않는다. 흔들리는
+            // 것은 꼭대기 쪽이고, 그것만 편다.
+            const float h_raw = static_cast<float>(tb + 1) * kBinH;
+            // 발치는 그 칸에 쓰인 지면 높이 그대로다. rep 에서 높이를 빼면
+            // 안 된다 - rep 는 topBin 을 기준으로 놓였는데 여기서 쓰는 top 은
+            // 그보다 낮을 수 있어, 그만큼 건물이 공중에 뜬다.
+            const Eigen::Vector3f foot = c.rep + up * (c.ground - c.rep.dot(up));
+            int nsame = 0;
+            const float h = smoothTop(c, h_raw, nsame);
+
+            // **홀로 선 칸은 구조물이 아니다.**
+            //
+            // 건물도 담장도 한 칸으로 끝나지 않는다. 이웃 없이 혼자 서 있는
+            // 1 m 짜리 기둥은 스테레오 잡음이 한 칸에 뭉친 것이고, 그것을
+            // 세우면 지도 곳곳에 까닭 없는 바늘이 꽂힌다 - 항공뷰에서 도로
+            // 바깥에 흩뿌려져 있던 것이 전부 그것이었다.
+            //
+            // 나무와 기둥은 예외다. 가로등도 홀로 선 나무도 원래 한 칸이다.
+            if ((c.cls == Stuff::Building || c.cls == Stuff::Fence) && nsame < 3) {
+                continue;
+            }
+
+            // 지면에서 꼭대기까지의 중간. 모든 몸통이 여기를 중심으로 선다.
+            const Eigen::Vector3d mid = (foot + up * (h * 0.5f)).cast<double>();
+            const Eigen::Vector3d hup = (up * (h * 0.5f)).cast<double>();
             const float half = cell * 0.5f;
 
             if (c.cls == Stuff::Building) {
-                // **건물은 평면으로 그린다.**
+                // **건물은 지면에서 꼭대기까지 세운 하나의 덩어리다.**
                 //
-                // 벽면은 원래 평면이다. 일반 아이소서피스는 스테레오 잡음을
-                // 그대로 표면으로 옮기므로 벽이 각진 바위가 되는데, 이미
-                // 구조 텐서에서 그 칸의 **법선** 을 구해 두었으므로 그 법선에
-                // 수직인 평면 조각을 세우면 잡음과 무관하게 평평한 벽이 된다.
+                // 앞선 판은 그 칸의 법선에 수직인 평면 조각 하나를 반 높이로
+                // 세웠다. 벽면 한 조각으로는 맞지만, 조각들이 각자의 법선을
+                // 따라 제멋대로 돌아서서 화면에는 흩어진 판자로 보였다 -
+                // 구조 텐서의 법선은 칸마다 잡음만큼 흔들리기 때문이다.
                 //
-                // 잡음을 매끄럽게 만드는 것과, 애초에 평면인 것을 평면으로
-                // 그리는 것은 다른 이야기다. 후자가 여기서는 맞다.
-                Eigen::Vector3f n = c.normal;
-                // 법선을 지면에 눕힌다. 벽은 수직이므로 법선은 수평이어야 한다.
-                n -= up * n.dot(up);
-                if (n.norm() > 1e-3f) {
-                    n.normalize();
-                    const Eigen::Vector3f tang = up.cross(n).normalized();
-                    const Eigen::Vector3f mid = 0.5f * (c.rep + foot);
-                    const Eigen::Vector3f q[4] = {
-                        mid - tang * half - up * (h * 0.5f),
-                        mid + tang * half - up * (h * 0.5f),
-                        mid + tang * half + up * (h * 0.5f),
-                        mid - tang * half + up * (h * 0.5f)};
-                    cv::Point pp[4];
-                    bool ok2 = true;
-                    for (int i = 0; i < 4 && ok2; ++i) {
-                        ok2 = project3(q[i].cast<double>(), orb, f, pp[i]);
-                    }
-                    if (ok2) {
-                        const double ww = std::max({std::abs(pp[0].x - pp[2].x),
-                                                    std::abs(pp[0].y - pp[2].y)});
-                        if (ww < img_.cols * 0.5) {
-                            // 법선이 시선을 향할수록 밝다. 벽의 방향이 색으로 읽힌다.
-                            const Eigen::Vector3d fwd = orb.basis().row(2).transpose();
-                            const double lam = 0.45 + 0.55 * std::abs(
-                                n.cast<double>().dot(fwd));
-                            cv::fillConvexPoly(img_, pp, 4,
-                                cv::Scalar(col[0] * lam, col[1] * lam, col[2] * lam),
-                                cv::LINE_AA);
-                        }
-                    }
-                    continue;   // 평면을 그렸으면 이웃 면은 그리지 않는다
-                }
-                // 법선이 수평이 아니면 평면으로 볼 수 없다. 덩어리로 남긴다.
-                solidBox((0.5 * (c.rep + foot)).cast<double>(),
-                         (g.a * half).cast<double>(),
-                         (up * (h * 0.5f)).cast<double>(),
-                         (g.b * half).cast<double>(),
-                         orb, f, col, 1.0);
+                // 밑면을 격자칸에 맞추면 그 흔들림이 사라진다. 이웃한 기둥의
+                // 밑면과 변이 맞닿으므로 벽면이 저절로 이어지고, 세 면 중
+                // 카메라 쪽만 보이므로 평평한 벽으로 읽힌다.
+                solidBox(mid, (g.a * half).cast<double>(), hup,
+                         (g.b * half).cast<double>(), orb, f, col, 1.0);
+                continue;
             }
             if (c.cls == Stuff::Fence) {
-                // 담장: 낮고 얇은 판. 건물과 같은 형태로 그리면 구분이 사라진다.
-                solidBox((0.5 * (c.rep + foot)).cast<double>(),
-                         (g.a * half).cast<double>(),
-                         (up * (h * 0.5f)).cast<double>(),
-                         (g.b * (half * 0.25f)).cast<double>(),
-                         orb, f, col, 0.85);
+                // 담장: 낮고 얇은 판. **두께 방향을 그 칸의 법선에 맞춘다.**
+                // 격자축에 고정하면 도로와 비스듬한 담장이 계단으로 남는다.
+                Eigen::Vector3f n = c.normal - up * c.normal.dot(up);
+                if (n.norm() < 1e-3f) n = g.b;
+                n.normalize();
+                const Eigen::Vector3f tang = up.cross(n).normalized();
+                solidBox(mid, (tang * half).cast<double>(), hup,
+                         (n * (half * 0.30f)).cast<double>(), orb, f, col, 0.92);
+                continue;
             }
             if (c.cls == Stuff::Vegetation) {
-                // 나무는 입체로. 줄기 위에 구 모양 수관이 얹힌다.
-                treeModel(foot, h, cell * 0.75f, up, orb, f, col);
-                // 나무는 여기서 끝낸다. 이웃과 면을 채우면 수관이 사각형에
-                // 묻혀 다시 건물처럼 보인다.
+                // **한 칸에 한 그루가 아니다.**
+                //
+                // 수관 하나는 격자칸 여러 개를 덮는다. 칸마다 나무를 세우면
+                // 가로수 한 그루가 작은 나무 아홉 그루의 무더기가 되어,
+                // 멀리서 보면 초록 자갈밭처럼 보인다.
+                //
+                // 군집의 대표만 세운다: 5x5 이웃 중 가장 높은 나무 칸이 그
+                // 자리의 나무다. 높이가 같으면 키로 갈라 매 프레임 같은 칸이
+                // 뽑히게 한다 - 아니면 나무가 프레임마다 자리를 옮긴다.
+                //
+                // 3x3 으로 잡으면 2 m 마다 한 그루가 서는데 수관 지름이 그보다
+                // 크므로 전부 겹쳐 한 덩이 초록 둔덕이 된다. 5x5 면 간격이
+                // 수관 지름과 비슷해져 그루가 그루로 보인다.
+                int nveg = 0;
+                bool seed = true;
+                for (int di = -2; di <= 2 && seed; ++di) {
+                    for (int dj = -2; dj <= 2; ++dj) {
+                        if (di == 0 && dj == 0) continue;
+                        const auto it = cols.find(GroundGrid::key(c.i + di, c.j + dj));
+                        if (it == cols.end() || it->second.cls != Stuff::Vegetation) continue;
+                        ++nveg;
+                        const int nb_top = std::min(it->second.topBin(),
+                                                    it->second.topRun());
+                        if (nb_top > tb || (nb_top == tb && it->first > k)) {
+                            seed = false;
+                            break;
+                        }
+                    }
+                }
+                if (!seed) continue;
+                // 수관 반지름. 군집이 넓을수록 크되, 나무 높이를 넘지 않는다.
+                // nveg 는 5x5 에서 최대 24 이므로 계수도 그 범위에 맞춘다.
+                const float spread = cell * (0.60f + 0.045f * static_cast<float>(nveg));
+                const float rad = std::clamp(std::min(spread, h * 0.40f), 0.35f, 2.5f);
+                treeModel(foot, h, rad, up, orb, f, col);
                 continue;
             }
             if (c.cls == Stuff::Pole) {
-                cv::Point pb;
-                if (project3(foot.cast<double>(), orb, f, pb)) {
-                    lineClipped(pb, pa, col, 2);
-                }
+                // 기둥: 가는 사각기둥. 선으로 그리면 굵기가 거리와 무관해져
+                // 멀리 있는 가로등이 가까운 것과 같은 굵기로 남는다.
+                const float pw = std::max(0.07f, cell * 0.10f);
+                solidBox(mid, (g.a * pw).cast<double>(), hup,
+                         (g.b * pw).cast<double>(), orb, f, col, 1.0);
                 continue;
             }
-            // **면으로 잇는다.** 선 두 개가 아니라 사각형 하나다.
-            //
-            // +a, +b 두 방향으로만 선을 그으면 화면에는 서로 만나지 않는
-            // 짧은 선분들이 남고, 표면이 아니라 빗금처럼 보인다. 네 이웃이
-            // 다 있을 때 사각형을 닫고 대각선 하나를 그어 삼각형 두 개로
-            // 만들면 그때부터 면으로 읽힌다 - 3 차원 격자가 되는 지점이다.
-            //
-            // 클래스가 다르면 잇지 않는다. 건물과 나무를 한 면으로 이으면
-            // 있지도 않은 구조가 생긴다.
-            const Column* nb_a = nullptr;
-            const Column* nb_b = nullptr;
-            const Column* nb_ab = nullptr;
-            {
-                auto get = [&](const Eigen::Vector3f& d) -> const Column* {
-                    const auto it = cols.find(g.key(c.rep + d));
-                    if (it == cols.end() || it->second.cls != c.cls) return nullptr;
-                    // **월드에서 멀리 떨어진 칸은 잇지 않는다.**
-                    //
-                    // 격자 좌표로는 이웃이어도 대표점의 높이가 크게 다르면 실제
-                    // 거리는 수십 m 다. 그것을 이으면 장면을 가로지르는 긴 선이
-                    // 생기고, 화면에는 있지도 않은 구조가 거미줄처럼 깔린다 -
-                    // 지금까지 그 선들이 하늘을 덮고 있었다.
-                    const float far2 = 9.0f * cell * cell;
-                    if ((it->second.rep - c.rep).squaredNorm() > far2) return nullptr;
-                    return &it->second;
-                };
-                nb_a  = get(g.a * cell);
-                nb_b  = get(g.b * cell);
-                nb_ab = get(g.a * cell + g.b * cell);
-            }
-            cv::Point p_a, p_b, p_ab;
-            const bool ok_a  = nb_a  && project3(nb_a->rep.cast<double>(),  orb, f, p_a);
-            const bool ok_b  = nb_b  && project3(nb_b->rep.cast<double>(),  orb, f, p_b);
-            const bool ok_ab = nb_ab && project3(nb_ab->rep.cast<double>(), orb, f, p_ab);
-
-            // **사각형을 긋지 말고 채운다.**
-            //
-            // 네 꼭짓점을 선으로 이으면 격자가 남고, 격자는 아무리 촘촘해도
-            // 뒤가 비쳐 면으로 읽히지 않는다. 같은 네 점을 채우면 그 순간
-            // 표면이 된다 - 이으려던 것이 원래 면이었기 때문이다.
-            if (ok_a && ok_b && ok_ab) {
-                const cv::Point quad[4] = {pa, p_a, p_ab, p_b};
-                // 화면에서 터무니없이 큰 조각은 투영이 튄 것이다.
-                const double w = std::max({std::abs(pa.x - p_ab.x),
-                                           std::abs(pa.y - p_ab.y)});
-                if (w < img_.cols * 0.6) {
-                    // 면의 기울기로 명암을 준다. 단색으로 채우면 굴곡이
-                    // 사라져 벽 하나가 평평한 얼룩이 된다.
-                    const Eigen::Vector3f e1 = nb_a->rep - c.rep;
-                    const Eigen::Vector3f e2 = nb_b->rep - c.rep;
-                    Eigen::Vector3f nrm = e1.cross(e2);
-                    double sh = 0.75;
-                    if (nrm.norm() > 1e-9) {
-                        nrm.normalize();
-                        sh = 0.55 + 0.45 * std::abs(static_cast<double>(nrm.dot(up)));
-                    }
-                    cv::fillConvexPoly(img_, quad, 4,
-                                       cv::Scalar(col[0] * sh, col[1] * sh, col[2] * sh),
-                                       cv::LINE_AA);
-                }
-            }
-            // 채워진 면 위에 모서리를 얇게 남긴다. 같은 색의 면 둘이 붙으면
-            // 경계가 사라져 하나로 뭉쳐 보인다.
-            if (ok_a) lineClipped(pa, p_a, col, 1);
-            if (ok_b) lineClipped(pa, p_b, col, 1);
         }
     }
 
