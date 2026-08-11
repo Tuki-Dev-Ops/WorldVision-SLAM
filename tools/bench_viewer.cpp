@@ -1601,6 +1601,30 @@ inline void surfaceNets(const std::unordered_map<std::int64_t, Splat>& cells,
     }
 }
 
+// **한 번 세운 집은 그 자리에 남는다.**
+//
+// 집을 프레임마다 다시 맞추면 자차가 나아갈 때마다 그 칸에 복셀이 붙고,
+// 붙을 때마다 최소 넓이 사각형의 중심과 크기가 조금씩 달라진다. 재 보니
+// 중앙값 0.74 m, 최대 2.94 m 씩 옮겨 앉고 있었다 - 정면에 집이 새로
+// 생기거나 갑자기 옮겨 가는 것처럼 보이던 것이 이것이다.
+//
+// 칸 경계를 월드에 못 박아 봤지만 거의 그대로였다 (0.66 m). 흔들리는 것은
+// 경계가 아니라 **맞춤 자체** 이기 때문이다. 같은 벽을 더 많이 본다고 그
+// 벽이 옮겨 가지는 않으므로, 한 번 세운 집은 그대로 두고 관측이 눈에 띄게
+// 늘었을 때만 다시 맞춘다.
+struct HouseFit {
+    Eigen::Vector3f mid{Eigen::Vector3f::Zero()};
+    Eigen::Vector3f dir{Eigen::Vector3f::UnitX()};
+    Eigen::Vector3f nrm{Eigen::Vector3f::UnitZ()};
+    float L{0}, W{0}, hb{0}, rise{0};
+    Stuff cls{Stuff::Unknown};
+};
+
+struct HouseBin {
+    std::vector<HouseFit> fits;
+    int n{0};          // 마지막으로 맞출 때 이 칸에 있던 기둥 수
+};
+
 // 월드에 고정되는 물체 기억. 지나온 곳에서 본 물체가 그 자리에 남는다.
 //
 // **관측마다 위치를 덮어쓰면 안 된다.** 그러면 카메라가 움직일 때마다 물체가
@@ -2925,7 +2949,8 @@ public:
                       const Eigen::Vector3d& up_d, float cell,
                       const Orbit& orb, double f, int layer = 0,
                       const Eigen::Vector3d& ego = Eigen::Vector3d::Zero(),
-                      double radius = 0.0, bool walls = true) {
+                      double radius = 0.0, bool walls = true,
+                      std::unordered_map<std::int64_t, HouseBin>* hcache = nullptr) {
         const float r2f = static_cast<float>(radius * radius);
         const Eigen::Vector3f egof = ego.cast<float>();
         const GroundGrid g(up_d.cast<float>(), cell);
@@ -3010,6 +3035,7 @@ public:
             // 굽은 길도 따라간다.
             constexpr float kHouseMax = 12.0f;   // 한 채의 최대 길이
 
+            std::vector<HouseFit> pending;
             auto emitHouse = [&](const std::vector<const Column*>& cs, Stuff cls) {
                 // **한 채를 세우려면 근거가 있어야 한다.**
                 //
@@ -3063,25 +3089,37 @@ public:
                     ? std::clamp(W * 0.30f, 0.8f, h * 0.32f) : 0.0f;
                 const float hb = h - rise;
 
-                const Eigen::Vector3f mid = foot2 + up * (wg + hb * 0.5f);
-                if (r2f > 0.0f && (mid - egof).squaredNorm() > r2f) return;
+                HouseFit hf;
+                hf.mid  = foot2 + up * (wg + hb * 0.5f);
+                hf.dir  = dir;
+                hf.nrm  = nrm;
+                hf.L    = L;
+                hf.W    = W;
+                hf.hb   = hb;
+                hf.rise = roofed ? rise : 0.0f;
+                hf.cls  = cls;
+                pending.push_back(hf);
+            };
 
-                solidBox(mid.cast<double>(),
-                         (dir * (L * 0.5f)).cast<double>(),
-                         (up * (hb * 0.5f)).cast<double>(),
-                         (nrm * (W * 0.5f)).cast<double>(),
-                         orb, f, stuffColor(cls), 1.0);
-                if (!roofed) return;
-
+            // 맞춰진 집 하나를 그린다. 맞추는 일과 그리는 일을 갈라 두어야
+            // 기억해 둔 맞춤을 그대로 다시 그릴 수 있다.
+            auto drawHouse = [&](const HouseFit& hf) {
+                if (r2f > 0.0f && (hf.mid - egof).squaredNorm() > r2f) return;
+                solidBox(hf.mid.cast<double>(),
+                         (hf.dir * (hf.L * 0.5f)).cast<double>(),
+                         (up * (hf.hb * 0.5f)).cast<double>(),
+                         (hf.nrm * (hf.W * 0.5f)).cast<double>(),
+                         orb, f, stuffColor(hf.cls), 1.0);
+                if (hf.rise <= 0.0f) return;
                 const Eigen::Matrix3d& Mv = orb.basis();
                 const Eigen::Vector3d eyev =
                     orb.center - Mv.row(2).transpose() * orb.dist;
-                const Eigen::Vector3f eav = foot2 + up * (wg + hb);
+                const Eigen::Vector3f eav = hf.mid + up * (hf.hb * 0.5f);
                 gableRoof(eav.cast<double>(),
-                          (dir * (L * 0.5f)).cast<double>(),
-                          (up * rise).cast<double>(),
-                          (nrm * (W * 0.5f)).cast<double>(),
-                          orb, f, stuffColor(cls),
+                          (hf.dir * (hf.L * 0.5f)).cast<double>(),
+                          (up * hf.rise).cast<double>(),
+                          (hf.nrm * (hf.W * 0.5f)).cast<double>(),
+                          orb, f, stuffColor(hf.cls),
                           depthFade((Mv * (eav.cast<double>() - eyev)).z()));
             };
 
@@ -3129,41 +3167,61 @@ public:
                 cs.reserve(part.size());
                 for (const std::int64_t k : part) cs.push_back(&cols.find(k)->second);
 
-                std::vector<cv::Point2f> pp0;
-                pp0.reserve(cs.size());
-                for (const Column* c : cs) {
-                    pp0.emplace_back(c->rep.dot(g.a), c->rep.dot(g.b));
-                }
-                const cv::RotatedRect rr0 = cv::minAreaRect(pp0);
-                double th0 = rr0.angle * kPiV / 180.0;
-                if (rr0.size.height > rr0.size.width) th0 += kPiV * 0.5;
-                const Eigen::Vector3f d0 =
-                    (g.a * static_cast<float>(std::cos(th0))
-                   + g.b * static_cast<float>(std::sin(th0))).normalized();
-
-                // **한 방향으로만 정렬해서 자르면 안 된다.**
+                // **칸 경계를 월드에 못 박는다.**
                 //
-                // 모퉁이에서 덩어리는 ㄱ 자로 이어진다. 그것을 한 축으로만
-                // 줄 세우면 서로 수직인 두 팔의 칸이 번갈아 섞이고, 12 m
-                // 마디 하나가 양쪽 팔에 걸친다. 그 마디의 사각형은 두 팔을
-                // 함께 감싸므로 실제로 벽이 없는 안쪽까지 채우고, 마디마다
-                // 그런 상자가 하나씩 나와 **집이 여러 겹으로 겹쳐 쌓인다** -
-                // 실제로 그렇게 나왔다.
+                // 앞서는 덩어리의 최소 넓이 사각형에서 방향을 뽑아 그 축으로
+                // 잘랐다. 그런데 자차가 나아가면 덩어리에 칸이 붙고, 붙을
+                // 때마다 그 사각형의 각도가 조금씩 돈다. 각도가 돌면 칸
+                // 경계가 통째로 밀리고, 같은 벽이 다른 자리에서 다시 잘려
+                // **집이 프레임마다 옮겨 앉는다** - 재 보니 중앙값 0.74 m,
+                // 최대 2.94 m 씩 움직이고 있었다. 정면에 집이 새로 생기는
+                // 것처럼 보이던 것이 이것이다.
                 //
-                // 덩어리 자기 좌표계에서 **가로세로 둘 다** 나눈다. 얇은
-                // 벽면이면 가로줄 하나로 끝나 이전과 같고, ㄱ 자면 두 팔이
-                // 서로 다른 칸으로 떨어져 섞이지 않는다.
-                const Eigen::Vector3f n0 = up.cross(d0).normalized();
-                const auto bdiv = [](float v) {
+                // 지면 격자축은 데이터셋 내내 고정이다. 그 축으로 나누면
+                // 칸 경계가 지도에 못 박히므로, 덩어리가 자라도 이미 세운
+                // 집은 제자리에 남고 새 칸에만 새 집이 선다. 방향은 칸
+                // 안에서 다시 뽑으므로 비스듬한 길도 그대로 따라간다.
+                const auto wdiv = [](float v) {
                     return static_cast<int>(std::floor(v / kHouseMax));
                 };
                 std::map<std::pair<int, int>, std::vector<const Column*>> bins;
                 for (const Column* c : cs) {
-                    bins[{bdiv(c->rep.dot(d0)), bdiv(c->rep.dot(n0))}].push_back(c);
+                    bins[{wdiv(c->rep.dot(g.a)), wdiv(c->rep.dot(g.b))}].push_back(c);
                 }
 
                 for (auto& [bk, bc] : bins) {
                     if (bc.size() < 6) continue;
+
+                    // **기억해 둔 맞춤이 있으면 그대로 그린다.**
+                    //
+                    // 관측이 4 분의 1 넘게 늘었을 때만 다시 맞춘다. 같은 벽을
+                    // 조금 더 봤다고 그 벽이 옮겨 가지는 않으므로, 그때마다
+                    // 다시 맞추면 얻는 것 없이 집만 흔들린다.
+                    const std::int64_t hk =
+                        GroundGrid::key(bk.first, bk.second) * 8
+                        + static_cast<std::int64_t>(c0.cls);
+                    if (hcache) {
+                        auto hit = hcache->find(hk);
+                        if (hit != hcache->end()
+                            && static_cast<int>(bc.size()) < hit->second.n * 5 / 4) {
+                            for (const auto& hf : hit->second.fits) drawHouse(hf);
+                            continue;
+                        }
+                    }
+                    pending.clear();
+                    // 칸 안에서 그 칸의 방향을 뽑는다. 칸 경계는 이미
+                    // 고정됐으므로 이 각도가 흔들려도 소속은 안 바뀐다.
+                    std::vector<cv::Point2f> bp;
+                    bp.reserve(bc.size());
+                    for (const Column* c : bc) {
+                        bp.emplace_back(c->rep.dot(g.a), c->rep.dot(g.b));
+                    }
+                    const cv::RotatedRect br = cv::minAreaRect(bp);
+                    double bth = br.angle * kPiV / 180.0;
+                    if (br.size.height > br.size.width) bth += kPiV * 0.5;
+                    const Eigen::Vector3f d0 =
+                        (g.a * static_cast<float>(std::cos(bth))
+                       + g.b * static_cast<float>(std::sin(bth))).normalized();
                     std::sort(bc.begin(), bc.end(),
                               [&](const Column* x, const Column* y) {
                                   return x->rep.dot(d0) < y->rep.dot(d0);
@@ -3186,6 +3244,13 @@ public:
                         prev_t = t;
                     }
                     emitHouse(run, c0.cls);
+
+                    if (hcache) {
+                        HouseBin& hb2 = (*hcache)[hk];
+                        hb2.fits = pending;
+                        hb2.n = static_cast<int>(bc.size());
+                    }
+                    for (const auto& hf : pending) drawHouse(hf);
                 }
             }
         }
@@ -3901,6 +3966,8 @@ int main(int argc, char** argv) {
     std::vector<MemoryObject> mem[2];
     // 지도에서 유도한 장면 라벨 (지면/건물/담장/나무/기둥).
     std::unordered_map<std::int64_t, Column> stuff[2];
+    // 맞춰 둔 집. 패널마다 지도와 함께 자란다.
+    std::unordered_map<std::int64_t, HouseBin> houses[2];
     // 노면 텍스처. 부피 지도와 따로 가는 2 차원 정밀 격자다.
     std::unordered_map<std::int64_t, RoadCell> road[2];
     // 삼각형 표면. 자차가 의미 있게 움직였을 때만 다시 만든다.
@@ -4761,7 +4828,8 @@ int main(int argc, char** argv) {
                         if (layer == 0 || layer == 4 || layer == 5) {
                             cloud[k].stuffVectors(stuff[k], ob.world_up, ccell,
                                                   ob, fpx, layer,
-                                                  ego_k, map_r, show_walls);
+                                                  ego_k, map_r, show_walls,
+                                                  &houses[k]);
                         }
                         const auto t_end = std::chrono::steady_clock::now();
                         prof_label[k] = std::chrono::duration<double, std::milli>(
