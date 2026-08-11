@@ -55,6 +55,7 @@
 #include <iomanip>
 #include <iostream>
 #include <map>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <sstream>
@@ -519,12 +520,73 @@ inline std::int64_t voxKey(const Eigen::Vector3f& p, float inv) {
             (q(p.z()) & 0x1FFFFF);
 }
 
+// 타일 = 복셀 16 x 16 x 16.
+//
+// **타일을 좌표가 아니라 복셀 키에서 뽑는다.** 예전에 4 m 타일을 미터로
+// 계산했다가 0.3 m 복셀의 정수배가 아니어서 경계의 복셀이 두 타일에 걸쳤고,
+// 라벨이 미묘하게 달라지는 원인을 오래 못 찾았다. 키의 비트를 자르면 그런
+// 어긋남이 생길 여지가 없다 - 복셀 하나는 언제나 타일 하나에만 속한다.
+constexpr int kTileShift = 4;
+
+inline std::int64_t tileOfVox(std::int64_t k) {
+    // 21 비트 필드를 부호 확장한 뒤 산술 시프트한다. 그래야 음수 좌표에서도
+    // 내림 나눗셈이 되어 원점 근처에서 타일이 겹치지 않는다.
+    const auto f = [](std::int64_t v) {
+        v &= 0x1FFFFF;
+        if (v & 0x100000) v -= 0x200000;
+        return v >> kTileShift;
+    };
+    const std::int64_t x = f(k >> 42), y = f(k >> 21), z = f(k);
+    return ((x & 0x1FFFF) << 34) | ((y & 0x1FFFF) << 17) | (z & 0x1FFFF);
+}
+
+inline std::int64_t tileKey(std::int64_t x, std::int64_t y, std::int64_t z) {
+    return ((x & 0x1FFFF) << 34) | ((y & 0x1FFFF) << 17) | (z & 0x1FFFF);
+}
+
 struct VoxelMap {
     std::unordered_map<std::int64_t, Splat> cells;
     float voxel{0.3f};     // m
     int   grown{0};        // 상한 때문에 복셀을 키운 횟수
 
-    void clear() { cells.clear(); grown = 0; revised = 0; }
+    // 타일 -> 그 안의 복셀들.
+    //
+    // **키가 아니라 원소 포인터를 담는다.** 키를 담으면 타일을 훑을 때마다
+    // 복셀당 해시 조회가 한 번씩 더 붙어, 훑기를 줄이려고 만든 색인이 조회를
+    // 늘리는 꼴이 된다. unordered_map 은 재해시해도 원소의 주소가 변하지
+    // 않으므로 포인터를 그대로 들고 있어도 된다 (지운 원소만 무효가 되는데,
+    // 지우기는 전부 erase() 한 곳을 지나므로 거기서 함께 뺀다).
+    std::unordered_map<std::int64_t, std::vector<Splat*>> tiles;
+
+    // 색인이 원소의 주소를 들고 있으므로 복사하면 남의 지도를 가리키게 된다.
+    // 컴파일러가 막게 해 둔다 - 이런 것은 실행 중에 알아내면 늦다.
+    VoxelMap() = default;
+    VoxelMap(const VoxelMap&) = delete;
+    VoxelMap& operator=(const VoxelMap&) = delete;
+
+    void clear() { cells.clear(); tiles.clear(); grown = 0; revised = 0; }
+
+    // 지우기는 반드시 여기를 지난다. 색인과 지도가 갈라지는 유일한 경로다.
+    void erase(std::int64_t key) {
+        const auto it = cells.find(key);
+        if (it == cells.end()) return;
+        const auto ti = tiles.find(tileOfVox(key));
+        if (ti != tiles.end()) {
+            auto& v = ti->second;
+            Splat* const p = &it->second;
+            for (std::size_t i = 0; i < v.size(); ++i) {
+                if (v[i] == p) { v[i] = v.back(); v.pop_back(); break; }
+            }
+            if (v.empty()) tiles.erase(ti);
+        }
+        cells.erase(it);
+    }
+
+    // 타일 색인을 지도에서 다시 만든다.
+    void reindex() {
+        tiles.clear();
+        for (auto& [k, v] : cells) tiles[tileOfVox(k)].push_back(&v);
+    }
 
     // 가까이서 본 관측이 멀리서 본 관측을 **이긴다.**
     long long revised{0};      // 폐기한 먼 관측의 수. 개선이 일어났다는 증거다.
@@ -597,6 +659,7 @@ struct VoxelMap {
                 }
             }
             cells[key].nbr = static_cast<std::uint8_t>(std::min(mine, 255));
+            tiles[tileOfVox(key)].push_back(&cells[key]);
         }
         if (cells.size() > cap) coarsen();
     }
@@ -624,7 +687,7 @@ struct VoxelMap {
                     // 지금 관측보다 2.5 배 넘게 멀리서 찍힌 것만 걷어낸다.
                     // 비슷한 거리에서 본 것은 둘 다 믿을 만하므로 남긴다.
                     if (it->second.range > new_range * 2.5f) {
-                        cells.erase(it);
+                        erase(it->first);
                         ++revised;
                     }
                 }
@@ -645,6 +708,7 @@ struct VoxelMap {
             if (slot.seen <= v.seen) slot = v;
         }
         cells.swap(next);
+        reindex();
     }
 };
 
@@ -1000,7 +1064,10 @@ inline void labelScene(const std::unordered_map<std::int64_t, Splat>& cells,
                        const Eigen::Vector3d& up_d, float cell, float voxel,
                        const Eigen::Vector3d& ego, float work_radius,
                        std::unordered_map<std::int64_t, Column>& cols,
-                       int ground_radius = 3) {
+                       int ground_radius = 3,
+                       const std::unordered_map<std::int64_t,
+                                                std::vector<Splat*>>* tiles
+                           = nullptr) {
     const GroundGrid g(up_d.cast<float>(), cell);
     const Eigen::Vector3f e = ego.cast<float>();
     const float r2 = work_radius * work_radius;
@@ -1026,14 +1093,24 @@ inline void labelScene(const std::unordered_map<std::int64_t, Splat>& cells,
     // 찾았으니 그 안에 자리 번호를 적어 두고 배열로 가면 된다.
     std::vector<std::vector<float>> hs;
     hs.reserve(cells.size() / 8 + 1);
-    for (const auto& [k, v] : cells) {
-        if ((v.p - e).squaredNorm() > r2) continue;
+
+    // **동점을 자리로 가른다.** 높이가 정확히 같은 복셀이 둘이면 예전에는
+    // 먼저 온 쪽이 대표가 됐는데, 그러면 답이 순회 순서에 딸린다. 전수 훑기와
+    // 타일 훑기는 순서가 다르므로 그 자리에서 결과가 갈린다 - 앞서 색인을
+    // 넣었다가 라벨이 미세하게 달라지는 것을 설명하지 못해 되돌렸던 이유가
+    // 이런 종류다. 자리로 가르면 순서와 무관해진다.
+    const auto take = [&](const Splat& v) {
+        if ((v.p - e).squaredNorm() > r2) return;
         const float h = v.p.dot(g.up);
         const auto [i, j] = g.ij(v.p);
         const std::int64_t ck = GroundGrid::key(i, j);
         auto& c = fresh[ck];
         c.i = i; c.j = j;
-        if (h > c.high) { c.high = h; c.rep = v.p; }
+        if (h > c.high ||
+            (h == c.high && std::make_tuple(v.p.x(), v.p.y(), v.p.z()) <
+                            std::make_tuple(c.rep.x(), c.rep.y(), c.rep.z()))) {
+            c.high = h; c.rep = v.p;
+        }
         c.low = std::min(c.low, h);
         ++c.n;
         if (v.range > 0.0f) c.best_range = std::min(c.best_range, v.range);
@@ -1045,6 +1122,40 @@ inline void labelScene(const std::unordered_map<std::int64_t, Splat>& cells,
             hs.emplace_back();
         }
         hs[static_cast<std::size_t>(c.hidx)].push_back(h);
+    };
+
+    if (tiles == nullptr) {
+        for (const auto& [k, v] : cells) take(v);
+    } else {
+        // **반경 밖은 아예 건드리지 않는다.**
+        //
+        // 지도는 지나온 거리만큼 자라는데 (kitti_00 400 프레임에서 31 만 칸)
+        // 다시 분류하는 것은 언제나 자차 주변 45 m 뿐이다. 전수 훑기는 그
+        // 45 m 를 찾으려고 31 만 칸을 다 만져 보는 것이라, 비용이 장면이
+        // 아니라 지도 크기를 따라간다 - 오래 달릴수록 느려진다.
+        //
+        // 타일은 복셀 16 칸이므로 반경 45 m 면 타일 몇 천 개다. 나머지는
+        // 해시 조회 한 번으로 통째로 건너뛴다.
+        const float inv = 1.0f / voxel;
+        const auto qf = [inv](float v) {
+            return static_cast<std::int64_t>(
+                std::floor(static_cast<double>(v) * inv));
+        };
+        const std::int64_t tx = qf(e.x()) >> kTileShift;
+        const std::int64_t ty = qf(e.y()) >> kTileShift;
+        const std::int64_t tz = qf(e.z()) >> kTileShift;
+        const float tspan = voxel * static_cast<float>(1 << kTileShift);
+        const int rt = static_cast<int>(std::ceil(work_radius / tspan)) + 1;
+        for (int dx = -rt; dx <= rt; ++dx) {
+            for (int dy = -rt; dy <= rt; ++dy) {
+                for (int dz = -rt; dz <= rt; ++dz) {
+                    const auto it = tiles->find(
+                        tileKey(tx + dx, ty + dy, tz + dz));
+                    if (it == tiles->end()) continue;
+                    for (const Splat* v : it->second) take(*v);
+                }
+            }
+        }
     }
 
     // 2 차: 이웃 반경 안에서 그 칸의 지면 높이를 잡는다.
@@ -1922,9 +2033,9 @@ inline void eraseBox(VoxelMap& vm, const Eigen::Vector3d& c,
     for (double x = c.x() - h.x(); x <= c.x() + h.x() + vm.voxel; x += vm.voxel) {
         for (double y = c.y() - h.y(); y <= c.y() + h.y() + vm.voxel; y += vm.voxel) {
             for (double z = c.z() - h.z(); z <= c.z() + h.z() + vm.voxel; z += vm.voxel) {
-                vm.cells.erase(voxKey(Eigen::Vector3f(static_cast<float>(x),
-                                                      static_cast<float>(y),
-                                                      static_cast<float>(z)), inv));
+                vm.erase(voxKey(Eigen::Vector3f(static_cast<float>(x),
+                                                static_cast<float>(y),
+                                                static_cast<float>(z)), inv));
             }
         }
     }
@@ -4674,6 +4785,9 @@ int main(int argc, char** argv) {
     std::string scene_glb;
     // 매개변수 형태의 장면 서술. 엔진 임포터가 읽는다.
     std::string scene_json;
+    // 타일 색인이 전수 훑기와 같은 답을 내는지 매 라벨마다 견준다. 느리다 -
+    // 색인을 믿을 근거를 만들 때만 켠다.
+    bool verify_tiles = false;
 
     for (int i = 1; i + 1 < argc; i += 2) {
         const std::string k = argv[i];
@@ -4681,6 +4795,7 @@ int main(int argc, char** argv) {
         else if (k == "--seq") start_seq = std::atoi(argv[i + 1]);
         else if (k == "--autoplay") autoplay = std::atoi(argv[i + 1]) != 0;
         else if (k == "--screenshot") shot_path = argv[i + 1];
+        else if (k == "--verify-tiles") verify_tiles = std::atoi(argv[i + 1]) != 0;
         else if (k == "--frame") shot_frame = std::atoi(argv[i + 1]);
         else if (k == "--cloud-cap") cloud_cap = std::atoi(argv[i + 1]);
         else if (k == "--dump-features") dump_feat = argv[i + 1];
@@ -5652,8 +5767,47 @@ int main(int argc, char** argv) {
                         // 프레임 수로 세면 속도에 따라 성기거나 낭비가 된다.
                         const double moved = (ego_k - label_at[k]).norm();
                         if (moved > work_r * 0.06 || stuff[k].empty()) {
+                            const auto t_idx0 = std::chrono::steady_clock::now();
                             labelScene(acc[k].cells, ob.world_up, ccell,
-                                       acc[k].voxel, ego_k, work_r, stuff[k]);
+                                       acc[k].voxel, ego_k, work_r, stuff[k],
+                                       3, &acc[k].tiles);
+                            const auto t_idx1 = std::chrono::steady_clock::now();
+                            // 색인을 믿을 근거를 실행 중에 만든다. 예전에
+                            // 같은 색인을 넣었다가 라벨이 조금씩 달라지는
+                            // 이유를 대지 못해 되돌렸으므로, 이번에는 전수
+                            // 훑기와 칸 단위로 견줘 본다.
+                            if (verify_tiles) {
+                                std::unordered_map<std::int64_t, Column> ref;
+                                const auto t_ful0 = std::chrono::steady_clock::now();
+                                labelScene(acc[k].cells, ob.world_up, ccell,
+                                           acc[k].voxel, ego_k, work_r, ref);
+                                const auto t_ful1 = std::chrono::steady_clock::now();
+                                long long bad = 0;
+                                for (const auto& [ck, rc] : ref) {
+                                    const auto it = stuff[k].find(ck);
+                                    if (it == stuff[k].end()) { ++bad; continue; }
+                                    const Column& gc = it->second;
+                                    if (gc.n != rc.n || gc.bins != rc.bins ||
+                                        gc.cls != rc.cls ||
+                                        gc.ground != rc.ground ||
+                                        gc.high != rc.high || gc.low != rc.low ||
+                                        (gc.rep - rc.rep).squaredNorm() != 0.0f)
+                                        ++bad;
+                                }
+                                std::cout << "타일색인 검증  복셀 "
+                                          << acc[k].cells.size()
+                                          << "  타일 " << acc[k].tiles.size()
+                                          << "  기준칸 " << ref.size()
+                                          << "  불일치 " << bad
+                                          << std::setprecision(1) << std::fixed
+                                          << "  색인 "
+                                          << std::chrono::duration<double,
+                                                 std::milli>(t_idx1 - t_idx0).count()
+                                          << " ms  전수 "
+                                          << std::chrono::duration<double,
+                                                 std::milli>(t_ful1 - t_ful0).count()
+                                          << " ms" << std::endl;
+                            }
                             label_at[k] = ego_k;
                         }
                         const auto t_vec = std::chrono::steady_clock::now();
