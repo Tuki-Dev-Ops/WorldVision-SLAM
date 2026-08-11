@@ -59,6 +59,13 @@ namespace WorldVision
         public bool moving;
     }
 
+    [Serializable] public class Road
+    {
+        public float cell;
+        // JsonUtility 는 float[][] 를 못 읽는다. 타일은 [x, y, z, 밝기] 인데
+        // 중첩 배열이라 직접 훑는다 - ReadRoad 참조.
+    }
+
     [Serializable] public class SceneFile
     {
         public string format;
@@ -69,6 +76,13 @@ namespace WorldVision
         public Tree[] trees;
         public Pole[] poles;
         public Vehicle[] vehicles;
+    }
+
+    // 노면 타일 하나. [x, y, z, 밝기]
+    public struct RoadTile
+    {
+        public Vector3 p;
+        public float v;     // 0..1
     }
 
     public static class SceneImporter
@@ -224,6 +238,121 @@ namespace WorldVision
             Build(path);
         }
 
+        // **노면만 직접 파싱한다.**
+        //
+        // JsonUtility 는 중첩 배열(float[][])을 못 읽는다. 나머지는 전부
+        // 객체 배열이라 문제가 없고, 노면만 [x,y,z,i] 형태라 여기서만
+        // 숫자를 훑는다 - 이것 하나 때문에 JSON 라이브러리를 들이지 않는다.
+        static List<RoadTile> ReadRoad(string text, out float cell)
+        {
+            var outp = new List<RoadTile>();
+            cell = 1.0f;
+            int at = text.IndexOf("\"road\"");
+            if (at < 0) return outp;
+            int cAt = text.IndexOf("\"cell\"", at);
+            if (cAt >= 0)
+            {
+                int c0 = text.IndexOf(':', cAt) + 1;
+                int c1 = text.IndexOfAny(new[] { ',', '}' }, c0);
+                float.TryParse(text.Substring(c0, c1 - c0).Trim(),
+                               System.Globalization.NumberStyles.Float,
+                               System.Globalization.CultureInfo.InvariantCulture,
+                               out cell);
+            }
+            int tAt = text.IndexOf('[', text.IndexOf("\"tiles\"", at));
+            if (tAt < 0) return outp;
+            int i = tAt + 1;
+            var num = new float[4];
+            while (i < text.Length)
+            {
+                int open = text.IndexOf('[', i);
+                if (open < 0) break;
+                int close = text.IndexOf(']', open);
+                if (close < 0) break;
+                string body = text.Substring(open + 1, close - open - 1);
+                string[] parts = body.Split(',');
+                if (parts.Length >= 4)
+                {
+                    bool ok = true;
+                    for (int k = 0; k < 4; ++k)
+                    {
+                        ok &= float.TryParse(parts[k].Trim(),
+                                System.Globalization.NumberStyles.Float,
+                                System.Globalization.CultureInfo.InvariantCulture,
+                                out num[k]);
+                    }
+                    if (ok)
+                    {
+                        outp.Add(new RoadTile {
+                            p = new Vector3(num[0], num[1], -num[2]),
+                            v = Mathf.Clamp01(num[3] / 255f) });
+                    }
+                }
+                i = close + 1;
+                int nxt = text.IndexOfAny(new[] { '[', ']' }, i);
+                if (nxt < 0 || text[nxt] == ']') break;
+            }
+            return outp;
+        }
+
+        // 노면을 메시 하나로 만든다. 타일마다 GameObject 를 두면 수천 개가
+        // 되어 씬이 무거워지고, 어차피 하나의 바닥이라 나눌 이유가 없다.
+        // 밝기 단계. 마지막 칸이 차선이다 - 도료는 아스팔트보다 훨씬 밝게
+        // 되돌아오므로 상위 구간만 흰색으로 뽑아 두면 선이 선으로 보인다.
+        static readonly float[] kRoadStep = { 0.16f, 0.24f, 0.34f, 0.48f, 0.90f };
+
+        static void BuildRoad(Transform parent, List<RoadTile> tiles, float cell)
+        {
+            if (tiles.Count == 0) return;
+
+            // **정점 색이 아니라 서브메시로 나눈다.**
+            //
+            // 처음에는 SetColors 로 밝기를 실었는데 화면에는 흰 리본 하나만
+            // 나왔다. Lit 셰이더는 COLOR_0 을 읽지 않으므로 밝기가 통째로
+            // 버려졌던 것이다. 셰이더를 새로 쓰는 대신 단계별 서브메시로
+            // 나누면 어떤 렌더 파이프라인에서도 그대로 보인다.
+            int nb = kRoadStep.Length;
+            var verts = new List<Vector3>(tiles.Count * 4);
+            var tris = new List<int>[nb];
+            for (int k = 0; k < nb; ++k) tris[k] = new List<int>();
+            float h = cell * 0.5f;
+            foreach (var t in tiles)
+            {
+                int b = verts.Count;
+                verts.Add(t.p + new Vector3(-h, 0, -h));
+                verts.Add(t.p + new Vector3( h, 0, -h));
+                verts.Add(t.p + new Vector3( h, 0,  h));
+                verts.Add(t.p + new Vector3(-h, 0,  h));
+                // 밝기를 제곱해 대비를 세운다 - 뷰어가 화면에서 하는 것과 같다.
+                int bucket = Mathf.Clamp((int)(t.v * t.v * nb), 0, nb - 1);
+                var tl = tris[bucket];
+                tl.Add(b); tl.Add(b + 3); tl.Add(b + 2);
+                tl.Add(b); tl.Add(b + 2); tl.Add(b + 1);
+            }
+
+            var go = new GameObject("Road");
+            go.transform.SetParent(parent, false);
+            var mesh = new Mesh();
+            mesh.indexFormat = verts.Count > 65000
+                ? UnityEngine.Rendering.IndexFormat.UInt32
+                : UnityEngine.Rendering.IndexFormat.UInt16;
+            mesh.SetVertices(verts);
+            mesh.subMeshCount = nb;
+            var mats = new Material[nb];
+            for (int k = 0; k < nb; ++k)
+            {
+                mesh.SetTriangles(tris[k], k);
+                float g = kRoadStep[k];
+                mats[k] = MakeMaterial("wv_road" + k, new Color(g, g, g * 1.02f));
+            }
+            mesh.RecalculateNormals();
+            go.AddComponent<MeshFilter>().sharedMesh = mesh;
+            go.AddComponent<MeshRenderer>().sharedMaterials = mats;
+            // 달릴 수 있어야 바닥이다.
+            go.AddComponent<MeshCollider>().sharedMesh = mesh;
+            go.isStatic = true;
+        }
+
         static bool Build(string path)
         {
             string text = File.ReadAllText(path);
@@ -245,6 +374,12 @@ namespace WorldVision
             var matLeaf  = MakeMaterial("wv_leaf",  new Color(0.24f, 0.52f, 0.22f));
             var matPole  = MakeMaterial("wv_pole",  new Color(0.45f, 0.45f, 0.48f));
             var matCar   = MakeMaterial("wv_car",   new Color(0.20f, 0.55f, 0.52f));
+
+            float roadCell;
+            var roadTiles = ReadRoad(text, out roadCell);
+            var gRoad = new GameObject("Ground").transform;
+            gRoad.SetParent(root.transform, false);
+            BuildRoad(gRoad, roadTiles, roadCell);
 
             var gBuild = new GameObject("Buildings").transform;
             gBuild.SetParent(root.transform, false);
@@ -326,12 +461,13 @@ namespace WorldVision
             }
 
             Debug.Log(string.Format(
-                "WorldVision: {0} 프레임 {1} - 건물 {2}, 나무 {3}, 기둥 {4}, 차량 {5}",
+                "WorldVision: {0} 프레임 {1} - 건물 {2}, 나무 {3}, 기둥 {4}, 차량 {5}, 노면 {6} 타일",
                 s.sequence, s.frame,
                 (s.buildings ?? new Building[0]).Length,
                 (s.trees ?? new Tree[0]).Length,
                 (s.poles ?? new Pole[0]).Length,
-                (s.vehicles ?? new Vehicle[0]).Length));
+                (s.vehicles ?? new Vehicle[0]).Length,
+                roadTiles.Count));
             Selection.activeGameObject = root;
             return true;
         }

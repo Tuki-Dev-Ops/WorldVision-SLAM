@@ -23,6 +23,7 @@ namespace UnityEngine
         public float sqrMagnitude { get { return x * x + y * y + z * z; } }
         public Vector3 normalized { get { return this; } }
         public static Vector3 up { get { return new Vector3(0, 1, 0); } }
+        public static Vector3 zero { get { return new Vector3(0, 0, 0); } }
         public static Vector3 operator +(Vector3 a, Vector3 b) { return new Vector3(a.x + b.x, a.y + b.y, a.z + b.z); }
         public static Vector3 operator *(Vector3 a, float s) { return new Vector3(a.x * s, a.y * s, a.z * s); }
     }
@@ -38,14 +39,94 @@ namespace UnityEngine
     public static class Mathf
     {
         public static float Clamp(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
+        public static int Clamp(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
+        public static float Clamp01(float v) { return Clamp(v, 0f, 1f); }
         public static float Max(float a, float b) { return a > b ? a : b; }
         public static float Min(float a, float b) { return a < b ? a : b; }
+        public static float Sqrt(float v) { return (float)Math.Sqrt(v); }
     }
 
-    public class Object { public string name; }
+    public struct Bounds
+    {
+        public Bounds(Vector3 c, Vector3 s) { center = c; size = s; }
+        public Vector3 center, size;
+        public Vector3 extents { get { return size * 0.5f; } }
+        public void Encapsulate(Vector3 p) { }
+        public void Encapsulate(Bounds b) { }
+    }
+
+    public struct Rect
+    {
+        public Rect(float x, float y, float w, float h) { }
+    }
+
+    public enum LightType { Directional, Point, Spot }
+    public enum CameraClearFlags { Skybox, SolidColor, Depth, Nothing }
+    public enum FindObjectsSortMode { None, InstanceID }
+    public enum TextureFormat { RGB24, RGBA32 }
+
+    public class Light : Component
+    {
+        public LightType type;
+        public float intensity, shadowStrength;
+        public Color color;
+        public LightShadows shadows;
+    }
+    public enum LightShadows { None, Hard, Soft }
+
+    public class Camera : Component
+    {
+        public CameraClearFlags clearFlags;
+        public Color backgroundColor;
+        public float fieldOfView, nearClipPlane, farClipPlane, orthographicSize;
+        public bool orthographic;
+        public RenderTexture targetTexture;
+        public void Render() { }
+    }
+
+    public class RenderTexture : Object
+    {
+        public RenderTexture(int w, int h, int depth) { }
+        public int antiAliasing;
+        public static RenderTexture active;
+        public void Release() { }
+    }
+
+    public class Texture2D : Object
+    {
+        public Texture2D(int w, int h, TextureFormat f, bool mip) { }
+        public void ReadPixels(Rect r, int x, int y) { }
+        public void Apply() { }
+        public byte[] EncodeToPNG() { return new byte[0]; }
+    }
+
+    public class Mesh : Object
+    {
+        public Rendering.IndexFormat indexFormat;
+        public int subMeshCount;
+        public void SetVertices(System.Collections.Generic.List<Vector3> v) { }
+        public void SetColors(System.Collections.Generic.List<Color> c) { }
+        public void SetTriangles(System.Collections.Generic.List<int> t, int sub) { }
+        public void RecalculateNormals() { }
+        public Bounds bounds;
+    }
+
+    public class MeshFilter : Component { public Mesh sharedMesh; }
+    public class MeshRenderer : Renderer { }
+    public class MeshCollider : Component { public Mesh sharedMesh; }
+    public class BoxCollider : Component { }
+    public class SphereCollider : Component { }
+    public class CapsuleCollider : Component { }
+
+    public class Object
+    {
+        public string name;
+        public static T[] FindObjectsByType<T>(FindObjectsSortMode m) { return new T[0]; }
+        public static void DestroyImmediate(Object o) { }
+    }
     public class Shader : Object { public static Shader Find(string n) { return null; } }
     public class Material : Object { public Material(Shader s) { } public Color color; }
-    public class Renderer : Component { public Material sharedMaterial; }
+    public class Renderer : Component { public Material sharedMaterial; public Material[] sharedMaterials; public Bounds bounds; }
     public class Component : Object { public Transform transform; }
 
     public class Transform : Component
@@ -65,6 +146,8 @@ namespace UnityEngine
         public bool isStatic;
         public static GameObject CreatePrimitive(PrimitiveType t) { return new GameObject(); }
         public T GetComponent<T>() where T : Component, new() { return new T(); }
+        public T AddComponent<T>() where T : Component, new() { return new T(); }
+        public void SetActive(bool v) { }
     }
 
     public static class Debug
@@ -79,6 +162,11 @@ namespace UnityEngine
     {
         public static T FromJson<T>(string s) { return default(T); }
     }
+}
+
+namespace UnityEngine.Rendering
+{
+    public enum IndexFormat { UInt16, UInt32 }
 }
 
 namespace UnityEditor

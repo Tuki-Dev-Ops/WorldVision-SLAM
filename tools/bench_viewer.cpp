@@ -4090,6 +4090,8 @@ inline bool exportSceneJson(const fs::path& path,
                             const std::unordered_map<std::int64_t, HouseBin>& houses,
                             const std::unordered_map<std::int64_t, Column>& cols,
                             const std::vector<MemoryObject>& objs,
+                            const std::unordered_map<std::int64_t, RoadCell>& road,
+                            const Eigen::Vector3f& road_a, const Eigen::Vector3f& road_b,
                             const Eigen::Vector3d& up_d, float cell,
                             const Eigen::Vector3d& ego, int frame,
                             const std::string& seq) {
@@ -4203,7 +4205,54 @@ inline bool exportSceneJson(const fs::path& path,
           << "], \"seen\": " << o.count
           << ", \"moving\": " << (o.dynamic ? "true" : "false") << "}";
     }
-    f << "\n  ]\n}\n";
+    f << "\n  ],\n";
+
+    // --- 노면 ---
+    //
+    // **1 m 로 묶어서 낸다.** 관측 격자는 0.1 m 인데 그대로 내면 칸이 수십만
+    // 개라 JSON 이 감당하지 못하고, 엔진에서도 타일 하나에 사각형 백 개를
+    // 얹을 이유가 없다. 차선을 보려면 0.1 m 가 필요하지만 그것은 GLB 쪽
+    // 이야기이고, 여기서 필요한 것은 **달릴 수 있는 바닥** 이다.
+    //
+    // 높이는 그 안 칸들의 중앙값이다. 평균을 쓰면 연석에 걸친 칸 하나가
+    // 타일 전체를 들어 올린다.
+    {
+        struct Tile { std::vector<float> h; long long isum = 0; int n = 0; };
+        std::map<std::pair<int, int>, Tile> tiles;
+        const int per = static_cast<int>(std::lround(1.0f / kRoadCell));
+        const auto fdiv = [per](std::int64_t v) {
+            return static_cast<int>((v >= 0) ? v / per : -((-v + per - 1) / per));
+        };
+        for (const auto& [key, rc] : road) {
+            if (rc.hits == 0) continue;
+            std::int64_t qi = (key >> 26) & 0x3FFFFFF, qj = key & 0x3FFFFFF;
+            if (qi & 0x2000000) qi -= 0x4000000;
+            if (qj & 0x2000000) qj -= 0x4000000;
+            Tile& t = tiles[{fdiv(qi), fdiv(qj)}];
+            t.h.push_back(rc.h);
+            t.isum += rc.intensity;
+            ++t.n;
+        }
+        f << "  \"road\": {\"cell\": 1.0, \"tiles\": [\n";
+        bool rfirst = true;
+        for (auto& [k2, t] : tiles) {
+            // 100 칸 중 여덟 칸도 안 찬 타일은 노면이라 하기 어렵다.
+            // 연석 너머로 튄 관측 몇 개가 1 m 짜리 바닥을 만들면 안 된다.
+            if (t.n < 8) continue;
+            std::nth_element(t.h.begin(), t.h.begin() + t.h.size() / 2, t.h.end());
+            const float hm = t.h[t.h.size() / 2];
+            const Eigen::Vector3f c3 =
+                road_a * (static_cast<float>(k2.first) + 0.5f)
+              + road_b * (static_cast<float>(k2.second) + 0.5f)
+              + up * hm;
+            const Eigen::Vector3f w = W(c3);
+            if (!rfirst) f << ",\n";
+            rfirst = false;
+            f << "    [" << w.x() << ", " << w.y() << ", " << w.z() << ", "
+              << (t.isum / std::max(1, t.n)) << "]";
+        }
+        f << "\n  ]}\n}\n";
+    }
     return static_cast<bool>(f);
 }
 
@@ -6443,6 +6492,7 @@ int main(int argc, char** argv) {
             if (!scene_json.empty()) {
                 const float ccell3 = (s.dataset == "kitti") ? 1.0f : 0.5f;
                 if (exportSceneJson(scene_json, houses[1], stuff[1], mem[1],
+                                    road[1], road_a, road_b,
                                     orb.world_up, ccell3, ego_pos,
                                     frame + 1, s.name)) {
                     std::cout << "장면 서술: " << scene_json << std::endl;

@@ -65,9 +65,20 @@ py "D:/Program Files/Slam-Model/engine/unreal/import_worldvision_scene.py"
   "trees":     [{"foot": [..], "height": 6.5, "canopy": 1.8}],
   "poles":     [{"foot": [..], "height": 4.0}],
   "vehicles":  [{"class": "car", "center": [..], "forward": [..],
-                 "size": [w, h, l], "seen": 7, "moving": false}]
+                 "size": [w, h, l], "seen": 7, "moving": false}],
+  "road": {"cell": 1.0, "tiles": [[x, y, z, 밝기], ...]}
 }
 ```
+
+`road` 는 **달릴 수 있는 바닥** 이다. 관측 격자는 0.1 m 지만 그대로 내면 칸이
+수십만 개라 1 m 로 묶어 낸다 - 차선 한 줄의 폭까지 보려면 GLB 를 쓴다. 높이는
+그 안 칸들의 중앙값이고 (평균을 쓰면 연석에 걸친 칸 하나가 타일을 들어 올린다),
+100 칸 중 여덟 칸도 안 찬 타일은 버린다.
+
+`밝기` 는 0..255 다. 임포터는 이것을 다섯 단계로 나눠 **서브메시** 로 만든다.
+처음에는 정점 색으로 실었는데 화면에는 흰 리본 하나만 나왔다 - Lit 셰이더는
+COLOR_0 을 읽지 않으므로 밝기가 통째로 버려졌던 것이다. 셰이더를 새로 쓰는
+대신 단계별로 나누면 어떤 파이프라인에서도 그대로 보인다.
 
 `range` 는 그 집을 **가장 가까이서 본 거리** 다. 스테레오 깊이 오차는 거리의
 제곱으로 커지므로 (30 m 에서 약 1.2 m), 먼 것만 걸러 쓰고 싶으면 이 값으로
@@ -93,7 +104,7 @@ Unity.exe -batchmode -quit -nographics -projectPath engine/unity/Project   -exec
 | GameObject / Transform | 614 / 614 |
 | MeshFilter | 609 |
 | 콜라이더 | Box 496 · Sphere 56 · Capsule 57 |
-| 이름별 | Building 237 · Roof 213 · Canopy 56 · Trunk 56 · car 37 · car (moving) 8 |
+| 이름별 | Building 237 · Roof 213 · Canopy 56 · Trunk 56 · car 37 · car (moving) 8 · Road 1 |
 
 지붕이 건물보다 24 개 적은 것은 맞다 - 높이 2.5 m 미만에는 박공을 얹지
 않는다. 콜라이더가 전부 붙어 있으므로 보이기만 하는 것이 아니라 물리가 있는
@@ -113,6 +124,10 @@ Unity.exe -batchmode -quit -nographics -projectPath engine/unity/Project   -exec
 
 거리가 그대로인 것이 중요하다 - z 뒤집기는 거울이라 손 방향만 바뀌고 형상은
 보존되어야 한다. 값이 달라졌다면 축을 잘못 섞은 것이다.
+
+노면은 1 m 타일 3332 개짜리 메시 하나다. 밝기 분포는 어두운 아스팔트가
+72.2 %, 가장 밝은 단계 (차선·연석) 가 2.0 % 로, 도료가 노면보다 훨씬 밝게
+되돌아온다는 것과 맞는다. `MeshCollider` 가 붙어 있으므로 차를 올리면 선다.
 
 `engine/unity/Check/check.ps1` 은 Unity 없이도 임포터가 컴파일되는지 본다.
 설치가 없는 환경에서 회귀를 잡으려고 남겨 둔다.
