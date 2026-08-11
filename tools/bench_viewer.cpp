@@ -766,6 +766,9 @@ struct Column {
     // 지면과 안 이어진 칸이 이웃 수에서 빠져 밀집도가 낮아지고, 8 이라는
     // 문턱이 그만큼 헐거워진다 - 실제로 기둥이 39 에서 110 으로 늘었다.
     std::int8_t top_raw{-1};
+    // 1 차 훑기에서 이 칸의 높이 목록이 어디에 담겼는가. 지도에 합쳐질
+    // 때는 쓰이지 않는 임시 값이다.
+    int hidx{-1};
     // 이 칸에 속한 복셀들의 분할 라벨 표. 화소가 말해 준 것이라 기하보다
     // 훨씬 믿을 만하다 - 기하로는 아스팔트와 잔디가, 벽과 나무줄기가
     // 갈리지 않는다.
@@ -1013,7 +1016,12 @@ inline void labelScene(const std::unordered_map<std::int64_t, Splat>& cells,
     //
     // 반경 안의 점은 전체의 일부일 뿐이므로, 그 높이만 칸별로 모아 두면
     // 두 번째 훑기가 연속된 배열 위의 짧은 순회로 바뀐다.
-    std::unordered_map<std::int64_t, std::vector<float>> hs;
+    // **점마다 해시를 두 번 타지 않는다.**
+    //
+    // 높이 목록을 칸 키로 다시 해시하면 점 하나에 조회가 두 번이다. 반경
+    // 안의 점이 10 만 개 남짓이므로 그대로 10 만 번이 더 든다. 칸을 이미
+    // 찾았으니 그 안에 자리 번호를 적어 두고 배열로 가면 된다.
+    std::vector<std::vector<float>> hs;
     hs.reserve(cells.size() / 8 + 1);
     for (const auto& [k, v] : cells) {
         if ((v.p - e).squaredNorm() > r2) continue;
@@ -1028,7 +1036,11 @@ inline void labelScene(const std::unordered_map<std::int64_t, Splat>& cells,
         if (v.seg <= 18) {
             ++c.seg_votes[static_cast<int>(stuffFromCityscapes(v.seg))];
         }
-        hs[ck].push_back(h);
+        if (c.hidx < 0) {
+            c.hidx = static_cast<int>(hs.size());
+            hs.emplace_back();
+        }
+        hs[static_cast<std::size_t>(c.hidx)].push_back(h);
     }
 
     // 2 차: 이웃 반경 안에서 그 칸의 지면 높이를 잡는다.
@@ -1059,9 +1071,8 @@ inline void labelScene(const std::unordered_map<std::int64_t, Splat>& cells,
     // 대가로 "어느 높이가 찼는가" 를 얻는다 - 그 정보 없이는 나무와 벽이
     // 구분되지 않는다.
     for (auto& [k, c] : fresh) {
-        const auto hit = hs.find(k);
-        if (hit == hs.end()) continue;
-        for (const float h : hit->second) {
+        if (c.hidx < 0) continue;
+        for (const float h : hs[static_cast<std::size_t>(c.hidx)]) {
             const int b = static_cast<int>(std::floor((h - c.ground) / kBinH));
             if (b >= 0 && b < kBins) c.bins |= (1u << b);
         }
