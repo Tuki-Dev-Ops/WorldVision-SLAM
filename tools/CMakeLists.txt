@@ -157,3 +157,13 @@ target_link_libraries(wme_scene_export PRIVATE
     opencv_imgproc)
 set_target_properties(wme_scene_export PROPERTIES FOLDER "wme/tools")
 wme_stage_runtime_dlls(wme_scene_export)
+
+# 의미 분할 내보내기. 픽셀 클래스를 미리 계산해 파일로 남기고 뷰어가 읽는다.
+# 뷰어 안에서 추론을 돌리지 않는 이유는 seg_export.cpp 머리말 참조.
+add_executable(wme_seg_export seg_export.cpp)
+target_link_libraries(wme_seg_export PRIVATE
+    wme::wme_perception
+    opencv_imgcodecs
+    opencv_imgproc)
+set_target_properties(wme_seg_export PROPERTIES FOLDER "wme/tools")
+wme_stage_runtime_dlls(wme_seg_export)
