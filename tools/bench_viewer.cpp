@@ -1670,6 +1670,7 @@ struct HouseBin {
 struct GlbMesh {
     std::vector<float>         pos;    // xyz
     std::vector<float>         nrm;    // xyz
+    std::vector<float>         col;    // rgba, 비어 있으면 재질 색만 쓴다
     std::vector<std::uint32_t> idx;
     float rgba[4]{0.8f, 0.8f, 0.8f, 1.0f};
     std::string name;
@@ -1704,6 +1705,23 @@ struct GlbMesh {
         quad(p[3], p[7], p[6], p[2]);   // +y
         quad(p[0], p[4], p[7], p[3]);   // -x
         quad(p[1], p[2], p[6], p[5]);   // +x
+    }
+    // 꼭짓점을 공유하는 사각형. 색을 함께 준다.
+    //
+    // tri() 는 면마다 꼭짓점을 새로 만든다 - 상자나 구는 면끼리 법선이
+    // 다르므로 그래야 한다. 노면은 반대다: 한 평면 위의 격자라 이웃 칸이
+    // 꼭짓점을 나눌 수 있고, 나누지 않으면 칸마다 여섯 개가 생겨 파일이
+    // 여섯 배가 된다.
+    std::uint32_t vertex(const Eigen::Vector3f& p, const Eigen::Vector3f& n,
+                         float r, float g2, float b) {
+        const std::uint32_t at = static_cast<std::uint32_t>(pos.size() / 3);
+        pos.push_back(p.x()); pos.push_back(p.y()); pos.push_back(p.z());
+        nrm.push_back(n.x()); nrm.push_back(n.y()); nrm.push_back(n.z());
+        col.push_back(r); col.push_back(g2); col.push_back(b); col.push_back(1.0f);
+        return at;
+    }
+    void face(std::uint32_t a, std::uint32_t b, std::uint32_t c) {
+        idx.push_back(a); idx.push_back(b); idx.push_back(c);
     }
     bool empty() const { return idx.empty(); }
 };
@@ -1743,18 +1761,28 @@ inline bool writeGlb(const fs::path& path, const std::vector<GlbMesh>& meshes) {
                 hi[a] = std::max(hi[a], m.pos[i + a]);
             }
         }
+        const bool has_col = (m.col.size() == m.pos.size() / 3 * 4);
         const std::size_t po = appendf(m.pos);
         const std::size_t no = appendf(m.nrm);
+        const std::size_t co = has_col ? appendf(m.col) : 0;
         const std::size_t io = appendi(m.idx);
-        const int bv_p = n_bv++, bv_n = n_bv++, bv_i = n_bv++;
-        const int ac_p = n_acc++, ac_n = n_acc++, ac_i = n_acc++;
+        const int bv_p = n_bv++, bv_n = n_bv++;
+        const int bv_c = has_col ? n_bv++ : -1;
+        const int bv_i = n_bv++;
+        const int ac_p = n_acc++, ac_n = n_acc++;
+        const int ac_c = has_col ? n_acc++ : -1;
+        const int ac_i = n_acc++;
 
         if (bv_p) bv << ',';
         bv << "{\"buffer\":0,\"byteOffset\":" << po
            << ",\"byteLength\":" << m.pos.size() * 4 << ",\"target\":34962},"
            << "{\"buffer\":0,\"byteOffset\":" << no
-           << ",\"byteLength\":" << m.nrm.size() * 4 << ",\"target\":34962},"
-           << "{\"buffer\":0,\"byteOffset\":" << io
+           << ",\"byteLength\":" << m.nrm.size() * 4 << ",\"target\":34962}";
+        if (has_col) {
+            bv << ",{\"buffer\":0,\"byteOffset\":" << co
+               << ",\"byteLength\":" << m.col.size() * 4 << ",\"target\":34962}";
+        }
+        bv << ",{\"buffer\":0,\"byteOffset\":" << io
            << ",\"byteLength\":" << m.idx.size() * 4 << ",\"target\":34963}";
 
         if (ac_p) acc << ',';
@@ -1763,14 +1791,19 @@ inline bool writeGlb(const fs::path& path, const std::vector<GlbMesh>& meshes) {
             << lo[0] << ',' << lo[1] << ',' << lo[2] << "],\"max\":["
             << hi[0] << ',' << hi[1] << ',' << hi[2] << "]},"
             << "{\"bufferView\":" << bv_n << ",\"componentType\":5126,\"count\":"
-            << m.nrm.size() / 3 << ",\"type\":\"VEC3\"},"
-            << "{\"bufferView\":" << bv_i << ",\"componentType\":5125,\"count\":"
+            << m.nrm.size() / 3 << ",\"type\":\"VEC3\"}";
+        if (has_col) {
+            acc << ",{\"bufferView\":" << bv_c << ",\"componentType\":5126,\"count\":"
+                << m.col.size() / 4 << ",\"type\":\"VEC4\"}";
+        }
+        acc << ",{\"bufferView\":" << bv_i << ",\"componentType\":5125,\"count\":"
             << m.idx.size() << ",\"type\":\"SCALAR\"}";
 
         if (n_mesh) { mesh_js << ','; mat_js << ','; node_js << ','; }
         mesh_js << "{\"name\":\"" << m.name << "\",\"primitives\":[{\"attributes\":{"
-                << "\"POSITION\":" << ac_p << ",\"NORMAL\":" << ac_n
-                << "},\"indices\":" << ac_i << ",\"material\":" << n_mesh << "}]}";
+                << "\"POSITION\":" << ac_p << ",\"NORMAL\":" << ac_n;
+        if (has_col) mesh_js << ",\"COLOR_0\":" << ac_c;
+        mesh_js << "},\"indices\":" << ac_i << ",\"material\":" << n_mesh << "}]}";
         mat_js << "{\"name\":\"" << m.name << "\",\"pbrMetallicRoughness\":{"
                << "\"baseColorFactor\":[" << m.rgba[0] << ',' << m.rgba[1] << ','
                << m.rgba[2] << ',' << m.rgba[3]
@@ -4144,20 +4177,68 @@ inline bool exportScene(const fs::path& path,
         }
     }
 
-    // --- 노면: 관측된 칸을 납작한 사각형으로 ---
-    for (const auto& [key, rc] : road) {
-        if (rc.hits == 0) continue;
-        std::int64_t qi = (key >> 26) & 0x3FFFFFF, qj = key & 0x3FFFFFF;
-        if (qi & 0x2000000) qi -= 0x4000000;
-        if (qj & 0x2000000) qj -= 0x4000000;
-        const float ca = (static_cast<float>(qi) + 0.5f) * kRoadCell;
-        const float cb = (static_cast<float>(qj) + 0.5f) * kRoadCell;
-        const Eigen::Vector3f c3 = road_a * ca + road_b * cb + up * rc.h;
-        const float hh = kRoadCell * 0.5f;
-        m_road.quad(W(c3 - road_a * hh - road_b * hh),
-                    W(c3 + road_a * hh - road_b * hh),
-                    W(c3 + road_a * hh + road_b * hh),
-                    W(c3 - road_a * hh + road_b * hh));
+    // --- 노면: 꼭짓점을 공유하는 격자, 색은 관측된 밝기 ---
+    //
+    // 처음에는 칸마다 사각형 하나를 따로 냈다. 한 프레임이 51 만 삼각형에
+    // 44 MB 였고, 그 해상도가 사 주는 것도 없었다 - 0.1 m 격자를 쓰는 이유는
+    // 차선이 거기 있기 때문인데 내보낼 때 밝기를 빼고 회색 한 장으로 칠하고
+    // 있었다.
+    //
+    // 밝기를 꼭짓점 색으로 실어 보내면 그 해상도가 제 값을 한다. 그리고
+    // 노면은 한 평면 위의 격자이므로 이웃 칸이 꼭짓점을 나눌 수 있다 -
+    // 칸마다 여섯 개씩 만들던 것이 하나가 된다.
+    {
+        // 밝기 범위는 내보내는 범위 전체에서 잡는다. 화면과 달리 여기서는
+        // 어디를 볼지 모르므로 지역 정규화를 할 기준이 없다.
+        int lo = 255, hi = 0;
+        for (const auto& [key, rc] : road) {
+            if (rc.hits == 0) continue;
+            lo = std::min(lo, static_cast<int>(rc.intensity));
+            hi = std::max(hi, static_cast<int>(rc.intensity));
+        }
+        const float span = static_cast<float>(std::max(20, hi - lo));
+        const Eigen::Vector3f n_up = W(up) - W(Eigen::Vector3f::Zero());
+
+        // 격자 꼭짓점은 칸 모서리에 있다. 같은 모서리를 여러 칸이 쓰므로
+        // 좌표로 한 번만 만들어 나눠 쓴다.
+        std::unordered_map<std::int64_t, std::uint32_t> vid;
+        const auto corner = [&](std::int64_t ci, std::int64_t cj, float h) {
+            const std::int64_t ck = ((ci & 0x3FFFFFF) << 26) | (cj & 0x3FFFFFF);
+            const auto it = vid.find(ck);
+            if (it != vid.end()) return it->second;
+            const Eigen::Vector3f p = road_a * (static_cast<float>(ci) * kRoadCell)
+                                    + road_b * (static_cast<float>(cj) * kRoadCell)
+                                    + up * h;
+            const std::uint32_t v = m_road.vertex(W(p), n_up, 1.0f, 1.0f, 1.0f);
+            vid.emplace(ck, v);
+            return v;
+        };
+
+        for (const auto& [key, rc] : road) {
+            if (rc.hits == 0) continue;
+            std::int64_t qi = (key >> 26) & 0x3FFFFFF, qj = key & 0x3FFFFFF;
+            if (qi & 0x2000000) qi -= 0x4000000;
+            if (qj & 0x2000000) qj -= 0x4000000;
+            const std::uint32_t a = corner(qi,     qj,     rc.h);
+            const std::uint32_t b = corner(qi + 1, qj,     rc.h);
+            const std::uint32_t c = corner(qi + 1, qj + 1, rc.h);
+            const std::uint32_t d = corner(qi,     qj + 1, rc.h);
+            // 칸의 밝기를 네 꼭짓점에 나눠 싣는다. 꼭짓점을 공유하므로
+            // 경계에서는 이웃 칸의 밝기와 섞이는데, 노면에서는 그것이
+            // 오히려 맞다 - 0.1 m 칸의 계단이 아니라 도장면이 이어진다.
+            const float t = std::clamp(
+                (static_cast<float>(rc.intensity) - static_cast<float>(lo)) / span,
+                0.0f, 1.0f);
+            const float v = 0.10f + 0.85f * t * t;
+            for (const std::uint32_t q : {a, b, c, d}) {
+                const std::size_t o = static_cast<std::size_t>(q) * 4;
+                m_road.col[o] = std::max(m_road.col[o], v);
+                m_road.col[o + 1] = m_road.col[o];
+                m_road.col[o + 2] = m_road.col[o];
+            }
+            m_road.face(a, b, c);
+            m_road.face(a, c, d);
+        }
     }
 
     // --- 차량: 검출된 자리마다 모형을 놓는다 ---
