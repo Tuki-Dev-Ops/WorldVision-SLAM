@@ -3891,10 +3891,31 @@ void backProject(const cv::Mat& depth16, const cv::Mat& gray,
             // 자차 높이를 기준으로 위아래를 자른다. 도로 장면에서 자차보다
             // 12 m 위에 있는 것은 건물 꼭대기까지이고, 그보다 높으면 관측이
             // 아니라 정합 실패다. 아래쪽도 자른다 - 노면 밑은 없다.
+            // **하늘은 라벨로 거른다.**
+            //
+            // 위 주석이 말하는 대로, 하늘 화소는 텍스처가 없어 스테레오가
+            // 아무 시차나 골라내고 그것이 도로 위 수십 m 에 구조로 남는다.
+            // 지금까지 그것을 높이로 잘라 왔는데, 높이는 하늘과 지붕을
+            // 구분하지 못하므로 상한을 낮추면 2 층 지붕이 같이 잘렸다 -
+            // 커밋 기록에 그 맞바꿈이 숫자로 남아 있다.
+            //
+            // 분할이 그 화소를 직접 sky 라고 말해 준다. 원인을 지목하는
+            // 조건이므로 지붕을 잘라 낼 이유가 없다.
+            std::uint8_t seg_c = 255;
+            if (!seg.empty()) {
+                const int su = u * seg.cols / depth16.cols;
+                const int sv = v * seg.rows / depth16.rows;
+                if (su >= 0 && sv >= 0 && su < seg.cols && sv < seg.rows) {
+                    seg_c = seg.at<std::uint8_t>(sv, su);
+                }
+            }
+            if (seg_c == 10) continue;                 // sky
+
             const double h = p_w.dot(up) - ego_h;
             if (h < h_lo || h > h_hi) continue;
 
             Splat s;
+            s.seg = seg_c;
             s.p = p_w.cast<float>();
             // 색 범위는 **유효 범위와 다르다.** KITTI 의 유효 범위는 3~80 m 지만
             // 실제 점의 대부분은 5~30 m 에 있어서, 유효 범위로 정규화하면 전부
@@ -3907,15 +3928,6 @@ void backProject(const cv::Mat& depth16, const cv::Mat& gray,
             // 나오므로 재투영도 보간도 필요 없다.
             if (!gray.empty() && v < gray.rows && u < gray.cols) {
                 s.intensity = gray.at<std::uint8_t>(v, u);
-            }
-            // 분할 라벨은 원본의 1/4 로 저장돼 있다. 배율 하나로 찾는다 -
-            // 같은 화소에서 나온 값이므로 재투영도 보간도 필요 없다.
-            if (!seg.empty()) {
-                const int su = u * seg.cols / depth16.cols;
-                const int sv = v * seg.rows / depth16.rows;
-                if (su >= 0 && sv >= 0 && su < seg.cols && sv < seg.rows) {
-                    s.seg = seg.at<std::uint8_t>(sv, su);
-                }
             }
             out.push_back(s);
         }
@@ -4497,7 +4509,7 @@ int main(int argc, char** argv) {
                     // 근본 해결은 시차 신뢰도를 깊이와 함께 들고 오는 것이지
                     // 높이를 자르는 것이 아니고, 그건 StereoDepth 쪽 일이다.
                     const double hlo = (s.dataset == "kitti") ? -3.0 : -2.0;
-                    const double hhi = (s.dataset == "kitti") ?  7.5 :  2.2;
+                    const double hhi = (s.dataset == "kitti") ?  9.5 :  2.2;
                     // 같은 프레임의 회색 영상. 노면 표시는 기하가 아니라
                     // 밝기로만 존재하므로 이것 없이는 주차선을 그릴 수 없다.
                     const cv::Mat gimg = cv::imread(
