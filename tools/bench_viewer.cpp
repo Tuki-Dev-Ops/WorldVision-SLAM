@@ -465,6 +465,25 @@ struct Splat {
     // intensity 로 차선을 보여 주는 것과 같은 이야기이고, 여기서는 카메라
     // 밝기가 그 자리를 그대로 대신한다.
     std::uint8_t  intensity{0};
+    // **그 화소의 의미 분할 클래스.** Cityscapes 번호, 255 는 라벨 없음.
+    //
+    // 복셀 하나는 여러 프레임에서 관측되고 프레임마다 라벨이 조금씩 다르다.
+    // 마지막 값을 그대로 쓰면 한 번의 오분류가 그 칸을 통째로 바꾼다.
+    // 다수결을 세려면 클래스별 카운터가 필요한데 복셀 수십만 개에 19 개
+    // 카운터는 메모리가 감당이 안 된다.
+    //
+    // Boyer-Moore 다수결은 그것을 2 바이트로 한다: 같은 값이 오면 세고,
+    // 다른 값이 오면 깎고, 0 이 되면 자리를 넘긴다. 과반이 있으면 반드시
+    // 그 값이 남고, 없으면 최다 후보 중 하나가 남는다.
+    std::uint8_t  seg{255};
+    std::uint8_t  seg_n{0};
+
+    void voteSeg(std::uint8_t s2) {
+        if (s2 > 18) return;                       // 라벨 없음
+        if (seg > 18 || seg_n == 0) { seg = s2; seg_n = 1; }
+        else if (seg == s2) { if (seg_n < 255) ++seg_n; }
+        else --seg_n;
+    }
     std::uint8_t  nbr{0};        // 26 이웃 중 점유 수
     std::uint8_t  hits{0};       // 총 관측 수 (포화 255)
     std::uint16_t view_mask{0};  // 관측한 시점 섹터 비트
@@ -536,15 +555,28 @@ struct VoxelMap {
             // 아니고, 여기서 나은 것은 **가까운** 것이다. 다만 이력은 갱신한다.
             it->second.hits = hits;
             it->second.view_mask = vm;
+            // 위치는 안 바꾸더라도 라벨은 한 표 더 받는다. 이 관측도 같은
+            // 자리를 본 것이므로 표를 버릴 이유가 없다.
+            it->second.voteSeg(s.seg);
             return;
         }
 
         const bool fresh = (it == cells.end());
+        // 분할 라벨은 **덮어쓰지 않고 투표한다.** slot = s 가 새 관측으로
+        // 통째로 갈아치우므로, 이전에 쌓인 표를 먼저 챙겨 두었다가 되돌린 뒤
+        // 이번 표를 던진다. 한 프레임의 오분류가 그 칸을 뒤집지 못한다.
+        std::uint8_t pseg = 255, pseg_n = 0;
+        if (it != cells.end()) { pseg = it->second.seg; pseg_n = it->second.seg_n; }
+
         Splat& slot = cells[key];
+        const std::uint8_t obs_seg = s.seg;
         slot = s;
         slot.hits = hits;
         slot.view_mask = vm;
         slot.nbr = nbr;
+        slot.seg = pseg;
+        slot.seg_n = pseg_n;
+        slot.voteSeg(obs_seg);
 
         // 새 칸이 생기면 26 이웃의 카운터를 올리고 자기 것도 세어 온다.
         // 삽입할 때만 26 회 조회하면 렌더에서는 비교 한 번으로 끝난다 -
@@ -630,7 +662,26 @@ struct VoxelMap {
 //
 // 판정 단위는 **지면 격자 한 칸의 수직 기둥** 이다. 기둥 하나가 어느 높이에
 // 얼마나 채워져 있는가가 곧 그것이 무엇인가다.
-enum class Stuff : std::uint8_t { Unknown, Ground, Building, Fence, Vegetation, Pole };
+enum class Stuff : std::uint8_t { Unknown, Ground, Building, Fence, Vegetation,
+                                  Pole, Terrain };
+constexpr int kStuffN = 7;
+
+// Cityscapes 19 클래스를 이 뷰어의 어휘로 옮긴다.
+//
+// 사람·차량 계열은 **일부러 Unknown 으로 보낸다.** 그것들은 검출기가 상자로
+// 다루고 화면에서도 물체 모형으로 그려지므로, 여기서 다시 구조물로 세우면
+// 같은 차가 지도에도 한 번 더 서게 된다. 하늘도 마찬가지로 구조가 아니다.
+inline Stuff stuffFromCityscapes(int c) {
+    switch (c) {
+        case 0: case 1: return Stuff::Ground;      // road, sidewalk
+        case 2:         return Stuff::Building;    // building
+        case 3: case 4: return Stuff::Fence;       // wall, fence
+        case 5: case 6: case 7: return Stuff::Pole;  // pole, light, sign
+        case 8:         return Stuff::Vegetation;  // vegetation
+        case 9:         return Stuff::Terrain;     // terrain (잔디·흙)
+        default:        return Stuff::Unknown;     // sky, 사람·차량 계열
+    }
+}
 
 inline const char* stuffName(Stuff s) {
     switch (s) {
@@ -639,6 +690,7 @@ inline const char* stuffName(Stuff s) {
         case Stuff::Fence:      return "fence / wall";
         case Stuff::Vegetation: return "tree";
         case Stuff::Pole:       return "pole";
+        case Stuff::Terrain:    return "grass";
         default:                return "";
     }
 }
@@ -651,6 +703,8 @@ inline cv::Scalar stuffColor(Stuff s) {
         case Stuff::Fence:      return {132, 176, 190};
         case Stuff::Vegetation: return {110, 190, 130};
         case Stuff::Pole:       return {168, 168, 214};
+        // 잔디. 수관보다 어둡고 노랗다 - 같은 초록이면 나무와 안 갈린다.
+        case Stuff::Terrain:    return { 92, 156,  96};
         default:                return {90, 90, 90};
     }
 }
@@ -712,6 +766,10 @@ struct Column {
     // 지면과 안 이어진 칸이 이웃 수에서 빠져 밀집도가 낮아지고, 8 이라는
     // 문턱이 그만큼 헐거워진다 - 실제로 기둥이 39 에서 110 으로 늘었다.
     std::int8_t top_raw{-1};
+    // 이 칸에 속한 복셀들의 분할 라벨 표. 화소가 말해 준 것이라 기하보다
+    // 훨씬 믿을 만하다 - 기하로는 아스팔트와 잔디가, 벽과 나무줄기가
+    // 갈리지 않는다.
+    std::uint16_t seg_votes[kStuffN] = {0, 0, 0, 0, 0, 0, 0};
     Stuff cls{Stuff::Unknown};
 
     // 최고 점유 칸. 이상치 하나에 그대로 끌려간다.
@@ -967,6 +1025,9 @@ inline void labelScene(const std::unordered_map<std::int64_t, Splat>& cells,
         if (h > c.high) { c.high = h; c.rep = v.p; }
         c.low = std::min(c.low, h);
         ++c.n;
+        if (v.seg <= 18) {
+            ++c.seg_votes[static_cast<int>(stuffFromCityscapes(v.seg))];
+        }
         hs[ck].push_back(h);
     }
 
@@ -1090,7 +1151,22 @@ inline void labelScene(const std::unordered_map<std::int64_t, Splat>& cells,
             }
             c.crowd = static_cast<std::uint8_t>(occ);
         }
-        c.cls = classifyColumn(c);
+        // **화소가 말한 것이 있으면 그것을 쓴다.**
+        //
+        // 구조 텐서는 형상만 보므로 갈리지 않는 쌍이 있고, 그 한계는
+        // classifyColumn 안에 수치로 적어 두었다. 분할 라벨은 외형에서 오므로
+        // 그 쌍을 가른다. 표가 충분할 때만 쓴다 - 한두 표는 경계 화소일 수
+        // 있고, 그럴 때는 기하 판정이 여전히 낫다.
+        int best = -1, bn = 0, tot = 0;
+        for (int ci = 1; ci < kStuffN; ++ci) {
+            tot += c.seg_votes[ci];
+            if (c.seg_votes[ci] > bn) { bn = c.seg_votes[ci]; best = ci; }
+        }
+        if (best > 0 && bn >= 3 && bn * 2 > tot) {
+            c.cls = static_cast<Stuff>(best);
+        } else {
+            c.cls = classifyColumn(c);
+        }
     }
 
     // **공간 일관성.** 칸마다 따로 판정하면 건물 벽면 한 장이 법선 잡음
@@ -1139,13 +1215,13 @@ inline void labelScene(const std::unordered_map<std::int64_t, Splat>& cells,
                     }
                 }
                 int fill_best = 0, fill_n = 0;
-                for (int ci = 1; ci < 6; ++ci) {
+                for (int ci = 1; ci < kStuffN; ++ci) {
                     if (m[ci] > fill_n) { fill_n = m[ci]; fill_best = ci; }
                 }
                 if (fill_n >= 4) voted[k] = static_cast<Stuff>(fill_best);
                 continue;
             }
-            int n[6] = {0, 0, 0, 0, 0, 0};
+            int n[kStuffN] = {0, 0, 0, 0, 0, 0, 0};
             for (int di = -2; di <= 2; ++di) {
                 for (int dj = -2; dj <= 2; ++dj) {
                     const auto it = fresh.find(GroundGrid::key(c.i + di, c.j + dj));
@@ -1158,7 +1234,7 @@ inline void labelScene(const std::unordered_map<std::int64_t, Splat>& cells,
             // 기둥이나 홀로 선 나무가 주변 지면에 먹혀 사라진다.
             n[static_cast<int>(c.cls)] += 2;
             int best = static_cast<int>(c.cls), bn = -1;
-            for (int ci = 1; ci < 6; ++ci) {
+            for (int ci = 1; ci < kStuffN; ++ci) {
                 if (n[ci] > bn) { bn = n[ci]; best = ci; }
             }
             voted[k] = static_cast<Stuff>(best);
@@ -1667,7 +1743,7 @@ inline void predictAhead(const std::unordered_map<std::int64_t, Column>& cols,
             if (sd[s].n < 3) continue;
             // 그 쪽에서 가장 많이 본 클래스를 그대로 세운다.
             int best = 0, bn = 0;
-            for (int ci = 1; ci < 6; ++ci) {
+            for (int ci = 1; ci < kStuffN; ++ci) {
                 if (sd[s].cls_n[ci] > bn) { bn = sd[s].cls_n[ci]; best = ci; }
             }
             if (best == 0) continue;
@@ -3463,6 +3539,7 @@ void loadSeq(Seq& s) {
 
 // 깊이맵을 세계 좌표 점군으로. stride 로 개수를 조절한다.
 void backProject(const cv::Mat& depth16, const cv::Mat& gray,
+                 const cv::Mat& seg,
                  const wme_tools::DatasetCalib& cal,
                  const Eigen::Isometry3d& T_world_cam, int stride,
                  double dmin, double dmax, double cmin, double cmax,
@@ -3505,6 +3582,15 @@ void backProject(const cv::Mat& depth16, const cv::Mat& gray,
             // 나오므로 재투영도 보간도 필요 없다.
             if (!gray.empty() && v < gray.rows && u < gray.cols) {
                 s.intensity = gray.at<std::uint8_t>(v, u);
+            }
+            // 분할 라벨은 원본의 1/4 로 저장돼 있다. 배율 하나로 찾는다 -
+            // 같은 화소에서 나온 값이므로 재투영도 보간도 필요 없다.
+            if (!seg.empty()) {
+                const int su = u * seg.cols / depth16.cols;
+                const int sv = v * seg.rows / depth16.rows;
+                if (su >= 0 && sv >= 0 && su < seg.cols && sv < seg.rows) {
+                    s.seg = seg.at<std::uint8_t>(sv, su);
+                }
             }
             out.push_back(s);
         }
@@ -3636,17 +3722,17 @@ int main(int argc, char** argv) {
     // 보려던 것은 지도다. L / O 로 필요할 때 켠다.
     // 라벨을 기본으로 켠다. 형상이 있어야 무엇을 인식했는지가 보인다.
     bool show_stuff = true;        // L 로 토글
-    // **건물/담장은 기본으로 그리지 않는다.** B 로 켠다.
+    // **건물/담장을 다시 그린다.** B 로 끈다.
     //
-    // 이 클래스는 우리가 그리는 것 중 근거가 가장 약하면서 화면 면적은
-    // 가장 크다. 측정해 둔 대로 선형·밀집 가지에서 벽 조각과 나무줄기 줄이
-    // 국소 구조가 같아 갈리지 않고 (vert p75 가 겹치고 scatter 는 소수점
-    // 셋째 자리까지 같다), 그 결과가 화면 절반을 덮는 파란 직사각형이었다.
+    // 한동안 껐던 이유는 이 클래스의 근거가 가장 약하면서 화면 면적은 가장
+    // 컸기 때문이다 - 기하만으로는 옆에서 본 벽과 나무줄기가 갈리지 않아서,
+    // 틀린 것이 화면 절반을 덮었다.
     //
-    // 못 믿을 것을 가장 크게 그리면 나머지가 맞아도 화면 전체가 틀려 보인다.
-    // 도로 밝기·검출된 차량·나무·기둥은 각자 근거가 분명하므로 그대로 두고,
-    // 근거가 약한 것만 내린다. 분류가 좋아지면 기본값을 되돌리면 된다.
-    bool show_walls = false;       // B 로 토글
+    // 이제 라벨이 화소에서 온다. 같은 프레임에서 벽은 building 으로, 잎은
+    // vegetation 으로 나오므로 그 혼동이 사라졌다 - kitti_00 에서 나무가
+    // 24 칸에서 886 칸으로, 건물이 3772 에서 2876 으로 옮겨 앉았다.
+    // 근거가 생겼으니 되돌린다.
+    bool show_walls = true;        // B 로 토글
     // 앞을 내다본 것과 그 성적표.
     std::unordered_map<std::int64_t, Prediction> pred[2];
     PredictScore pscore[2];
@@ -4086,7 +4172,15 @@ int main(int argc, char** argv) {
                     const cv::Mat gimg = cv::imread(
                         s.rgb[static_cast<std::size_t>(fi)].second,
                         cv::IMREAD_GRAYSCALE);
-                    backProject(d16, gimg, s.calib,
+                    // 미리 계산해 둔 화소 클래스. 없으면 빈 행렬이고, 그러면
+                    // 기하 기반 분류가 그대로 쓰인다 - 분할을 안 돌린 데이터셋
+                    // 에서도 뷰어는 그대로 동작해야 한다.
+                    const cv::Mat seg_img = cv::imread(
+                        (scene_dir.parent_path() / "seg" / s.name /
+                         (fs::path(s.rgb[static_cast<std::size_t>(fi)].second)
+                              .stem().string() + ".png")).string(),
+                        cv::IMREAD_GRAYSCALE);
+                    backProject(d16, gimg, seg_img, s.calib,
                                 run.aligned[static_cast<std::size_t>(pi)],
                                 stride,
                                 s.calib.depth_min, s.calib.depth_max, cmin, cmax,
@@ -4920,7 +5014,7 @@ int main(int argc, char** argv) {
                     // 그 클래스가 실제로 나왔는지 화면에서 알 수 없고,
                     // 0 개인 범례는 있지도 않은 능력을 광고한다.
                     if (show_stuff && !stuff[k].empty()) {
-                        int n[6] = {0, 0, 0, 0, 0, 0};
+                        int n[kStuffN] = {0, 0, 0, 0, 0, 0, 0};
                         for (const auto& [ck, c] : stuff[k]) {
                             n[static_cast<int>(c.cls)]++;
                         }
@@ -5129,7 +5223,7 @@ int main(int argc, char** argv) {
                           << " (" << acc[k].voxel << " m, coarsen " << acc[k].grown
                           << ", 원거리 정정 " << acc[k].revised << ")"
                           << ", 라벨 " << [&] {
-                                 int n[6] = {0,0,0,0,0,0};
+                                 int n[kStuffN] = {0,0,0,0,0,0,0};
                                  for (const auto& [ck, c] : stuff[k]) {
                                      n[static_cast<int>(c.cls)]++;
                                  }
