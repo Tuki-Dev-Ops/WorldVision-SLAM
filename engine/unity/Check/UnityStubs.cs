@@ -94,4 +94,15 @@ namespace UnityEditor
         public static void RegisterCreatedObjectUndo(UnityEngine.Object o, string s) { }
     }
     public static class Selection { public static GameObject activeGameObject; }
+    public static class EditorApplication { public static void Exit(int code) { } }
+}
+
+namespace UnityEditor.SceneManagement
+{
+    public struct Scene { }
+    public static class EditorSceneManager
+    {
+        public static Scene GetActiveScene() { return default(Scene); }
+        public static bool SaveScene(Scene s, string path) { return true; }
+    }
 }
