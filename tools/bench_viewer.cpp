@@ -3222,7 +3222,8 @@ public:
                       const Orbit& orb, double f, int layer = 0,
                       const Eigen::Vector3d& ego = Eigen::Vector3d::Zero(),
                       double radius = 0.0, bool walls = true,
-                      std::unordered_map<std::int64_t, HouseBin>* hcache = nullptr) {
+                      std::unordered_map<std::int64_t, HouseBin>* hcache = nullptr,
+                      bool trees_on = true) {
         const float r2f = static_cast<float>(radius * radius);
         const Eigen::Vector3f egof = ego.cast<float>();
         const GroundGrid g(up_d.cast<float>(), cell);
@@ -3651,6 +3652,7 @@ public:
                 continue;
             }
             if (c.cls == Stuff::Vegetation) {
+                if (!trees_on) continue;
                 // **한 칸에 한 그루가 아니다.**
                 //
                 // 수관 하나는 격자칸 여러 개를 덮는다. 칸마다 나무를 세우면
@@ -4070,6 +4072,141 @@ void spark(cv::Mat& c, cv::Rect r, const std::vector<double>& v, int upto,
 // 화면용 코드와 나누어 둔다. 화면은 시점이 있으므로 카메라 쪽 세 면만
 // 그리고 먼 것은 생략해도 되지만, 엔진으로 넘길 형상은 어느 쪽에서 볼지
 // 모르므로 닫힌 몸통이어야 한다.
+// 인식한 장면을 **매개변수 목록** 으로 내보낸다.
+//
+// GLB 는 삼각형을 굳혀 보내므로 엔진에서 보기에는 좋지만 게임이 되지는
+// 않는다 - 집 하나가 벽이 아니라 커다란 메시의 일부라 충돌체도 재질도
+// 따로 줄 수 없고, 차를 움직이거나 건물을 지우는 것도 안 된다.
+//
+// 그래서 형상 대신 **무엇이 어디에 얼마만 한가** 를 쓴다. 집은 중심·방향·
+// 치수·지붕 높이, 나무는 자리·높이·수관 반지름, 차량은 변환과 클래스다.
+// 엔진 쪽 임포터가 그것을 읽어 프리팹/액터를 놓으면, 그때부터는 엔진이
+// 아는 오브젝트가 된다.
+//
+// 좌표는 glTF 와 같은 규약으로 낸다: +y 가 위인 오른손계. 엔진마다 축이
+// 다르므로 변환은 임포터가 자기 규약에 맞춰 한 번 더 한다 - 어느 쪽으로
+// 바꿔야 하는지는 엔진이 알지 이 도구가 알 일이 아니다.
+inline bool exportSceneJson(const fs::path& path,
+                            const std::unordered_map<std::int64_t, HouseBin>& houses,
+                            const std::unordered_map<std::int64_t, Column>& cols,
+                            const std::vector<MemoryObject>& objs,
+                            const Eigen::Vector3d& up_d, float cell,
+                            const Eigen::Vector3d& ego, int frame,
+                            const std::string& seq) {
+    const GroundGrid g(up_d.cast<float>(), cell);
+    const Eigen::Vector3f up = g.up;
+    const auto W = [&](const Eigen::Vector3f& p) {
+        return Eigen::Vector3f(p.dot(g.a), p.dot(up), p.dot(g.b));
+    };
+    // 방향 벡터는 위치가 아니므로 원점 보정 없이 축만 바꾼다.
+    const auto Wd = [&](const Eigen::Vector3f& v) {
+        return Eigen::Vector3f(v.dot(g.a), v.dot(up), v.dot(g.b));
+    };
+
+    std::ofstream f(path);
+    if (!f) return false;
+    f << std::fixed << std::setprecision(3);
+    f << "{\n  \"format\": \"worldvision-scene/1\",\n"
+      << "  \"sequence\": \"" << seq << "\",\n"
+      << "  \"frame\": " << frame << ",\n"
+      << "  \"up\": \"+y\",\n  \"handedness\": \"right\",\n  \"unit\": \"meter\",\n";
+    {
+        const Eigen::Vector3f e = W(ego.cast<float>());
+        f << "  \"ego\": [" << e.x() << ", " << e.y() << ", " << e.z() << "],\n";
+    }
+
+    f << "  \"buildings\": [\n";
+    bool first = true;
+    for (const auto& [k, hb] : houses) {
+        for (const HouseFit& h : hb.fits) {
+            const Eigen::Vector3f c = W(h.mid);
+            const Eigen::Vector3f d = Wd(h.dir);
+            if (!first) f << ",\n";
+            first = false;
+            // 중심은 몸통의 중심이다. 지붕은 그 위에 얹힌다.
+            f << "    {\"center\": [" << c.x() << ", " << c.y() << ", " << c.z()
+              << "], \"forward\": [" << d.x() << ", " << d.y() << ", " << d.z()
+              << "], \"length\": " << h.L << ", \"width\": " << h.W
+              << ", \"height\": " << h.hb << ", \"roof\": " << h.rise
+              << ", \"range\": " << h.rng << "}";
+        }
+    }
+    f << "\n  ],\n";
+
+    f << "  \"trees\": [\n";
+    first = true;
+    for (const auto& [k, c] : cols) {
+        if (c.cls != Stuff::Vegetation || c.top_eff < 0) continue;
+        const float h = static_cast<float>(c.top_eff + 1) * kBinH;
+        if (h < 1.5f) continue;
+        bool seed = true;
+        int nveg = 0;
+        for (int di = -3; di <= 3 && seed; ++di) {
+            for (int dj = -3; dj <= 3; ++dj) {
+                if (!di && !dj) continue;
+                const auto it = cols.find(GroundGrid::key(c.i + di, c.j + dj));
+                if (it == cols.end() || it->second.cls != Stuff::Vegetation) continue;
+                ++nveg;
+                if (it->second.top_eff > c.top_eff
+                    || (it->second.top_eff == c.top_eff && it->first > k)) {
+                    seed = false;
+                    break;
+                }
+            }
+        }
+        if (!seed) continue;
+        const Eigen::Vector3f foot = W(c.rep + up * (c.ground - c.rep.dot(up)));
+        const float spread = cell * (0.60f + 0.045f * static_cast<float>(nveg));
+        const float rad = std::clamp(std::min(spread, h * 0.40f), 0.35f, 2.5f);
+        if (!first) f << ",\n";
+        first = false;
+        f << "    {\"foot\": [" << foot.x() << ", " << foot.y() << ", " << foot.z()
+          << "], \"height\": " << h << ", \"canopy\": " << rad << "}";
+    }
+    f << "\n  ],\n";
+
+    f << "  \"poles\": [\n";
+    first = true;
+    for (const auto& [k, c] : cols) {
+        if (c.cls != Stuff::Pole || c.top_eff < 0) continue;
+        const float h = static_cast<float>(c.top_eff + 1) * kBinH;
+        if (h < 1.5f) continue;
+        const Eigen::Vector3f foot = W(c.rep + up * (c.ground - c.rep.dot(up)));
+        if (!first) f << ",\n";
+        first = false;
+        f << "    {\"foot\": [" << foot.x() << ", " << foot.y() << ", " << foot.z()
+          << "], \"height\": " << h << "}";
+    }
+    f << "\n  ],\n";
+
+    f << "  \"vehicles\": [\n";
+    first = true;
+    for (const MemoryObject& o : objs) {
+        const bool veh = (o.cls == "car" || o.cls == "truck" || o.cls == "bus" ||
+                          o.cls == "motorcycle" || o.cls == "bicycle");
+        if (!veh || o.count < 2) continue;
+        const Eigen::Vector3d u = up_d.normalized();
+        Eigen::Vector3d fw = o.cur_c - o.first_c;
+        if (fw.norm() < 0.3) fw = Eigen::Vector3d::UnitX();
+        fw = (fw - u * fw.dot(u)).normalized();
+        const Eigen::Vector3f c = W(o.center().cast<float>());
+        const Eigen::Vector3f d = Wd(fw.cast<float>());
+        const Eigen::Vector3d sz = o.size();
+        if (!first) f << ",\n";
+        first = false;
+        // moving 은 관측에서 나온 판정이다. 엔진에서 정적 배치와 주행
+        // 차량을 가를 때 쓰라고 그대로 넘긴다.
+        f << "    {\"class\": \"" << o.cls << "\", \"center\": ["
+          << c.x() << ", " << c.y() << ", " << c.z() << "], \"forward\": ["
+          << d.x() << ", " << d.y() << ", " << d.z() << "], \"size\": ["
+          << sz.x() << ", " << sz.y() << ", " << sz.z()
+          << "], \"seen\": " << o.count
+          << ", \"moving\": " << (o.dynamic ? "true" : "false") << "}";
+    }
+    f << "\n  ]\n}\n";
+    return static_cast<bool>(f);
+}
+
 inline bool exportScene(const fs::path& path,
                         const std::unordered_map<std::int64_t, HouseBin>& houses,
                         const std::unordered_map<std::int64_t, Column>& cols,
@@ -4486,6 +4623,8 @@ int main(int argc, char** argv) {
     std::string car_obj;
     // 인식한 장면을 glTF 로 내보낼 경로. 스크린샷과 같은 프레임에서 쓴다.
     std::string scene_glb;
+    // 매개변수 형태의 장면 서술. 엔진 임포터가 읽는다.
+    std::string scene_json;
 
     for (int i = 1; i + 1 < argc; i += 2) {
         const std::string k = argv[i];
@@ -4500,6 +4639,7 @@ int main(int argc, char** argv) {
         else if (k == "--cam") start_cam = std::atoi(argv[i + 1]);
         else if (k == "--car-model") car_obj = argv[i + 1];
         else if (k == "--export-scene") scene_glb = argv[i + 1];
+        else if (k == "--export-json") scene_json = argv[i + 1];
     }
 
     const fs::path scene_dir = fs::path(manifest).parent_path();
@@ -4609,6 +4749,17 @@ int main(int argc, char** argv) {
     // 24 칸에서 886 칸으로, 건물이 3772 에서 2876 으로 옮겨 앉았다.
     // 근거가 생겼으니 되돌린다.
     bool show_walls = true;        // B 로 토글
+    // **나무는 기본으로 그리지 않는다.** Y 로 켠다.
+    //
+    // 수관을 채운 구, 선 격자, 앞면만, 성기게 - 여러 판을 거쳤지만 화면에서
+    // 제 몫을 한 적이 없다. 채우면 초록 덩어리이고 선으로 그으면 여러 그루가
+    // 겹쳐 그물이 된다. 나무가 몇 그루 있다는 사실 자체는 라벨 칸 수가 이미
+    // 말해 주고, 그 위에 형상을 얹어서 얻는 것이 없었다.
+    //
+    // 분류는 그대로 돈다 - 나무로 라벨된 칸은 건물로 세워지지 않아야 하므로
+    // 그 판정은 여전히 필요하다. 그리지 않을 뿐이다. glTF 내보내기에는
+    // 남는다: 엔진에는 재질과 조명이 있어 사정이 다르다.
+    bool show_trees = false;       // Y 로 토글
     // 앞을 내다본 것과 그 성적표.
     std::unordered_map<std::int64_t, Prediction> pred[2];
     PredictScore pscore[2];
@@ -5461,7 +5612,7 @@ int main(int argc, char** argv) {
                             cloud[k].stuffVectors(stuff[k], ob.world_up, ccell,
                                                   ob, fpx, layer,
                                                   ego_k, map_r, show_walls,
-                                                  &houses[k]);
+                                                  &houses[k], show_trees);
                         }
                         const auto t_end = std::chrono::steady_clock::now();
                         prof_label[k] = std::chrono::duration<double, std::milli>(
@@ -6148,7 +6299,7 @@ int main(int argc, char** argv) {
             label(canvas, "controls", {hx, fy + 72}, C_INK3);
             text(canvas, "SPACE play    , . step    N/P sequence    1/2 swap model",
                  {hx, fy + 100}, T_BODY, C_INK2);
-            text(canvas, "A/D orbit  W/S zoom  V camera  T layer  C cubes  L labels  B walls  O lookahead  R restart  F shot  Q quit",
+            text(canvas, "A/D orbit  W/S zoom  V camera  T layer  C cubes  L labels  B walls  Y trees  O lookahead  R restart  F shot  Q quit",
                  {hx, fy + 126}, T_BODY, C_INK2);
         }
         {
@@ -6289,6 +6440,16 @@ int main(int argc, char** argv) {
             // 화면에 그린 그 장면을 그대로 엔진용 형상으로도 내보낸다.
             // 오른쪽 패널만 내보낸다 - 왼쪽은 설계상 매 프레임 지도를
             // 비우므로 내보낼 세계가 없다.
+            if (!scene_json.empty()) {
+                const float ccell3 = (s.dataset == "kitti") ? 1.0f : 0.5f;
+                if (exportSceneJson(scene_json, houses[1], stuff[1], mem[1],
+                                    orb.world_up, ccell3, ego_pos,
+                                    frame + 1, s.name)) {
+                    std::cout << "장면 서술: " << scene_json << std::endl;
+                } else {
+                    std::cerr << "장면 서술 저장 실패: " << scene_json << std::endl;
+                }
+            }
             if (!scene_glb.empty()) {
                 const float ccell2 = (s.dataset == "kitti") ? 1.0f : 0.5f;
                 if (!exportScene(scene_glb, houses[1], stuff[1], road[1], mem[1],
@@ -6322,6 +6483,7 @@ int main(int argc, char** argv) {
         else if (key == 'm' || key == 'M') show_mesh = !show_mesh;
         else if (key == 'l' || key == 'L') show_stuff = !show_stuff;
         else if (key == 'b' || key == 'B') show_walls = !show_walls;
+        else if (key == 'y' || key == 'Y') show_trees = !show_trees;
         // 예측 토글은 O 다. P 는 **이전 시퀀스** 로 이미 잡혀 있었고, 여기에
         // 토글을 얹으니 아래 분기가 영영 안 닿아 시퀀스 되감기가 통째로
         // 죽었다 - if/else 사슬에서 같은 키를 두 번 쓰면 뒤엣것은 없는 코드다.
