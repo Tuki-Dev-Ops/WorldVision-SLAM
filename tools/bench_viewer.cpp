@@ -2571,41 +2571,6 @@ public:
                   cv::Scalar(base[0] * a, base[1] * a, base[2] * a));
     }
 
-    // **울타리.** 얇은 판 하나로는 담벼락이지 울타리가 아니다.
-    //
-    // 담장을 집과 같은 상자로 그리면 낮은 건물로 읽힌다. 눈이 울타리를
-    // 알아보는 단서는 **일정 간격으로 선 기둥** 이고, 그 리듬이 있으면
-    // 얇아도 울타리로 보인다.
-    //
-    // 기둥 간격은 2 m 로 고정한다. 관측에서 뽑을 수 있는 값이 아니고 -
-    // 0.3 m 복셀로는 기둥 하나가 한두 칸이라 간격을 셀 수가 없다 - 여기서
-    // 그리는 것은 "이 자리에 울타리가 있다" 는 사실의 표현이지 기둥의
-    // 위치가 아니다. 그래서 판은 관측된 높이를 지키고, 기둥은 그보다
-    // 조금만 솟게 둔다.
-    void fenceRun(const Eigen::Vector3d& c, const Eigen::Vector3d& half_len,
-                  const Eigen::Vector3d& up_h, const Eigen::Vector3d& half_w,
-                  const Orbit& orb, double f, const cv::Scalar& col) {
-        const double len = half_len.norm() * 2.0;
-        if (len < 1e-3) return;
-        const Eigen::Vector3d dir = half_len.normalized();
-        const Eigen::Vector3d nrm = half_w.normalized();
-
-        // 판: 관측 두께와 무관하게 얇게. 담장은 원래 얇다.
-        const double panel_t = std::min(0.09, half_w.norm());
-        solidBox(c, half_len, up_h * 0.86, nrm * panel_t, orb, f, col, 0.88);
-
-        // 기둥: 2 m 간격, 판보다 두껍고 조금 높다.
-        const int posts = std::clamp(static_cast<int>(len / 2.0) + 1, 2, 12);
-        const double post_t = std::min(0.16, half_w.norm());
-        for (int i = 0; i < posts; ++i) {
-            const double t = (posts == 1) ? 0.0
-                           : (static_cast<double>(i) / (posts - 1) * 2.0 - 1.0);
-            solidBox(c + dir * (t * half_len.norm()) + up_h * 0.07,
-                     dir * post_t, up_h * 1.07, nrm * post_t,
-                     orb, f, col, 1.0);
-        }
-    }
-
     // **박공지붕.** 집을 집으로 읽게 하는 것은 결국 지붕이다.
     //
     // 꼭대기가 평평한 상자는 아무리 제자리에 잘 세워도 담벼락으로 읽힌다 -
@@ -2663,8 +2628,8 @@ public:
     // 한 번만 만들어 두고 나무마다 이동·확대해서 쓴다. 나무 한 그루가 128
     // 삼각형이면 화면에 100 그루가 있어도 12800 개이고, 이미 30 만 점을
     // 래스터하고 있는 파이프라인에서 그것은 반올림 오차다.
-    static const std::vector<std::array<Eigen::Vector3f, 3>>& unitSphere() {
-        static const std::vector<std::array<Eigen::Vector3f, 3>> tris = [] {
+    static const std::vector<std::array<Eigen::Vector3f, 3>>& unitSphere(int level = 2) {
+        static const auto build = [](int lv) {
             std::vector<std::array<Eigen::Vector3f, 3>> t;
             const Eigen::Vector3f v[6] = {{1,0,0},{-1,0,0},{0,1,0},
                                           {0,-1,0},{0,0,1},{0,0,-1}};
@@ -2673,8 +2638,8 @@ public:
             for (const auto& fc : face) {
                 t.push_back({v[fc[0]], v[fc[1]], v[fc[2]]});
             }
-            // 두 번 쪼갠다. 쪼갤 때마다 새 꼭짓점을 구면으로 밀어낸다.
-            for (int it = 0; it < 2; ++it) {
+            // 쪼갤 때마다 새 꼭짓점을 구면으로 밀어낸다.
+            for (int it = 0; it < lv; ++it) {
                 std::vector<std::array<Eigen::Vector3f, 3>> next;
                 next.reserve(t.size() * 4);
                 for (const auto& tr : t) {
@@ -2689,8 +2654,10 @@ public:
                 t.swap(next);
             }
             return t;
-        }();
-        return tris;
+        };
+        static const std::vector<std::array<Eigen::Vector3f, 3>> lo = build(1);
+        static const std::vector<std::array<Eigen::Vector3f, 3>> hi = build(2);
+        return (level <= 1) ? lo : hi;
     }
 
     // 나무. **줄기 + 수관** 을 진짜 입체로 세운다.
@@ -2753,26 +2720,36 @@ public:
         const Eigen::Vector3f ex = a * canopy_r;
         const Eigen::Vector3f ey = up * canopy_ry;
         const Eigen::Vector3f ez = b * canopy_r;
-        // 위쪽 잎은 하늘을, 아래쪽 잎은 그늘을 본다. 균일하게 칠하면 수관이
-        // 초록 공 하나로 뭉친다.
-        for (const auto& tr : unitSphere()) {
+
+        // **수관은 채우지 않고 잇는다.**
+        //
+        // 면으로 채운 수관은 초록 덩어리 하나다. 나무는 원래 속이 비어
+        // 있어서 가지 사이로 뒤가 비치고, 눈은 그 **뚫림** 으로 나무를
+        // 나무로 읽는다. 채워 놓으면 아무리 음영을 줘도 공이다.
+        //
+        // 꼭짓점을 선으로 이으면 부피는 그대로 두고 속이 열린다. 뒤에 있는
+        // 것이 사이로 보이고, 카메라가 돌면 앞뒤 선이 서로 지나가면서
+        // 깊이가 살아난다 - 채워진 실루엣에는 없는 단서다.
+        //
+        // 격자는 한 번만 쪼갠 구(32 면)를 쓴다. 128 면을 선으로 그리면
+        // 선이 너무 촘촘해 결국 덩어리로 다시 뭉친다.
+        for (const auto& tr : unitSphere(1)) {
             Eigen::Vector3f n = (tr[0] + tr[1] + tr[2]) / 3.0f;
             if (n.norm() < 1e-6f) continue;
             n.normalize();
-            const Eigen::Vector3f wn =
-                (ex * n.x() + ey * n.y() + ez * n.z());
-            // 뒷면은 자기 앞면에 가려진다. 그리지 않는다.
+            const Eigen::Vector3f wn = (ex * n.x() + ey * n.y() + ez * n.z());
             const Eigen::Vector3d wc = (cen + wn).cast<double>();
-            if ((eye - wc).dot(wn.cast<double>()) < 0.0) continue;
-            const double lam = (0.26 + 0.46 * std::abs(wn.normalized().cast<double>().dot(fwd))
-                              + 0.28 * std::clamp(static_cast<double>(n.dot(up)), 0.0, 1.0))
-                             * depthFade((M * (wc - eye)).z());
+            // 뒷면 선도 남긴다. 앞뒤가 겹쳐 보이는 것이 속이 빈 증거다.
+            const double lam = (0.34 + 0.42 * std::abs(wn.normalized().cast<double>().dot(fwd))
+                              + 0.24 * std::clamp(static_cast<double>(n.dot(up)), 0.0, 1.0))
+                             * depthFade((M * (wc - eye)).z())
+                             * (((eye - wc).dot(wn.cast<double>()) < 0.0) ? 0.55 : 1.0);
             const Eigen::Vector3d q[3] = {
                 (cen + ex * tr[0].x() + ey * tr[0].y() + ez * tr[0].z()).cast<double>(),
                 (cen + ex * tr[1].x() + ey * tr[1].y() + ez * tr[1].z()).cast<double>(),
                 (cen + ex * tr[2].x() + ey * tr[2].y() + ez * tr[2].z()).cast<double>()};
-            fillPoly3(q, 3, orb, f,
-                      cv::Scalar(col[0] * lam, col[1] * lam, col[2] * lam));
+            strokePoly3(q, 3, orb, f,
+                        cv::Scalar(col[0] * lam, col[1] * lam, col[2] * lam));
         }
     }
 
@@ -3089,14 +3066,6 @@ public:
                 const Eigen::Vector3f mid = foot2 + up * (wg + hb * 0.5f);
                 if (r2f > 0.0f && (mid - egof).squaredNorm() > r2f) return;
 
-                if (cls == Stuff::Fence) {
-                    fenceRun(mid.cast<double>(),
-                             (dir * (L * 0.5f)).cast<double>(),
-                             (up * (hb * 0.5f)).cast<double>(),
-                             (nrm * (W * 0.5f)).cast<double>(),
-                             orb, f, stuffColor(cls));
-                    return;
-                }
                 solidBox(mid.cast<double>(),
                          (dir * (L * 0.5f)).cast<double>(),
                          (up * (hb * 0.5f)).cast<double>(),
@@ -3118,8 +3087,14 @@ public:
 
             std::unordered_set<std::int64_t> seen;
             std::vector<std::int64_t> stack, part;
+            // **담장은 그리지 않는다.**
+            //
+            // 이 클래스가 화면에 보태는 것이 없었다. 낮고 얇아서 멀리서는
+            // 안 보이고, 가까이서는 건물 발치의 잡음과 구분되지 않는다.
+            // 기둥을 세워 울타리답게 만들어도 마찬가지였다 - 문제는 생김새가
+            // 아니라 이것이 지도에서 말해 주는 것이 없다는 쪽이었다.
             for (const auto& [k0, c0] : cols) {
-                if (c0.cls != Stuff::Building && c0.cls != Stuff::Fence) continue;
+                if (c0.cls != Stuff::Building) continue;
                 if (c0.top_eff < 0 || seen.count(k0)) continue;
                 if (r2f > 0.0f && (c0.rep - egof).squaredNorm() > r2f) continue;
 
@@ -3232,8 +3207,8 @@ public:
             // 맡는다 - 관측 칸을 하나씩 그리면 성긴 곳은 구멍이, 잡음이 있는
             // 곳은 어긋난 타일이 생겨 평평한 바닥이 누더기가 된다.
             if (c.cls == Stuff::Ground) continue;
-            // 건물/담장을 내렸으면 낱칸으로도 그리지 않는다.
-            if (!walls && (c.cls == Stuff::Building || c.cls == Stuff::Fence)) continue;
+            if (c.cls == Stuff::Fence) continue;      // 담장은 그리지 않는다
+            if (!walls && c.cls == Stuff::Building) continue;
 
             // **형상이 클래스를 말한다.**
             //
@@ -4516,12 +4491,34 @@ int main(int argc, char** argv) {
                             // 평균은 **그리는** 데 쓰는 값이다 (정지 물체가 관측
                             // 잡음으로 떨지 않게). 결합은 추적이므로 최근 위치가
                             // 맞다. 두 목적에 같은 숫자를 쓴 것이 잘못이었다.
+                            // **묶는 거리는 물체 크기에서 나온다.**
+                            //
+                            // 고정 2.5 m 로 묶고 있었는데 차 길이가 4.5 m 다.
+                            // 옆을 지나가면 보이는 부분이 바뀌면서 검출 중심이
+                            // 차체를 따라 미끄러지고, 2.5 m 를 넘는 순간 같은
+                            // 차가 새 물체로 등록된다 - 한 대가 여러 대로 늘어
+                            // 겹쳐 보이던 것이 그것이다.
+                            //
+                            // 월드 축 상자 겹침으로 바꿔 봤더니 오히려 늘었다
+                            // (49 -> 53). 검출 상자의 크기는 **카메라 축** 기준
+                            // 이라 월드 축 AABB 로 재면 축이 뒤섞인다.
+                            //
+                            // 중심이 미끄러지는 거리는 결국 그 물체의 길이를
+                            // 넘지 못한다. 문턱을 제 크기에 매면 차는 제 길이의
+                            // 4 분의 3 만큼 미끄러져도 같은 차로 남고, 앞뒤로
+                            // 주차된 다른 차는 중심이 한 대 길이 넘게 떨어져
+                            // 있으므로 합쳐지지 않는다.
                             MemoryObject* hit = nullptr;
-                            double bestd = merge_r;
-                            for (auto& m : mem[k]) {
-                                if (m.cls != b.cls) continue;
-                                const double d = ((m.count > 0 ? m.cur_c : m.center()) - wc).norm();
-                                if (d < bestd) { bestd = d; hit = &m; }
+                            {
+                                const double own = std::max(b.size.maxCoeff(), 0.4);
+                                double bestd = std::max(merge_r, own * 0.75);
+                                for (auto& m : mem[k]) {
+                                    if (m.cls != b.cls) continue;
+                                    const double lim = std::max(
+                                        bestd, m.size().maxCoeff() * 0.75);
+                                    const double d = (m.center() - wc).norm();
+                                    if (d < lim && d < bestd) { bestd = d; hit = &m; }
+                                }
                             }
                             if (hit == nullptr) {
                                 MemoryObject m;
@@ -4917,7 +4914,38 @@ int main(int argc, char** argv) {
                     // --- 기억된 물체 (지나온 곳에 남는 것) ---
                     // 월드에 고정된 좌표이므로 자차가 지나가도 그 자리에 남는다.
                     // 지금 프레임에서 다시 보이는 것은 아래에서 진하게 덧그린다.
-                    for (const auto& m : mem[k]) {
+                    // **같은 자리의 물체는 한 번만 그린다.**
+                    //
+                    // 연관이 아무리 좋아져도 이미 갈라진 기억은 남는다 -
+                    // 지도는 지우지 않는 것이 원칙이므로 예전에 따로 등록된
+                    // 같은 차가 계속 둘로 존재한다. 그러면 화면에는 차 한 대
+                    // 자리에 차체가 두 겹으로 겹쳐 선다.
+                    //
+                    // 관측을 많이 한 쪽부터 그리고, 이미 그린 것과 제 크기의
+                    // 4 분의 3 안에서 겹치는 같은 클래스는 건너뛴다. 기억을
+                    // 지우는 것이 아니라 **한 자리에 하나만 보이게** 하는
+                    // 것이라, 판정이 나중에 갈라져도 화면은 흔들리지 않는다.
+                    std::vector<const MemoryObject*> mo;
+                    mo.reserve(mem[k].size());
+                    for (const auto& m : mem[k]) mo.push_back(&m);
+                    std::sort(mo.begin(), mo.end(),
+                              [](const MemoryObject* x, const MemoryObject* y) {
+                                  return x->count > y->count;
+                              });
+                    std::vector<std::pair<Eigen::Vector3d, double>> shown;
+                    shown.reserve(mo.size());
+
+                    for (const auto* mp : mo) {
+                        const auto& m = *mp;
+                        const double own_r = std::max(0.4, m.size().maxCoeff());
+                        {
+                            bool dup = false;
+                            for (const auto& [c2, r2m] : shown) {
+                                if ((m.center() - c2).norm()
+                                    < std::max(own_r, r2m) * 0.75) { dup = true; break; }
+                            }
+                            if (dup) continue;
+                        }
                         // 사람 골격은 자리를 크게 차지하므로 관측이 충분한
                         // 것만 그린다. 한두 번 본 검출이 전부 골격으로 서면
                         // 서로 겹쳐 엉킨 덩어리가 된다 - 실제로 그랬다.
@@ -4947,6 +4975,10 @@ int main(int argc, char** argv) {
                         // 아니다. 지금 보고 있지 않은 사람을 계속 그리는 것은
                         // 관측이 뒷받침하지 않는 주장이다. 최근에 본 것만 그린다.
                         if (person && frame - m.seen > 12) continue;
+
+                        // 여기까지 왔으면 그린다. 뒤에 오는 같은 자리의
+                        // 기억은 이것에 가려 건너뛴다.
+                        shown.emplace_back(m.center(), own_r);
 
                         // **움직인다고 판정된 것은 지도의 일부가 아니다.**
                         // 지나온 자리에 남기지 않고, 지금 있는 자리에만 그린다.
