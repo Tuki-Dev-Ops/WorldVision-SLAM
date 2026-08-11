@@ -588,6 +588,38 @@ struct VoxelMap {
         for (auto& [k, v] : cells) tiles[tileOfVox(k)].push_back(&v);
     }
 
+    // 자차 주변 반경 안의 복셀만 넘긴다.
+    //
+    // 지도는 달린 거리만큼 자라는데 한 프레임에 쓰는 것은 언제나 자차 주변
+    // 몇십 m 다. 그 몇십 m 를 찾자고 지도 전체를 만져 보면 비용이 장면이
+    // 아니라 주행 거리를 따라간다 - 오래 달릴수록 느려지고, 화면에 늘어난
+    // 것은 없다.
+    template <class F>
+    void forEachNear(const Eigen::Vector3f& c, float radius, F&& fn) const {
+        const float inv = 1.0f / voxel;
+        const auto qf = [inv](float v) {
+            return static_cast<std::int64_t>(
+                std::floor(static_cast<double>(v) * inv));
+        };
+        const std::int64_t tx = qf(c.x()) >> kTileShift;
+        const std::int64_t ty = qf(c.y()) >> kTileShift;
+        const std::int64_t tz = qf(c.z()) >> kTileShift;
+        const float tspan = voxel * static_cast<float>(1 << kTileShift);
+        const int rt = static_cast<int>(std::ceil(radius / tspan)) + 1;
+        const float r2 = radius * radius;
+        for (int dx = -rt; dx <= rt; ++dx) {
+            for (int dy = -rt; dy <= rt; ++dy) {
+                for (int dz = -rt; dz <= rt; ++dz) {
+                    const auto it = tiles.find(tileKey(tx + dx, ty + dy, tz + dz));
+                    if (it == tiles.end()) continue;
+                    for (const Splat* v : it->second) {
+                        if ((v->p - c).squaredNorm() <= r2) fn(*v);
+                    }
+                }
+            }
+        }
+    }
+
     // 가까이서 본 관측이 멀리서 본 관측을 **이긴다.**
     long long revised{0};      // 폐기한 먼 관측의 수. 개선이 일어났다는 증거다.
 
@@ -1060,6 +1092,13 @@ inline Stuff classifyColumn(const Column& c) {
 //
 // 자차가 결국 모든 곳을 지나가므로 지도는 빠짐없이 라벨된다. 잘라내는 것이
 // 아니라 **한 번 계산한 것을 재사용** 하는 것이므로 화면에서 사라지는 것도 없다.
+// labelScene 각 단계의 시간(ms). 어디가 비싼지는 재 보기 전에는 모른다 -
+// 짐작으로 고친 것이 몇 번이나 헛수고였다. 채우는 값이 시계 읽기 여섯 번
+// 이므로 늘 켜 둔다.
+inline double g_lab_ms[6] = {0, 0, 0, 0, 0, 0};
+inline long long g_lab_tensor = 0;   // 구조 텐서까지 간 칸의 수
+inline long long g_lab_cols = 0;     // 이번에 손댄 칸의 수
+
 inline void labelScene(const std::unordered_map<std::int64_t, Splat>& cells,
                        const Eigen::Vector3d& up_d, float cell, float voxel,
                        const Eigen::Vector3d& ego, float work_radius,
@@ -1071,6 +1110,14 @@ inline void labelScene(const std::unordered_map<std::int64_t, Splat>& cells,
     const GroundGrid g(up_d.cast<float>(), cell);
     const Eigen::Vector3f e = ego.cast<float>();
     const float r2 = work_radius * work_radius;
+
+    auto t_lab = std::chrono::steady_clock::now();
+    const auto lap = [&t_lab](int slot) {
+        const auto now = std::chrono::steady_clock::now();
+        g_lab_ms[slot] =
+            std::chrono::duration<double, std::milli>(now - t_lab).count();
+        t_lab = now;
+    };
 
     // 이번에 손댈 칸만 모은다. 이전 라벨은 지우지 않는다.
     std::unordered_map<std::int64_t, Column> fresh;
@@ -1158,6 +1205,8 @@ inline void labelScene(const std::unordered_map<std::int64_t, Splat>& cells,
         }
     }
 
+    lap(0);
+
     // 2 차: 이웃 반경 안에서 그 칸의 지면 높이를 잡는다.
     //
     // **최솟값을 쓰면 안 된다.** 스테레오 깊이의 이상치 하나가 반경 안의 모든
@@ -1181,6 +1230,8 @@ inline void labelScene(const std::unordered_map<std::int64_t, Splat>& cells,
                          nb.end());
         c.ground = nb[mid];
     }
+
+    lap(1);
 
     // 3 차: 지면이 정해졌으니 점유 프로파일을 채운다. 셀을 한 번 더 훑는
     // 대가로 "어느 높이가 찼는가" 를 얻는다 - 그 정보 없이는 나무와 벽이
@@ -1211,6 +1262,8 @@ inline void labelScene(const std::unordered_map<std::int64_t, Splat>& cells,
         c.rep += g.up * (want - have);
     }
 
+    lap(2);
+
     // 4 차: 구조 텐서. **국소 3 차원 이웃에서** 계산한다.
     //
     // 처음에는 기둥 아홉 칸을 통째로 더했는데, 그것은 1 x 1 m 바닥에 높이
@@ -1225,6 +1278,7 @@ inline void labelScene(const std::unordered_map<std::int64_t, Splat>& cells,
     // 복셀 125 회 조회에 3x3 고유값 분해까지 도는데(실측 26 ms), 그 답을
     // 쓰지 않을 것이면 전부 버려지는 계산이다. 분할 라벨이 충분히 모인 칸은
     // 기하를 물을 이유가 없고, 그런 칸이 지금은 대다수다.
+    long long tensor_n = 0;
     for (auto& [k, c] : fresh) {
         {
             int best = -1, bn = 0, tot = 0;
@@ -1237,6 +1291,7 @@ inline void labelScene(const std::unordered_map<std::int64_t, Splat>& cells,
                 continue;
             }
         }
+        ++tensor_n;
         int n = 0;
         Eigen::Vector3d sum = Eigen::Vector3d::Zero();
         Eigen::Matrix3d sq = Eigen::Matrix3d::Zero();
@@ -1297,6 +1352,8 @@ inline void labelScene(const std::unordered_map<std::int64_t, Splat>& cells,
         c.cls = classifyColumn(c);
     }
 
+    lap(3);
+
     // **공간 일관성.** 칸마다 따로 판정하면 건물 벽면 한 장이 법선 잡음
     // 때문에 조각조각 흩어진다 - kitti_00 에서 나무 2640 대 건물 382 가
     // 나온 것이 그것이다. 주택가 도로가 그렇게 생겼을 리 없다.
@@ -1332,7 +1389,12 @@ inline void labelScene(const std::unordered_map<std::int64_t, Splat>& cells,
             if (c.cls == Stuff::Unknown) {
                 voted[k] = c.cls;
                 if (c.top_eff < 0) continue;
-                int m[6] = {0, 0, 0, 0, 0, 0};
+                // **배열 크기를 클래스 수에 묶는다.** 여기가 6 이었는데
+                // Stuff 는 Terrain 까지 일곱이라, 지형에 던진 표가 배열 밖에
+                // 나갔다. 그 자리에 무엇이 있었는지에 따라 판정이 달라지므로
+                // 결과가 순회 순서를 탄다 - 전수 훑기와 타일 훑기의 라벨이
+                // 미세하게 갈리던 것이 이것이다.
+                int m[kStuffN] = {0, 0, 0, 0, 0, 0, 0};
                 for (int di = -1; di <= 1; ++di) {
                     for (int dj = -1; dj <= 1; ++dj) {
                         if (di == 0 && dj == 0) continue;
@@ -1370,10 +1432,15 @@ inline void labelScene(const std::unordered_map<std::int64_t, Splat>& cells,
         for (auto& [k, c] : fresh) c.cls = voted[k];
     }
 
+    lap(4);
+
     // **누적 지도에 합친다.** 이번에 손대지 않은 칸의 라벨은 그대로 남는다 -
     // 지나온 곳의 건물이 시야에서 벗어났다고 사라지면 그것은 세계 모델이
     // 아니라 지금 보이는 것의 목록이다.
     for (const auto& [k, c] : fresh) cols[k] = c;
+    lap(5);
+    g_lab_cols = static_cast<long long>(fresh.size());
+    g_lab_tensor = tensor_n;
 }
 
 // ---------------------------------------------------------------------------
@@ -5561,6 +5628,10 @@ int main(int argc, char** argv) {
                 //
                 // 반경은 장면 규모에서 온 값이고 자차와 함께 움직이므로,
                 // 지도가 아무리 커져도 담기는 양은 일정하게 유지된다.
+                // **재는 자리가 일하는 자리보다 뒤에 있으면 안 된다.**
+                // 시계를 아래 그리기 직전에 켜 두는 바람에, 반경을 고르는
+                // 훑기가 계측에 안 잡히고 있었다.
+                const auto t_c0 = std::chrono::steady_clock::now();
                 const double flat_r2 = ((s.dataset == "kitti") ? 55.0 : 7.0)
                                      * ((s.dataset == "kitti") ? 55.0 : 7.0);
                 const Eigen::Vector3f ego_f = ego_k.cast<float>();
@@ -5569,13 +5640,16 @@ int main(int argc, char** argv) {
                 // age 는 최근성이다. 오래 전에 본 표면은 배경으로 가라앉혀
                 // 지금 보고 있는 것과 구분한다 - 지우지는 않는다.
                 const double span = std::max(1, frame);
-                for (const auto& [key, v] : acc[k].cells) {
-                    if ((v.p - ego_f).squaredNorm() > flat_r2) continue;
+                // 반경 밖은 만져 보지도 않는다. 위의 주석대로 복사는 이미
+                // 줄였는데 **찾는 일** 이 남아 있었다 - 55 m 를 고르려고
+                // 83 만 칸을 전부 훑고 있었으므로, 비용은 여전히 지도 크기를
+                // 따라가고 있었다.
+                acc[k].forEachNear(ego_f, static_cast<float>(std::sqrt(flat_r2)),
+                                   [&](const Splat& v) {
                     flat.push_back(v);
                     flat.back().age = static_cast<float>(
                         std::clamp(1.0 - static_cast<double>(v.seen) / span, 0.0, 1.0));
-                }
-                const auto t_c0 = std::chrono::steady_clock::now();
+                });
                 // 먼저 점으로 전부 깔고, 그 위에 가까운 칸을 큐브로 채운다.
                 // 큐브만 그리면 2 px 미만으로 작아지는 먼 구조가 통째로
                 // 사라져 "저기엔 아무 것도 없다" 로 읽힌다 - 없는 것과 너무
@@ -5782,23 +5856,73 @@ int main(int argc, char** argv) {
                                 labelScene(acc[k].cells, ob.world_up, ccell,
                                            acc[k].voxel, ego_k, work_r, ref);
                                 const auto t_ful1 = std::chrono::steady_clock::now();
-                                long long bad = 0;
+                                // **누적 지도를 거쳐 견주면 안 된다.** 이번
+                                // 프레임에 손대지 않은 칸의 옛 값이 섞인다.
+                                // 같은 조건에서 두 번 돌려 그 결과끼리 본다.
+                                std::unordered_map<std::int64_t, Column> idx;
+                                labelScene(acc[k].cells, ob.world_up, ccell,
+                                           acc[k].voxel, ego_k, work_r, idx,
+                                           3, &acc[k].tiles);
+                                long long bad = 0, d_miss = 0, d_n = 0, d_low = 0,
+                                          d_high = 0, d_rep = 0, d_grd = 0,
+                                          d_bins = 0, d_cls = 0, d_ten = 0,
+                                          d_crw = 0, d_top = 0, d_seg = 0;
                                 for (const auto& [ck, rc] : ref) {
-                                    const auto it = stuff[k].find(ck);
-                                    if (it == stuff[k].end()) { ++bad; continue; }
+                                    const auto it = idx.find(ck);
+                                    if (it == idx.end()) { ++bad; ++d_miss; continue; }
                                     const Column& gc = it->second;
-                                    if (gc.n != rc.n || gc.bins != rc.bins ||
-                                        gc.cls != rc.cls ||
-                                        gc.ground != rc.ground ||
-                                        gc.high != rc.high || gc.low != rc.low ||
-                                        (gc.rep - rc.rep).squaredNorm() != 0.0f)
-                                        ++bad;
+                                    bool diff = false;
+                                    if (gc.n != rc.n) { ++d_n; diff = true; }
+                                    if (gc.low != rc.low) { ++d_low; diff = true; }
+                                    if (gc.high != rc.high) { ++d_high; diff = true; }
+                                    if ((gc.rep - rc.rep).squaredNorm() != 0.0f)
+                                        { ++d_rep; diff = true; }
+                                    if (gc.ground != rc.ground) { ++d_grd; diff = true; }
+                                    if (gc.bins != rc.bins) { ++d_bins; diff = true; }
+                                    if (gc.cls != rc.cls) { ++d_cls; diff = true; }
+                                    if (gc.planarity != rc.planarity ||
+                                        gc.linearity != rc.linearity ||
+                                        gc.scatter != rc.scatter ||
+                                        gc.vert != rc.vert) { ++d_ten; diff = true; }
+                                    if (gc.crowd != rc.crowd) { ++d_crw; diff = true; }
+                                    if (gc.top_eff != rc.top_eff ||
+                                        gc.top_raw != rc.top_raw) { ++d_top; diff = true; }
+                                    {
+                                        bool sv = false;
+                                        for (int ci = 0; ci < kStuffN; ++ci)
+                                            if (gc.seg_votes[ci] != rc.seg_votes[ci]) sv = true;
+                                        if (sv) { ++d_seg; diff = true; }
+                                    }
+                                    if (diff) ++bad;
+                                }
+                                // 색인 자체를 지도와 맞춰 본다. 라벨이
+                                // 어긋난다면 원인은 대개 여기다.
+                                std::size_t idx_n = 0;
+                                for (const auto& [tk, tv] : acc[k].tiles)
+                                    idx_n += tv.size();
+                                std::size_t misplaced = 0;
+                                for (const auto& [ck2, cv] : acc[k].cells) {
+                                    const auto ti = acc[k].tiles.find(tileOfVox(ck2));
+                                    if (ti == acc[k].tiles.end()) { ++misplaced; continue; }
+                                    bool found = false;
+                                    for (const Splat* pp : ti->second)
+                                        if (pp == &cv) { found = true; break; }
+                                    if (!found) ++misplaced;
                                 }
                                 std::cout << "타일색인 검증  복셀 "
                                           << acc[k].cells.size()
                                           << "  타일 " << acc[k].tiles.size()
                                           << "  기준칸 " << ref.size()
                                           << "  불일치 " << bad
+                                          << "  색인원소 " << idx_n
+                                          << "  누락 " << misplaced
+                                          << " [없음 " << d_miss << " n " << d_n
+                                          << " low " << d_low << " high " << d_high
+                                          << " rep " << d_rep << " 지면 " << d_grd
+                                          << " bins " << d_bins << " cls " << d_cls
+                                          << " 텐서 " << d_ten << " crowd " << d_crw
+                                          << " top " << d_top << " seg " << d_seg
+                                          << "]"
                                           << std::setprecision(1) << std::fixed
                                           << "  색인 "
                                           << std::chrono::duration<double,
@@ -6600,6 +6724,13 @@ int main(int argc, char** argv) {
                           << "\n           시간(ms): 점군 " << std::fixed
                           << std::setprecision(1) << prof_cloud[k]
                           << "  라벨 " << prof_label[k]
+                          << " [훑기 " << g_lab_ms[0]
+                          << " 지면 " << g_lab_ms[1]
+                          << " 프로파일 " << g_lab_ms[2]
+                          << " 텐서 " << g_lab_ms[3]
+                          << "(" << g_lab_tensor << "/" << g_lab_cols << "칸)"
+                          << " 투표 " << g_lab_ms[4]
+                          << " 병합 " << g_lab_ms[5] << "]" 
                           << "  벡터 " << prof_vec[k]
                           << "  예측 " << prof_pred[k]
                           << "  예측그리기 " << prof_pdraw[k]
