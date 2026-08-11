@@ -3123,8 +3123,13 @@ public:
                 // **깊이는 본 만큼만.** 길에서 보면 벽면 한 겹뿐이라 사각형이
                 // 얇게 나온다. 집 안쪽까지 지어내지 않되, 종잇장이 되지 않을
                 // 만큼은 세운다 - 두께 0 인 벽에는 지붕을 얹을 자리가 없다.
+                //
+                // 그 바닥값이 2.2 m 였는데, 재 보니 세워지는 집의 **56 %** 가
+                // 거기에 걸려 있었다. 절반 넘는 집의 깊이가 관측이 아니라
+                // 내가 정한 숫자였다는 뜻이다. 1.2 m 면 박공을 얹을 자리는
+                // 되면서 지어내는 몫이 절반으로 준다.
                 const float W = std::clamp(std::min(rr.size.width, rr.size.height)
-                                           + cell, 2.2f, 12.0f);
+                                           + cell, 1.2f, 12.0f);
 
                 const auto quant = [](std::vector<float>& v, double q) {
                     const std::size_t i = std::min(
@@ -3137,6 +3142,20 @@ public:
                 const float h  = quant(tops, 0.7);
                 const float wg = quant(grounds, 0.5);
                 if (h < 1.5f) return;
+
+                // **사각형의 대부분이 비어 있으면 집이 아니다.**
+                //
+                // 최소 넓이 사각형은 흩어진 칸도 감싼다. 그러면 관측이 없는
+                // 자리까지 벽이 서고, 카메라에 보이는 것보다 큰 집이 된다 -
+                // 재 보니 바닥 넓이의 중앙값 41 % 가 뒷받침 없는 자리였고,
+                // 여섯 채 중 하나는 그 비율이 60 % 를 넘었다.
+                //
+                // 칸이 채우는 비율이 3 분의 1 도 안 되면 그 사각형은 건물의
+                // 윤곽이 아니라 흩어진 조각의 외접선이다.
+                if (static_cast<float>(cs.size()) * cell * cell
+                    < 0.35f * L * W) {
+                    return;
+                }
 
                 double th = rr.angle * kPiV / 180.0;
                 if (rr.size.height > rr.size.width) th += kPiV * 0.5;
