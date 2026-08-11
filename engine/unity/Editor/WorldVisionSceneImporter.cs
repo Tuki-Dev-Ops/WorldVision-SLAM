@@ -505,6 +505,116 @@ namespace WorldVision
             return m;
         }
 
+        // 차선. **예측한 것이므로 관측한 노면 텍스처와 섞지 않는다.**
+        //
+        // 구운 밝기 지도는 측정이고 이쪽은 도로 구조에서 세운 모형이다. 따로
+        // 두어야 나중에 서로를 채점할 수 있고, 보는 사람도 무엇이 근거이고
+        // 무엇이 추정인지 구분할 수 있다.
+        static List<List<Vector3>> ReadLanes(string text, out List<string> kinds,
+                                             out List<float> widths)
+        {
+            var outp = new List<List<Vector3>>();
+            kinds = new List<string>();
+            widths = new List<float>();
+            int at = text.IndexOf("\"lanes\"");
+            if (at < 0) return outp;
+            int i = at;
+            while (true)
+            {
+                int k0 = text.IndexOf("\"kind\"", i);
+                if (k0 < 0) break;
+                int q0 = text.IndexOf('"', text.IndexOf(':', k0)) + 1;
+                int q1 = text.IndexOf('"', q0);
+                if (q0 <= 0 || q1 < 0) break;
+                string kind = text.Substring(q0, q1 - q0);
+                float w = Num(text, "\"width\"", q1, 0.12f);
+                int p0 = text.IndexOf("\"points\"", q1);
+                if (p0 < 0) break;
+                int open = text.IndexOf('[', p0);
+                int close = text.IndexOf("]]", open);
+                if (open < 0 || close < 0) break;
+                var pts = new List<Vector3>();
+                int j = open + 1;
+                var n = new float[3];
+                while (j < close + 1)
+                {
+                    int a = text.IndexOf('[', j);
+                    if (a < 0 || a > close) break;
+                    int b = text.IndexOf(']', a);
+                    if (b < 0) break;
+                    string[] pp = text.Substring(a + 1, b - a - 1).Split(',');
+                    if (pp.Length >= 3)
+                    {
+                        bool ok = true;
+                        for (int c = 0; c < 3; ++c)
+                            ok &= float.TryParse(pp[c].Trim(),
+                                    System.Globalization.NumberStyles.Float,
+                                    System.Globalization.CultureInfo.InvariantCulture,
+                                    out n[c]);
+                        if (ok) pts.Add(new Vector3(n[0], n[1], -n[2]));
+                    }
+                    j = b + 1;
+                }
+                if (pts.Count >= 2) { outp.Add(pts); kinds.Add(kind); widths.Add(w); }
+                i = close + 2;
+                // 배열이 닫혔으면 그만.
+                int nx = text.IndexOf("\"kind\"", i);
+                int endBracket = text.IndexOf(']', i);
+                if (nx < 0 || (endBracket >= 0 && endBracket < nx)) break;
+            }
+            return outp;
+        }
+
+        static void BuildLanes(Transform parent, List<List<Vector3>> lanes,
+                               List<string> kinds, List<float> widths)
+        {
+            if (lanes.Count == 0) return;
+            // 노면보다 2 cm 띄운다. 같은 높이면 z-fighting 으로 선이 깜빡인다.
+            const float lift = 0.02f;
+            var mats = new Material[2];
+            mats[0] = MakeMaterial("wv_lane_edge",   new Color(0.90f, 0.90f, 0.88f));
+            mats[1] = MakeMaterial("wv_lane_center", new Color(0.94f, 0.88f, 0.45f));
+            for (int k = 0; k < 2; ++k)
+            {
+                if (mats[k].HasProperty("_Glossiness")) mats[k].SetFloat("_Glossiness", 0.05f);
+            }
+
+            for (int L = 0; L < lanes.Count; ++L)
+            {
+                var pts = lanes[L];
+                bool center = kinds[L] == "center";
+                float hw = Mathf.Max(0.05f, widths[L]) * 0.5f;
+                var verts = new List<Vector3>();
+                var tris = new List<int>();
+                for (int i = 0; i + 1 < pts.Count; ++i)
+                {
+                    Vector3 a = pts[i] + Vector3.up * lift;
+                    Vector3 b = pts[i + 1] + Vector3.up * lift;
+                    Vector3 d = b - a; d.y = 0f;
+                    if (d.sqrMagnitude < 1e-6f) continue;
+                    // 중앙선은 파선으로 놓는다. 실선으로 그으면 추월 금지라는
+                    // 뜻이 되는데, 그것은 관측한 것이 아니라 지어낸 규칙이다.
+                    if (center && (i % 2) == 1) continue;
+                    Vector3 n = new Vector3(-d.z, 0f, d.x).normalized * hw;
+                    int v0 = verts.Count;
+                    verts.Add(a - n); verts.Add(a + n);
+                    verts.Add(b + n); verts.Add(b - n);
+                    tris.Add(v0); tris.Add(v0 + 1); tris.Add(v0 + 2);
+                    tris.Add(v0); tris.Add(v0 + 2); tris.Add(v0 + 3);
+                }
+                if (verts.Count == 0) continue;
+                var go = new GameObject((center ? "LaneCenter " : "LaneEdge ") + L);
+                go.transform.SetParent(parent, false);
+                var mesh = new Mesh();
+                mesh.SetVertices(verts);
+                mesh.SetTriangles(tris, 0);
+                mesh.RecalculateNormals();
+                go.AddComponent<MeshFilter>().sharedMesh = mesh;
+                go.AddComponent<MeshRenderer>().sharedMaterial = mats[center ? 1 : 0];
+                go.isStatic = true;
+            }
+        }
+
         // 표면 종류마다 하나씩. 물성이 다르므로 메시도 갈라야 한다 - 차가
         // 굴러가는 아스팔트와 밟고 서는 보도와 잔디는 같은 재질일 수 없다.
         //
@@ -687,6 +797,12 @@ namespace WorldVision
             BuildSurfaces(gRoad, surfTiles, surfCell, roadMap, roadTex,
                           Path.GetDirectoryName(path));
 
+            List<string> laneKinds; List<float> laneWidths;
+            var lanes = ReadLanes(text, out laneKinds, out laneWidths);
+            var gLane = new GameObject("Lanes").transform;
+            gLane.SetParent(root.transform, false);
+            BuildLanes(gLane, lanes, laneKinds, laneWidths);
+
             var gBuild = new GameObject("Buildings").transform;
             gBuild.SetParent(root.transform, false);
             foreach (var b in s.buildings ?? new Building[0])
@@ -768,7 +884,7 @@ namespace WorldVision
 
             Debug.Log(string.Format(
                 "WorldVision: {0} 프레임 {1} - 건물 {2}, 나무 {3}, 기둥 {4}, 차량 {5}, "
-                + "지표면 {6} 타일 (도로 {7} 인도 {8} 잔디 {9} 기타 {10}), 노면지도 {11}",
+                + "지표면 {6} 타일 (도로 {7} 인도 {8} 잔디 {9} 기타 {10}), 노면지도 {11}, 차선 {12}",
                 s.sequence, s.frame,
                 (s.buildings ?? new Building[0]).Length,
                 (s.trees ?? new Tree[0]).Length,
@@ -779,7 +895,8 @@ namespace WorldVision
                 surfTiles.FindAll(t => t.cls == 1).Count,
                 surfTiles.FindAll(t => t.cls == 2).Count,
                 surfTiles.FindAll(t => t.cls == 3).Count,
-                roadTex != null ? roadMap.width + "x" + roadMap.height : "없음"));
+                roadTex != null ? roadMap.width + "x" + roadMap.height : "없음",
+                lanes.Count));
             Selection.activeGameObject = root;
             return true;
         }

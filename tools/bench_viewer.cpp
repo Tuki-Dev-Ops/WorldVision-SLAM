@@ -54,6 +54,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <functional>
 #include <map>
 #include <tuple>
 #include <unordered_map>
@@ -4293,6 +4294,187 @@ void spark(cv::Mat& c, cv::Rect r, const std::vector<double>& v, int upto,
 // 좌표는 glTF 와 같은 규약으로 낸다: +y 가 위인 오른손계. 엔진마다 축이
 // 다르므로 변환은 임포터가 자기 규약에 맞춰 한 번 더 한다 - 어느 쪽으로
 // 바꿔야 하는지는 엔진이 알지 이 도구가 알 일이 아니다.
+// ---------------------------------------------------------------------------
+// 차선 — 관측되지 않은 것을 구조에서 되찾는다
+// ---------------------------------------------------------------------------
+// 칠해진 차선은 세 가지 이유로 잘 안 보인다. 주택가 골목에는 애초에 없고,
+// 있어도 닳아서 아스팔트와 밝기가 비슷해지며, 스테레오 깊이가 노면에서
+// 가장 나쁘므로 15 cm 짜리 선이 여러 칸에 번진다. 실제로 kitti_00 에서
+// 가늘고 긴 밝은 성분은 세 개뿐이었다.
+//
+// **그렇다고 차선이 없는 것은 아니다.** 도로에는 구조가 있다 - 자차가
+// 지나간 자리가 곧 차로 중심이고, 노면 마스크의 경계가 곧 도로 가장자리다.
+// 그 둘은 잘 관측되므로, 보이지 않는 선을 보이는 것에서 세울 수 있다.
+//
+// 예측한 것과 관측한 것은 **섞지 않는다.** 구운 밝기 지도는 측정이고 이쪽은
+// 모형이라, 따로 내보내야 나중에 서로를 채점할 수 있다.
+struct LaneLine {
+    std::vector<Eigen::Vector3f> pts;   // 월드(내보내기 좌표계)
+    const char* kind = "edge";          // edge / center
+    float width = 0.12f;
+};
+
+// 도로 마스크에서 자차 기준 좌우 폭을 재고 선을 놓는다.
+//
+// 폭을 **재는** 것이지 가정하지 않는다. 차로 폭을 3.5 m 로 박아 두면 골목
+// 에서는 인도를 덮고 넓은 길에서는 가운데만 그린다 - 나라마다 다르고 같은
+// 시퀀스 안에서도 변한다.
+inline std::vector<LaneLine> predictLanes(
+        const std::unordered_map<std::int64_t, RoadCell>& road,
+        const Eigen::Vector3f& ra, const Eigen::Vector3f& rb,
+        const Eigen::Vector3f& up,
+        const std::vector<Eigen::Vector3d>& traj,
+        const std::function<Eigen::Vector3f(const Eigen::Vector3f&)>& W,
+        double* out_score, int* out_pts) {
+    std::vector<LaneLine> out;
+    if (out_score) *out_score = std::nan("");
+    if (out_pts) *out_pts = 0;
+    if (traj.size() < 4) return out;
+
+    // 차도 칸만 모은다. 인도와 잔디는 도로가 아니므로 여기서 빠져야 폭이
+    // 인도까지 번지지 않는다.
+    struct Cell { float h; std::uint8_t inten; };
+    std::unordered_map<std::int64_t, Cell> carriage;
+    carriage.reserve(road.size());
+    for (const auto& [k, rc] : road) {
+        if (rc.hits == 0) continue;
+        if (rc.seg <= 18 && surfaceFromCityscapes(rc.seg) != Surface::Road) continue;
+        carriage.emplace(k, Cell{rc.h, rc.intensity});
+    }
+    if (carriage.size() < 200) return out;
+
+    const float rinv = 1.0f / kRoadCell;
+    const auto at = [&](float u, float v) -> const Cell* {
+        const auto q = [](float x) {
+            return static_cast<std::int64_t>(std::floor(static_cast<double>(x)));
+        };
+        const std::int64_t key = ((q(u) & 0x3FFFFFF) << 26) | (q(v) & 0x3FFFFFF);
+        const auto it = carriage.find(key);
+        return it == carriage.end() ? nullptr : &it->second;
+    };
+
+    // 궤적을 도로 격자 좌표로 옮기고 2 m 마다 다시 뽑는다. 프레임 간격은
+    // 속도에 따라 0.2 m 에서 2 m 까지 흔들리므로 그대로 쓰면 선의 점 밀도가
+    // 구간마다 달라진다.
+    std::vector<Eigen::Vector2f> path;
+    for (const auto& p : traj) {
+        const Eigen::Vector3f f = p.cast<float>();
+        const Eigen::Vector2f q(f.dot(ra) * rinv, f.dot(rb) * rinv);
+        if (path.empty() || (q - path.back()).norm() * kRoadCell > 2.0f) {
+            path.push_back(q);
+        }
+    }
+    if (path.size() < 3) return out;
+
+    // 칸을 벗어나도 다섯 칸까지는 참는다. 관측이 성겨 생긴 구멍에서 도로가
+    // 끝났다고 보면 선이 잘게 끊긴다.
+    const int kGap = 5;
+    const float kMaxHalf = 12.0f / kRoadCell;
+    const auto march = [&](const Eigen::Vector2f& o, const Eigen::Vector2f& d) {
+        float last = 0.0f;
+        int miss = 0;
+        for (float t = 0.0f; t < kMaxHalf; t += 1.0f) {
+            const Eigen::Vector2f q = o + d * t;
+            if (at(q.x(), q.y())) { last = t; miss = 0; }
+            else if (++miss > kGap) break;
+        }
+        return last * kRoadCell;   // m
+    };
+
+    std::vector<float> dl(path.size(), 0.0f), dr(path.size(), 0.0f);
+    std::vector<float> hh(path.size(), 0.0f);
+    for (std::size_t i = 0; i < path.size(); ++i) {
+        const std::size_t a = (i == 0) ? 0 : i - 1;
+        const std::size_t b = std::min(path.size() - 1, i + 1);
+        Eigen::Vector2f t = path[b] - path[a];
+        if (t.squaredNorm() < 1e-9f) t = Eigen::Vector2f(1, 0);
+        t.normalize();
+        const Eigen::Vector2f n(-t.y(), t.x());
+        dl[i] = march(path[i], n);
+        dr[i] = march(path[i], -n);
+        const Cell* c = at(path[i].x(), path[i].y());
+        hh[i] = c ? c->h : 0.0f;
+    }
+
+    // 폭은 중앙값으로 다듬는다. 주차된 차가 노면을 가린 자리에서 한 표본만
+    // 크게 짧아지는데, 그대로 두면 선이 그 자리에서 도로 안쪽으로 꺾인다.
+    const auto smooth = [](std::vector<float>& v) {
+        std::vector<float> o = v;
+        for (std::size_t i = 0; i < v.size(); ++i) {
+            std::vector<float> w;
+            for (std::size_t j = (i >= 2 ? i - 2 : 0);
+                 j <= std::min(v.size() - 1, i + 2); ++j) w.push_back(o[j]);
+            std::nth_element(w.begin(), w.begin() + w.size() / 2, w.end());
+            v[i] = w[w.size() / 2];
+        }
+    };
+    smooth(dl); smooth(dr); smooth(hh);
+
+    // 선을 놓는다. 가장자리는 도로 안쪽으로 15 cm 들인다 - 페인트는 연석에
+    // 붙어 있지 않고, 마스크 경계 자체가 반 칸쯤 바깥으로 번져 있다.
+    struct Build { const char* kind; float w; std::vector<Eigen::Vector3f> pts; };
+    std::vector<Build> lines = {
+        {"edge", 0.12f, {}}, {"edge", 0.12f, {}}, {"center", 0.12f, {}},
+    };
+    std::vector<std::vector<Eigen::Vector2f>> uv(3);
+    for (std::size_t i = 0; i < path.size(); ++i) {
+        const float w = dl[i] + dr[i];
+        // 3 m 도 안 되면 차도가 아니라 관측 구멍이고, 25 m 를 넘으면
+        // 교차로에서 마스크가 옆길로 새어 나간 것이다.
+        if (w < 3.0f || w > 25.0f) continue;
+        const std::size_t a = (i == 0) ? 0 : i - 1;
+        const std::size_t b = std::min(path.size() - 1, i + 1);
+        Eigen::Vector2f t = path[b] - path[a];
+        if (t.squaredNorm() < 1e-9f) continue;
+        t.normalize();
+        const Eigen::Vector2f n(-t.y(), t.x());
+        const float off[3] = {
+            dl[i] - 0.15f,          // 왼쪽 가장자리
+            -(dr[i] - 0.15f),       // 오른쪽 가장자리
+            (dl[i] - dr[i]) * 0.5f, // 회랑 한가운데
+        };
+        for (int L = 0; L < 3; ++L) {
+            // 가운데 선은 두 차로가 들어가는 폭에서만 긋는다. 5.5 m 미만은
+            // 한 차로짜리 골목이라 가운데를 그으면 없는 규칙을 만드는 것이다.
+            if (L == 2 && w < 5.5f) continue;
+            const Eigen::Vector2f q = path[i] + n * (off[L] / kRoadCell);
+            uv[static_cast<std::size_t>(L)].push_back(q);
+            const Eigen::Vector3f p3 = ra * (q.x() * kRoadCell)
+                                     + rb * (q.y() * kRoadCell)
+                                     + up * hh[i];
+            lines[static_cast<std::size_t>(L)].pts.push_back(W(p3));
+        }
+    }
+
+    // **관측한 밝기로 채점한다.** 예측이 옳다면 그 자리가 주위보다 밝아야
+    // 한다 - 칠이 남아 있는 구간에서는 그렇고, 없는 구간에서는 아니다.
+    // 숫자가 1 에 가까우면 예측이 아무 것도 못 맞힌 것이다.
+    {
+        double on = 0.0, off_ = 0.0;
+        int non = 0, noff = 0;
+        for (const auto& L : uv) {
+            for (const auto& q : L) {
+                if (const Cell* c = at(q.x(), q.y())) { on += c->inten; ++non; }
+            }
+        }
+        for (const auto& [k, c] : carriage) { off_ += c.inten; ++noff; }
+        if (non > 20 && noff > 20 && off_ > 0.0) {
+            *out_score = (on / non) / (off_ / noff);
+        }
+        if (out_pts) *out_pts = non;
+    }
+
+    for (auto& b : lines) {
+        if (b.pts.size() < 3) continue;
+        LaneLine l;
+        l.pts = std::move(b.pts);
+        l.kind = b.kind;
+        l.width = b.w;
+        out.push_back(std::move(l));
+    }
+    return out;
+}
+
 inline bool exportSceneJson(const fs::path& path,
                             const std::unordered_map<std::int64_t, HouseBin>& houses,
                             const std::unordered_map<std::int64_t, Column>& cols,
@@ -4301,7 +4483,8 @@ inline bool exportSceneJson(const fs::path& path,
                             const Eigen::Vector3f& road_a, const Eigen::Vector3f& road_b,
                             const Eigen::Vector3d& up_d, float cell,
                             const Eigen::Vector3d& ego, int frame,
-                            const std::string& seq) {
+                            const std::string& seq,
+                            const std::vector<Eigen::Vector3d>& traj) {
     const GroundGrid g(up_d.cast<float>(), cell);
     const Eigen::Vector3f up = g.up;
     const auto W = [&](const Eigen::Vector3f& p) {
@@ -4528,13 +4711,42 @@ inline bool exportSceneJson(const fs::path& path,
               << ", \"origin\": [" << o.x() << ", " << o.y() << ", " << o.z()
               << "], \"axis_u\": [" << au.x() << ", " << au.y() << ", " << au.z()
               << "], \"axis_v\": [" << av.x() << ", " << av.y() << ", " << av.z()
-              << "]}\n}\n";
+              << "]},\n";
             std::cout << "  노면 밝기: " << png.filename().string() << " "
                       << W_px << "x" << H_px << " px (" << kRoadCell
                       << " m/px)" << std::endl;
         } else {
-            f << "  \"road_map\": null\n}\n";
+            f << "  \"road_map\": null,\n";
         }
+    }
+
+    // --- 차선 ---
+    {
+        double score = std::nan("");
+        int npts = 0;
+        const auto lanes = predictLanes(road, road_a, road_b, up, traj, W,
+                                        &score, &npts);
+        f << "  \"lanes\": [";
+        bool lfirst = true;
+        for (const auto& L : lanes) {
+            if (!lfirst) f << ",";
+            lfirst = false;
+            f << "\n    {\"kind\": \"" << L.kind << "\", \"source\": \"predicted\""
+              << ", \"width\": " << L.width << ", \"points\": [";
+            for (std::size_t i = 0; i < L.pts.size(); ++i) {
+                if (i) f << ", ";
+                f << "[" << L.pts[i].x() << ", " << L.pts[i].y() << ", "
+                  << L.pts[i].z() << "]";
+            }
+            f << "]}";
+        }
+        f << "\n  ]\n}\n";
+        std::cout << "  차선(예측): " << lanes.size() << " 개, 점 " << npts;
+        if (!std::isnan(score)) {
+            std::cout << ", 선 위 밝기 / 노면 평균 = " << std::fixed
+                      << std::setprecision(2) << score;
+        }
+        std::cout << std::endl;
     }
     return static_cast<bool>(f);
 }
@@ -6882,10 +7094,24 @@ int main(int argc, char** argv) {
             // 비우므로 내보낼 세계가 없다.
             if (!scene_json.empty()) {
                 const float ccell3 = (s.dataset == "kitti") ? 1.0f : 0.5f;
+                // 자차가 지나온 자리는 차로 중심의 가장 좋은 증거다.
+                // 이번 프레임까지만 넘긴다 - 아직 가 보지 않은 길에 선을
+                // 그으면 그것은 예측이 아니라 창작이다.
+                std::vector<Eigen::Vector3d> ego_traj;
+                {
+                    const Run& r1 = s.runs.at(
+                        s.systems[static_cast<std::size_t>(pick[1])]);
+                    const double st = s.rgb.empty() ? 0.0
+                        : s.rgb[static_cast<std::size_t>(frame)].first;
+                    for (std::size_t j = 0; j < r1.aligned.size(); ++j) {
+                        if (j < r1.traj.size() && r1.traj[j].t > st + 1e-6) break;
+                        ego_traj.push_back(r1.aligned[j].translation());
+                    }
+                }
                 if (exportSceneJson(scene_json, houses[1], stuff[1], mem[1],
                                     road[1], road_a, road_b,
                                     orb.world_up, ccell3, ego_pos,
-                                    frame + 1, s.name)) {
+                                    frame + 1, s.name, ego_traj)) {
                     std::cout << "장면 서술: " << scene_json << std::endl;
                 } else {
                     std::cerr << "장면 서술 저장 실패: " << scene_json << std::endl;
