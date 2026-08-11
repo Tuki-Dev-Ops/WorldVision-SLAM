@@ -2560,6 +2560,41 @@ public:
                   cv::Scalar(base[0] * a, base[1] * a, base[2] * a));
     }
 
+    // **울타리.** 얇은 판 하나로는 담벼락이지 울타리가 아니다.
+    //
+    // 담장을 집과 같은 상자로 그리면 낮은 건물로 읽힌다. 눈이 울타리를
+    // 알아보는 단서는 **일정 간격으로 선 기둥** 이고, 그 리듬이 있으면
+    // 얇아도 울타리로 보인다.
+    //
+    // 기둥 간격은 2 m 로 고정한다. 관측에서 뽑을 수 있는 값이 아니고 -
+    // 0.3 m 복셀로는 기둥 하나가 한두 칸이라 간격을 셀 수가 없다 - 여기서
+    // 그리는 것은 "이 자리에 울타리가 있다" 는 사실의 표현이지 기둥의
+    // 위치가 아니다. 그래서 판은 관측된 높이를 지키고, 기둥은 그보다
+    // 조금만 솟게 둔다.
+    void fenceRun(const Eigen::Vector3d& c, const Eigen::Vector3d& half_len,
+                  const Eigen::Vector3d& up_h, const Eigen::Vector3d& half_w,
+                  const Orbit& orb, double f, const cv::Scalar& col) {
+        const double len = half_len.norm() * 2.0;
+        if (len < 1e-3) return;
+        const Eigen::Vector3d dir = half_len.normalized();
+        const Eigen::Vector3d nrm = half_w.normalized();
+
+        // 판: 관측 두께와 무관하게 얇게. 담장은 원래 얇다.
+        const double panel_t = std::min(0.09, half_w.norm());
+        solidBox(c, half_len, up_h * 0.86, nrm * panel_t, orb, f, col, 0.88);
+
+        // 기둥: 2 m 간격, 판보다 두껍고 조금 높다.
+        const int posts = std::clamp(static_cast<int>(len / 2.0) + 1, 2, 12);
+        const double post_t = std::min(0.16, half_w.norm());
+        for (int i = 0; i < posts; ++i) {
+            const double t = (posts == 1) ? 0.0
+                           : (static_cast<double>(i) / (posts - 1) * 2.0 - 1.0);
+            solidBox(c + dir * (t * half_len.norm()) + up_h * 0.07,
+                     dir * post_t, up_h * 1.07, nrm * post_t,
+                     orb, f, col, 1.0);
+        }
+    }
+
     // **박공지붕.** 집을 집으로 읽게 하는 것은 결국 지붕이다.
     //
     // 꼭대기가 평평한 상자는 아무리 제자리에 잘 세워도 담벼락으로 읽힌다 -
@@ -3043,12 +3078,19 @@ public:
                 const Eigen::Vector3f mid = foot2 + up * (wg + hb * 0.5f);
                 if (r2f > 0.0f && (mid - egof).squaredNorm() > r2f) return;
 
+                if (cls == Stuff::Fence) {
+                    fenceRun(mid.cast<double>(),
+                             (dir * (L * 0.5f)).cast<double>(),
+                             (up * (hb * 0.5f)).cast<double>(),
+                             (nrm * (W * 0.5f)).cast<double>(),
+                             orb, f, stuffColor(cls));
+                    return;
+                }
                 solidBox(mid.cast<double>(),
                          (dir * (L * 0.5f)).cast<double>(),
                          (up * (hb * 0.5f)).cast<double>(),
                          (nrm * (W * 0.5f)).cast<double>(),
-                         orb, f, stuffColor(cls),
-                         (cls == Stuff::Fence) ? 0.92 : 1.0);
+                         orb, f, stuffColor(cls), 1.0);
                 if (!roofed) return;
 
                 const Eigen::Matrix3d& Mv = orb.basis();
