@@ -2815,9 +2815,13 @@ public:
         // 것이 사이로 보이고, 카메라가 돌면 앞뒤 선이 서로 지나가면서
         // 깊이가 살아난다 - 채워진 실루엣에는 없는 단서다.
         //
-        // 격자는 한 번만 쪼갠 구(32 면)를 쓴다. 128 면을 선으로 그리면
-        // 선이 너무 촘촘해 결국 덩어리로 다시 뭉친다.
-        for (const auto& tr : unitSphere(1)) {
+        // 격자의 촘촘함은 **화면에서 얼마나 큰가** 로 정한다. 멀리 있는
+        // 수관에 128 면을 그으면 선이 겹쳐 다시 덩어리가 되고, 눈앞의 수관에
+        // 32 면만 그으면 각진 철망으로 보인다. 화면에서 120 px 을 기준으로
+        // 가른다 - 그쯤부터 32 면의 각이 눈에 띈다.
+        const double cspan = f * canopy_r
+                           / std::max(1e-3, (M * (cen.cast<double>() - eye)).z());
+        for (const auto& tr : unitSphere(cspan > 120.0 ? 2 : 1)) {
             Eigen::Vector3f n = (tr[0] + tr[1] + tr[2]) / 3.0f;
             if (n.norm() < 1e-6f) continue;
             n.normalize();
