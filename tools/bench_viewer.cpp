@@ -1094,7 +1094,23 @@ inline void labelScene(const std::unordered_map<std::int64_t, Splat>& cells,
     //
     // 이웃은 기둥이 아니라 **공** 이어야 한다. 복셀 ±2 칸이면 KITTI 에서 약
     // 3 m 로, 벽면 한 조각과 수관 한 덩이를 가르기에 맞는 크기다.
+    //
+    // **화소가 이미 답한 칸은 이 계산을 하지 않는다.** 구조 텐서는 칸마다
+    // 복셀 125 회 조회에 3x3 고유값 분해까지 도는데(실측 26 ms), 그 답을
+    // 쓰지 않을 것이면 전부 버려지는 계산이다. 분할 라벨이 충분히 모인 칸은
+    // 기하를 물을 이유가 없고, 그런 칸이 지금은 대다수다.
     for (auto& [k, c] : fresh) {
+        {
+            int best = -1, bn = 0, tot = 0;
+            for (int ci = 1; ci < kStuffN; ++ci) {
+                tot += c.seg_votes[ci];
+                if (c.seg_votes[ci] > bn) { bn = c.seg_votes[ci]; best = ci; }
+            }
+            if (best > 0 && bn >= 3 && bn * 2 > tot) {
+                c.cls = static_cast<Stuff>(best);
+                continue;
+            }
+        }
         int n = 0;
         Eigen::Vector3d sum = Eigen::Vector3d::Zero();
         Eigen::Matrix3d sq = Eigen::Matrix3d::Zero();
@@ -1151,22 +1167,8 @@ inline void labelScene(const std::unordered_map<std::int64_t, Splat>& cells,
             }
             c.crowd = static_cast<std::uint8_t>(occ);
         }
-        // **화소가 말한 것이 있으면 그것을 쓴다.**
-        //
-        // 구조 텐서는 형상만 보므로 갈리지 않는 쌍이 있고, 그 한계는
-        // classifyColumn 안에 수치로 적어 두었다. 분할 라벨은 외형에서 오므로
-        // 그 쌍을 가른다. 표가 충분할 때만 쓴다 - 한두 표는 경계 화소일 수
-        // 있고, 그럴 때는 기하 판정이 여전히 낫다.
-        int best = -1, bn = 0, tot = 0;
-        for (int ci = 1; ci < kStuffN; ++ci) {
-            tot += c.seg_votes[ci];
-            if (c.seg_votes[ci] > bn) { bn = c.seg_votes[ci]; best = ci; }
-        }
-        if (best > 0 && bn >= 3 && bn * 2 > tot) {
-            c.cls = static_cast<Stuff>(best);
-        } else {
-            c.cls = classifyColumn(c);
-        }
+        // 여기까지 온 칸은 화소가 답하지 못한 칸이다. 기하로 판정한다.
+        c.cls = classifyColumn(c);
     }
 
     // **공간 일관성.** 칸마다 따로 판정하면 건물 벽면 한 장이 법선 잡음
