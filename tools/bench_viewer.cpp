@@ -1651,6 +1651,167 @@ struct HouseBin {
     int n{0};          // 마지막으로 맞출 때 이 칸에 있던 기둥 수
 };
 
+// ---------------------------------------------------------------------------
+// 인식한 장면을 glTF 로 내보내기
+// ---------------------------------------------------------------------------
+// 뷰어가 화면에 그리는 것은 이미 **장면 서술** 이다. 집은 중심·방향·길이·
+// 폭·높이·지붕 경사이고, 나무는 자리·높이·수관 반지름이며, 차량은 변환과
+// 크기와 클래스다. 그것을 삼각형으로 펴서 파일로 내보내면 Unity 나 Unreal
+// 이 그대로 읽어 재질과 조명을 입힐 수 있다.
+//
+// **왜 glTF(GLB) 인가.** 두 엔진이 별도 임포터 없이 읽는 유일한 공통 포맷
+// 이다. 그리고 규격이 JSON 한 덩이 + 바이너리 한 덩이라 라이브러리 없이
+// 쓸 수 있다 - 이 파일의 의존성은 OpenCV 와 Eigen 뿐이라는 전제를 포맷
+// 하나 때문에 깨지 않아도 된다.
+//
+// **좌표계를 바꿔서 내보낸다.** glTF 는 +y 가 위이고 오른손계다. 이 지도의
+// "위" 는 데이터셋마다 다르고 KITTI 는 카메라계라 +y 가 아래다. 내보낼 때
+// 맞추지 않으면 엔진에서 장면이 옆으로 눕거나 뒤집힌다.
+struct GlbMesh {
+    std::vector<float>         pos;    // xyz
+    std::vector<float>         nrm;    // xyz
+    std::vector<std::uint32_t> idx;
+    float rgba[4]{0.8f, 0.8f, 0.8f, 1.0f};
+    std::string name;
+
+    void tri(const Eigen::Vector3f& a, const Eigen::Vector3f& b,
+             const Eigen::Vector3f& c) {
+        Eigen::Vector3f n = (b - a).cross(c - a);
+        if (n.norm() < 1e-12f) return;
+        n.normalize();
+        const std::uint32_t base = static_cast<std::uint32_t>(pos.size() / 3);
+        for (const Eigen::Vector3f& v : {a, b, c}) {
+            pos.push_back(v.x()); pos.push_back(v.y()); pos.push_back(v.z());
+            nrm.push_back(n.x()); nrm.push_back(n.y()); nrm.push_back(n.z());
+        }
+        idx.push_back(base); idx.push_back(base + 1); idx.push_back(base + 2);
+    }
+    void quad(const Eigen::Vector3f& a, const Eigen::Vector3f& b,
+              const Eigen::Vector3f& c, const Eigen::Vector3f& d) {
+        tri(a, b, c);
+        tri(a, c, d);
+    }
+    // 방향이 있는 상자. 여섯 면을 다 넣는다 - 엔진에서는 어느 쪽에서 볼지
+    // 모르므로 카메라 쪽 세 면만 그리던 화면용 규칙을 쓸 수 없다.
+    void box(const Eigen::Vector3f& c, const Eigen::Vector3f& ex,
+             const Eigen::Vector3f& ey, const Eigen::Vector3f& ez) {
+        const Eigen::Vector3f p[8] = {
+            c - ex - ey - ez, c + ex - ey - ez, c + ex + ey - ez, c - ex + ey - ez,
+            c - ex - ey + ez, c + ex - ey + ez, c + ex + ey + ez, c - ex + ey + ez};
+        quad(p[0], p[3], p[2], p[1]);   // -z
+        quad(p[4], p[5], p[6], p[7]);   // +z
+        quad(p[0], p[1], p[5], p[4]);   // -y
+        quad(p[3], p[7], p[6], p[2]);   // +y
+        quad(p[0], p[4], p[7], p[3]);   // -x
+        quad(p[1], p[2], p[6], p[5]);   // +x
+    }
+    bool empty() const { return idx.empty(); }
+};
+
+// 4 바이트 경계로 채운다. GLB 는 두 청크가 다 4 의 배수여야 한다.
+inline void glbPad(std::string& s, char fill) {
+    while (s.size() % 4 != 0) s.push_back(fill);
+}
+
+inline bool writeGlb(const fs::path& path, const std::vector<GlbMesh>& meshes) {
+    std::string bin;
+    std::ostringstream acc, bv, mesh_js, mat_js, node_js;
+    int n_acc = 0, n_bv = 0, n_mesh = 0;
+
+    const auto align = [&bin]() { while (bin.size() % 4 != 0) bin.push_back('\0'); };
+    const auto appendf = [&](const std::vector<float>& v) {
+        align();
+        const std::size_t off = bin.size();
+        bin.append(reinterpret_cast<const char*>(v.data()), v.size() * 4);
+        return off;
+    };
+    const auto appendi = [&](const std::vector<std::uint32_t>& v) {
+        align();
+        const std::size_t off = bin.size();
+        bin.append(reinterpret_cast<const char*>(v.data()), v.size() * 4);
+        return off;
+    };
+
+    for (const GlbMesh& m : meshes) {
+        if (m.empty()) continue;
+        // 최소/최대는 POSITION 접근자에 **필수** 다. 빠뜨리면 엄격한
+        // 임포터가 파일을 거부한다.
+        float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f};
+        for (std::size_t i = 0; i + 2 < m.pos.size(); i += 3) {
+            for (int a = 0; a < 3; ++a) {
+                lo[a] = std::min(lo[a], m.pos[i + a]);
+                hi[a] = std::max(hi[a], m.pos[i + a]);
+            }
+        }
+        const std::size_t po = appendf(m.pos);
+        const std::size_t no = appendf(m.nrm);
+        const std::size_t io = appendi(m.idx);
+        const int bv_p = n_bv++, bv_n = n_bv++, bv_i = n_bv++;
+        const int ac_p = n_acc++, ac_n = n_acc++, ac_i = n_acc++;
+
+        if (bv_p) bv << ',';
+        bv << "{\"buffer\":0,\"byteOffset\":" << po
+           << ",\"byteLength\":" << m.pos.size() * 4 << ",\"target\":34962},"
+           << "{\"buffer\":0,\"byteOffset\":" << no
+           << ",\"byteLength\":" << m.nrm.size() * 4 << ",\"target\":34962},"
+           << "{\"buffer\":0,\"byteOffset\":" << io
+           << ",\"byteLength\":" << m.idx.size() * 4 << ",\"target\":34963}";
+
+        if (ac_p) acc << ',';
+        acc << "{\"bufferView\":" << bv_p << ",\"componentType\":5126,\"count\":"
+            << m.pos.size() / 3 << ",\"type\":\"VEC3\",\"min\":["
+            << lo[0] << ',' << lo[1] << ',' << lo[2] << "],\"max\":["
+            << hi[0] << ',' << hi[1] << ',' << hi[2] << "]},"
+            << "{\"bufferView\":" << bv_n << ",\"componentType\":5126,\"count\":"
+            << m.nrm.size() / 3 << ",\"type\":\"VEC3\"},"
+            << "{\"bufferView\":" << bv_i << ",\"componentType\":5125,\"count\":"
+            << m.idx.size() << ",\"type\":\"SCALAR\"}";
+
+        if (n_mesh) { mesh_js << ','; mat_js << ','; node_js << ','; }
+        mesh_js << "{\"name\":\"" << m.name << "\",\"primitives\":[{\"attributes\":{"
+                << "\"POSITION\":" << ac_p << ",\"NORMAL\":" << ac_n
+                << "},\"indices\":" << ac_i << ",\"material\":" << n_mesh << "}]}";
+        mat_js << "{\"name\":\"" << m.name << "\",\"pbrMetallicRoughness\":{"
+               << "\"baseColorFactor\":[" << m.rgba[0] << ',' << m.rgba[1] << ','
+               << m.rgba[2] << ',' << m.rgba[3]
+               << "],\"metallicFactor\":0,\"roughnessFactor\":0.9}}";
+        node_js << "{\"mesh\":" << n_mesh << ",\"name\":\"" << m.name << "\"}";
+        ++n_mesh;
+    }
+    if (n_mesh == 0) return false;
+
+    std::ostringstream js;
+    js << "{\"asset\":{\"version\":\"2.0\",\"generator\":\"WorldVision-SLAM\"},"
+       << "\"scene\":0,\"scenes\":[{\"nodes\":[";
+    for (int i = 0; i < n_mesh; ++i) { if (i) js << ','; js << i; }
+    js << "]}],\"nodes\":[" << node_js.str() << "],"
+       << "\"meshes\":[" << mesh_js.str() << "],"
+       << "\"materials\":[" << mat_js.str() << "],"
+       << "\"accessors\":[" << acc.str() << "],"
+       << "\"bufferViews\":[" << bv.str() << "],"
+       << "\"buffers\":[{\"byteLength\":" << bin.size() << "}]}";
+
+    std::string json = js.str();
+    glbPad(json, ' ');
+    glbPad(bin, '\0');
+
+    std::ofstream f(path, std::ios::binary);
+    if (!f) return false;
+    const auto u32 = [&f](std::uint32_t v) {
+        f.write(reinterpret_cast<const char*>(&v), 4);
+    };
+    u32(0x46546C67u);                                   // "glTF"
+    u32(2u);
+    u32(static_cast<std::uint32_t>(12 + 8 + json.size() + 8 + bin.size()));
+    u32(static_cast<std::uint32_t>(json.size()));
+    u32(0x4E4F534Au);                                   // "JSON"
+    f.write(json.data(), static_cast<std::streamsize>(json.size()));
+    u32(static_cast<std::uint32_t>(bin.size()));
+    u32(0x004E4942u);                                   // "BIN\0"
+    f.write(bin.data(), static_cast<std::streamsize>(bin.size()));
+    return static_cast<bool>(f);
+}
+
 // 월드에 고정되는 물체 기억. 지나온 곳에서 본 물체가 그 자리에 남는다.
 //
 // **관측마다 위치를 덮어쓰면 안 된다.** 그러면 카메라가 움직일 때마다 물체가
@@ -3871,6 +4032,178 @@ void spark(cv::Mat& c, cv::Rect r, const std::vector<double>& v, int upto,
     cv::circle(c, pts.back(), 2, col, -1, cv::LINE_AA);
 }
 
+// 인식한 장면을 삼각형으로 펴서 GLB 로 쓴다.
+//
+// 화면용 코드와 나누어 둔다. 화면은 시점이 있으므로 카메라 쪽 세 면만
+// 그리고 먼 것은 생략해도 되지만, 엔진으로 넘길 형상은 어느 쪽에서 볼지
+// 모르므로 닫힌 몸통이어야 한다.
+inline bool exportScene(const fs::path& path,
+                        const std::unordered_map<std::int64_t, HouseBin>& houses,
+                        const std::unordered_map<std::int64_t, Column>& cols,
+                        const std::unordered_map<std::int64_t, RoadCell>& road,
+                        const std::vector<MemoryObject>& objs,
+                        const TriMesh& car,
+                        const Eigen::Vector3d& up_d, float cell,
+                        const Eigen::Vector3f& road_a, const Eigen::Vector3f& road_b,
+                        int frame) {
+    const GroundGrid g(up_d.cast<float>(), cell);
+    const Eigen::Vector3f up = g.up;
+
+    // glTF 는 +y 가 위다. 이 지도의 위는 up 이므로 (a, up, b) 를 (x, y, z) 로
+    // 옮긴다. 엔진에서 장면이 눕지 않으려면 여기서 맞춰야 한다.
+    const auto W = [&](const Eigen::Vector3f& p) {
+        return Eigen::Vector3f(p.dot(g.a), p.dot(up), p.dot(g.b));
+    };
+
+    GlbMesh m_house, m_roof, m_tree, m_trunk, m_pole, m_road, m_car;
+    m_house.name = "building";  m_house.rgba[0] = 0.72f; m_house.rgba[1] = 0.70f; m_house.rgba[2] = 0.66f;
+    m_roof.name  = "roof";      m_roof.rgba[0]  = 0.45f; m_roof.rgba[1]  = 0.28f; m_roof.rgba[2]  = 0.24f;
+    m_tree.name  = "foliage";   m_tree.rgba[0]  = 0.24f; m_tree.rgba[1]  = 0.52f; m_tree.rgba[2]  = 0.22f;
+    m_trunk.name = "trunk";     m_trunk.rgba[0] = 0.30f; m_trunk.rgba[1] = 0.22f; m_trunk.rgba[2] = 0.15f;
+    m_pole.name  = "pole";      m_pole.rgba[0]  = 0.45f; m_pole.rgba[1]  = 0.45f; m_pole.rgba[2]  = 0.48f;
+    m_road.name  = "road";      m_road.rgba[0]  = 0.22f; m_road.rgba[1]  = 0.22f; m_road.rgba[2]  = 0.23f;
+    m_car.name   = "vehicle";   m_car.rgba[0]   = 0.20f; m_car.rgba[1]   = 0.55f; m_car.rgba[2]   = 0.52f;
+
+    // --- 집: 몸통 + 박공지붕 ---
+    for (const auto& [k, hb] : houses) {
+        for (const HouseFit& h : hb.fits) {
+            const Eigen::Vector3f ex = h.dir * (h.L * 0.5f);
+            const Eigen::Vector3f ey = up * (h.hb * 0.5f);
+            const Eigen::Vector3f ez = h.nrm * (h.W * 0.5f);
+            m_house.box(W(h.mid), W(ex) - W(Eigen::Vector3f::Zero()),
+                        W(ey) - W(Eigen::Vector3f::Zero()),
+                        W(ez) - W(Eigen::Vector3f::Zero()));
+            if (h.rise <= 0.0f) continue;
+            const Eigen::Vector3f e = h.mid + up * (h.hb * 0.5f);
+            const Eigen::Vector3f e00 = W(e - ex - ez), e01 = W(e - ex + ez);
+            const Eigen::Vector3f e10 = W(e + ex - ez), e11 = W(e + ex + ez);
+            const Eigen::Vector3f r0 = W(e - ex + up * h.rise);
+            const Eigen::Vector3f r1 = W(e + ex + up * h.rise);
+            m_roof.quad(e00, e10, r1, r0);
+            m_roof.quad(e11, e01, r0, r1);
+            m_roof.tri(e00, r0, e01);
+            m_roof.tri(e11, r1, e10);
+        }
+    }
+
+    // --- 나무와 기둥 ---
+    for (const auto& [k, c] : cols) {
+        if (c.top_eff < 0) continue;
+        const float h = static_cast<float>(c.top_eff + 1) * kBinH;
+        const Eigen::Vector3f foot = c.rep + up * (c.ground - c.rep.dot(up));
+        if (c.cls == Stuff::Vegetation) {
+            // 화면과 같은 7x7 대표 규칙. 칸마다 한 그루를 내보내면 엔진에서
+            // 나무 수천 그루가 서로 파고든다.
+            bool seed = true;
+            int nveg = 0;
+            for (int di = -3; di <= 3 && seed; ++di) {
+                for (int dj = -3; dj <= 3; ++dj) {
+                    if (!di && !dj) continue;
+                    const auto it = cols.find(GroundGrid::key(c.i + di, c.j + dj));
+                    if (it == cols.end() || it->second.cls != Stuff::Vegetation) continue;
+                    ++nveg;
+                    if (it->second.top_eff > c.top_eff
+                        || (it->second.top_eff == c.top_eff && it->first > k)) {
+                        seed = false;
+                        break;
+                    }
+                }
+            }
+            if (!seed || h < 1.5f) continue;
+            const float spread = cell * (0.60f + 0.045f * static_cast<float>(nveg));
+            const float rad = std::clamp(std::min(spread, h * 0.40f), 0.35f, 2.5f);
+            const float ry = std::clamp(h * 0.35f, 0.30f, 2.8f);
+            const float rr = std::max(rad, ry * 0.70f);
+            const float cz = std::min(h * 0.58f, h - ry * 0.6f);
+            const Eigen::Vector3f cen = foot + up * cz;
+            // 수관은 채운 구로 내보낸다. 엔진에는 재질과 조명이 있으므로
+            // 화면에서 쓰던 격자 표현이 필요 없다.
+            Eigen::Vector3f a2 = up.cross(Eigen::Vector3f::UnitZ());
+            if (a2.norm() < 1e-6f) a2 = up.cross(Eigen::Vector3f::UnitX());
+            a2.normalize();
+            const Eigen::Vector3f b2 = up.cross(a2).normalized();
+            for (const auto& tr : CloudView::unitSphere(2)) {
+                const auto P = [&](const Eigen::Vector3f& n) {
+                    return W(cen + a2 * (n.x() * rr) + up * (n.y() * ry)
+                                 + b2 * (n.z() * rr));
+                };
+                m_tree.tri(P(tr[0]), P(tr[1]), P(tr[2]));
+            }
+            const float tw = std::max(0.05f, rr * 0.14f);
+            const float th = std::max(0.2f, cz - ry * 0.55f);
+            m_trunk.box(W(foot + up * (th * 0.5f)),
+                        W(a2 * tw) - W(Eigen::Vector3f::Zero()),
+                        W(up * (th * 0.5f)) - W(Eigen::Vector3f::Zero()),
+                        W(b2 * tw) - W(Eigen::Vector3f::Zero()));
+        } else if (c.cls == Stuff::Pole && h >= 1.5f) {
+            const float pw = std::max(0.07f, cell * 0.10f);
+            m_pole.box(W(foot + up * (h * 0.5f)),
+                       W(g.a * pw) - W(Eigen::Vector3f::Zero()),
+                       W(up * (h * 0.5f)) - W(Eigen::Vector3f::Zero()),
+                       W(g.b * pw) - W(Eigen::Vector3f::Zero()));
+        }
+    }
+
+    // --- 노면: 관측된 칸을 납작한 사각형으로 ---
+    for (const auto& [key, rc] : road) {
+        if (rc.hits == 0) continue;
+        std::int64_t qi = (key >> 26) & 0x3FFFFFF, qj = key & 0x3FFFFFF;
+        if (qi & 0x2000000) qi -= 0x4000000;
+        if (qj & 0x2000000) qj -= 0x4000000;
+        const float ca = (static_cast<float>(qi) + 0.5f) * kRoadCell;
+        const float cb = (static_cast<float>(qj) + 0.5f) * kRoadCell;
+        const Eigen::Vector3f c3 = road_a * ca + road_b * cb + up * rc.h;
+        const float hh = kRoadCell * 0.5f;
+        m_road.quad(W(c3 - road_a * hh - road_b * hh),
+                    W(c3 + road_a * hh - road_b * hh),
+                    W(c3 + road_a * hh + road_b * hh),
+                    W(c3 - road_a * hh + road_b * hh));
+    }
+
+    // --- 차량: 검출된 자리마다 모형을 놓는다 ---
+    if (car.valid()) {
+        for (const MemoryObject& o : objs) {
+            const bool veh = (o.cls == "car" || o.cls == "truck" || o.cls == "bus" ||
+                              o.cls == "motorcycle" || o.cls == "bicycle");
+            if (!veh || o.count < 2) continue;
+            const Eigen::Vector3d cw = o.center(), sz = o.size();
+            Eigen::Vector3d fw = o.cur_c - o.first_c;
+            if (fw.norm() < 0.3) fw = Eigen::Vector3d::UnitX();
+            const Eigen::Vector3d u = up_d.normalized();
+            fw = (fw - u * fw.dot(u)).normalized();
+            const Eigen::Vector3d rt = u.cross(fw).normalized();
+            const double L = std::max(0.6, sz.maxCoeff());
+            const double Wd = std::max(0.4, std::min(sz.x(), sz.z()));
+            const double H = std::max(0.4, sz.y());
+            const double sl = (L * 0.5) / car.half[car.ax_len];
+            const double sw = (Wd * 0.5) / car.half[car.ax_wid];
+            const double sh = (H * 0.5) / car.half[car.ax_up];
+            const Eigen::Vector3d base = cw - u * (H * 0.5);
+            const auto TP = [&](const Eigen::Vector3f& p) {
+                const Eigen::Vector3f q = p - car.mid;
+                const Eigen::Vector3d w = base
+                    + fw * (q[car.ax_len] * sl) + rt * (q[car.ax_wid] * sw)
+                    + u  * ((q[car.ax_up] + car.half[car.ax_up]) * sh);
+                return W(w.cast<float>());
+            };
+            for (const auto& t : car.tri) {
+                m_car.tri(TP(car.vert[static_cast<std::size_t>(t[0])]),
+                          TP(car.vert[static_cast<std::size_t>(t[1])]),
+                          TP(car.vert[static_cast<std::size_t>(t[2])]));
+            }
+        }
+    }
+
+    const std::vector<GlbMesh> all = {m_road, m_house, m_roof, m_trunk,
+                                      m_tree, m_pole, m_car};
+    if (!writeGlb(path, all)) return false;
+    std::size_t tris = 0;
+    for (const GlbMesh& m : all) tris += m.idx.size() / 3;
+    std::cout << "장면 내보내기: " << path.string() << "  프레임 " << frame
+              << ", 삼각형 " << tris << std::endl;
+    return true;
+}
+
 // ===========================================================================
 // 매니페스트
 // ===========================================================================
@@ -4070,6 +4403,8 @@ int main(int argc, char** argv) {
     int start_cam = 0;      // 0 1인칭 / 1 3인칭 / 2 지도 / 3 항공
     // 자동차 3D 모형(OBJ). 없으면 상자 모형으로 그린다.
     std::string car_obj;
+    // 인식한 장면을 glTF 로 내보낼 경로. 스크린샷과 같은 프레임에서 쓴다.
+    std::string scene_glb;
 
     for (int i = 1; i + 1 < argc; i += 2) {
         const std::string k = argv[i];
@@ -4083,6 +4418,7 @@ int main(int argc, char** argv) {
         else if (k == "--all") drive_only = false;
         else if (k == "--cam") start_cam = std::atoi(argv[i + 1]);
         else if (k == "--car-model") car_obj = argv[i + 1];
+        else if (k == "--export-scene") scene_glb = argv[i + 1];
     }
 
     const fs::path scene_dir = fs::path(manifest).parent_path();
@@ -5869,6 +6205,17 @@ int main(int argc, char** argv) {
             }
             std::cout << "저장: " << shot_path << "  (" << s.name << ", frame "
                       << (frame + 1) << "/" << nframes << ")\n";
+            // 화면에 그린 그 장면을 그대로 엔진용 형상으로도 내보낸다.
+            // 오른쪽 패널만 내보낸다 - 왼쪽은 설계상 매 프레임 지도를
+            // 비우므로 내보낼 세계가 없다.
+            if (!scene_glb.empty()) {
+                const float ccell2 = (s.dataset == "kitti") ? 1.0f : 0.5f;
+                if (!exportScene(scene_glb, houses[1], stuff[1], road[1], mem[1],
+                                 car_mesh, orb.world_up, ccell2,
+                                 road_a, road_b, frame + 1)) {
+                    std::cerr << "장면 내보내기 실패: " << scene_glb << "\n";
+                }
+            }
             return 0;
         }
 
