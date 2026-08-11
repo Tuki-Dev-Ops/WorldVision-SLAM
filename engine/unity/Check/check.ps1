@@ -14,6 +14,7 @@ $ErrorActionPreference = "Stop"
 try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch { }
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $importer = Join-Path $here "..\Editor\WorldVisionSceneImporter.cs"
+$player = Join-Path $here "..\Runtime\WorldVisionPlayer.cs"
 $stubs = Join-Path $here "UnityStubs.cs"
 
 # Roslyn 은 Visual Studio 나 Build Tools 와 함께 온다. 없으면 .NET Framework
@@ -29,8 +30,8 @@ if (-not $csc) {
 }
 
 $out = Join-Path $env:TEMP "wv_unity_check.dll"
-& $csc /nologo /target:library /warn:4 /out:$out $stubs $importer
+& $csc /nologo /target:library /warn:4 /out:$out $stubs $importer $player
 if ($LASTEXITCODE -ne 0) {
     Write-Error "임포터가 컴파일되지 않는다."
 }
-Write-Output "임포터 컴파일 통과: $importer"
+Write-Output "컴파일 통과: 임포터 + 플레이어"

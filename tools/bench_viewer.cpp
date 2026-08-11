@@ -1497,7 +1497,36 @@ struct RoadCell {
     float        range{0.0f};    // 관측 거리. 가까이서 본 것이 이긴다
     std::uint8_t intensity{0};   // 관측된 밝기 - 흰 페인트가 여기 남는다
     std::uint8_t hits{0};
+    // **이 칸이 도로인지 인도인지 잔디인지.**
+    //
+    // 높이로는 절대 갈리지 않는다. 인도는 도로보다 12 cm 높을 뿐이고 관측
+    // 잡음이 그보다 크다. 갈라 주는 것은 화소의 의미뿐이다 - Cityscapes 는
+    // road 와 sidewalk 와 terrain 을 따로 내므로 그 표를 여기에 쌓는다.
+    //
+    // 밝기와 달리 라벨은 **가까운 관측이 이기게 두면 안 된다.** 한 프레임의
+    // 오분류가 그 칸을 통째로 뒤집는다. 다수결이라야 한 표에 흔들리지 않는다.
+    std::uint8_t seg{255};
+    std::uint8_t seg_n{0};
+    void voteSeg(std::uint8_t s2) {
+        if (s2 > 18) return;
+        if (seg > 18 || seg_n == 0) { seg = s2; seg_n = 1; }
+        else if (seg == s2) { if (seg_n < 255) ++seg_n; }
+        else --seg_n;
+    }
 };
+
+// 노면 격자 칸이 어떤 표면인가. 내보내는 값이다.
+enum class Surface : std::uint8_t { Road = 0, Sidewalk = 1, Grass = 2, Other = 3 };
+
+inline Surface surfaceFromCityscapes(int c) {
+    switch (c) {
+        case 0:  return Surface::Road;       // road
+        case 1:  return Surface::Sidewalk;   // sidewalk
+        case 9:  return Surface::Grass;      // terrain (잔디·흙)
+        case 8:  return Surface::Grass;      // vegetation - 지면 높이면 덤불이다
+        default: return Surface::Other;      // 벽 밑동, 미상
+    }
+}
 
 // 노면 격자 키. 높이 축을 뺀 2 차원이다.
 // 노면 격자의 굵은 타일. 0.1 m 칸을 4 m 단위로 묶어 둔다.
@@ -4385,19 +4414,27 @@ inline bool exportSceneJson(const fs::path& path,
     }
     f << "\n  ],\n";
 
-    // --- 노면 ---
+    // --- 지표면 ---
     //
-    // **1 m 로 묶어서 낸다.** 관측 격자는 0.1 m 인데 그대로 내면 칸이 수십만
-    // 개라 JSON 이 감당하지 못하고, 엔진에서도 타일 하나에 사각형 백 개를
-    // 얹을 이유가 없다. 차선을 보려면 0.1 m 가 필요하지만 그것은 GLB 쪽
-    // 이야기이고, 여기서 필요한 것은 **달릴 수 있는 바닥** 이다.
+    // 도로와 인도와 잔디는 **같은 평면 위의 다른 표면** 이다. 높이로는 갈리지
+    // 않는다 - 연석 단차 12 cm 는 스테레오 잡음보다 작다. 갈라 주는 것은
+    // 화소의 의미이고, 그 표는 이미 칸마다 쌓여 있다.
     //
-    // 높이는 그 안 칸들의 중앙값이다. 평균을 쓰면 연석에 걸친 칸 하나가
-    // 타일 전체를 들어 올린다.
+    // 0.5 m 로 묶는다. 1 m 면 인도 폭이 두 칸이라 경계가 계단이 되고, 0.1 m
+    // 그대로면 칸이 수십만 개라 JSON 이 감당하지 못한다. 차선은 아래 텍스처가
+    // 0.1 m 그대로 나르므로 여기서 잘게 쪼갤 이유가 없다.
+    //
+    // 높이는 중앙값이다. 평균을 쓰면 연석에 걸친 칸 하나가 타일을 들어 올린다.
+    constexpr float kSurfCell = 0.5f;
     {
-        struct Tile { std::vector<float> h; long long isum = 0; int n = 0; };
+        struct Tile {
+            std::vector<float> h;
+            long long isum = 0;
+            int n = 0;
+            int vote[4] = {0, 0, 0, 0};
+        };
         std::map<std::pair<int, int>, Tile> tiles;
-        const int per = static_cast<int>(std::lround(1.0f / kRoadCell));
+        const int per = static_cast<int>(std::lround(kSurfCell / kRoadCell));
         const auto fdiv = [per](std::int64_t v) {
             return static_cast<int>((v >= 0) ? v / per : -((-v + per - 1) / per));
         };
@@ -4410,26 +4447,94 @@ inline bool exportSceneJson(const fs::path& path,
             t.h.push_back(rc.h);
             t.isum += rc.intensity;
             ++t.n;
+            if (rc.seg <= 18) {
+                ++t.vote[static_cast<int>(surfaceFromCityscapes(rc.seg))];
+            }
         }
-        f << "  \"road\": {\"cell\": 1.0, \"tiles\": [\n";
+        f << "  \"surfaces\": {\"cell\": " << kSurfCell << ", \"tiles\": [\n";
         bool rfirst = true;
+        int emitted[4] = {0, 0, 0, 0};
         for (auto& [k2, t] : tiles) {
-            // 100 칸 중 여덟 칸도 안 찬 타일은 노면이라 하기 어렵다.
-            // 연석 너머로 튄 관측 몇 개가 1 m 짜리 바닥을 만들면 안 된다.
-            if (t.n < 8) continue;
+            // 스물다섯 칸 중 넷도 안 찬 타일은 표면이라 하기 어렵다. 연석
+            // 너머로 튄 관측 몇 개가 반 미터짜리 바닥을 만들면 안 된다.
+            if (t.n < 4) continue;
             std::nth_element(t.h.begin(), t.h.begin() + t.h.size() / 2, t.h.end());
             const float hm = t.h[t.h.size() / 2];
             const Eigen::Vector3f c3 =
-                road_a * (static_cast<float>(k2.first) + 0.5f)
-              + road_b * (static_cast<float>(k2.second) + 0.5f)
+                road_a * ((static_cast<float>(k2.first) + 0.5f) * kSurfCell)
+              + road_b * ((static_cast<float>(k2.second) + 0.5f) * kSurfCell)
               + up * hm;
             const Eigen::Vector3f w = W(c3);
+            // 표가 하나도 없으면 도로로 둔다. 이 격자는 애초에 주행 평면
+            // ±40 cm 를 받은 것이라, 모르면 도로 쪽이 맞을 확률이 높다.
+            int best = 0, bn = 0;
+            for (int ci = 0; ci < 4; ++ci) {
+                if (t.vote[ci] > bn) { bn = t.vote[ci]; best = ci; }
+            }
+            ++emitted[best];
             if (!rfirst) f << ",\n";
             rfirst = false;
             f << "    [" << w.x() << ", " << w.y() << ", " << w.z() << ", "
-              << (t.isum / std::max(1, t.n)) << "]";
+              << (t.isum / std::max(1, t.n)) << ", " << best << "]";
         }
-        f << "\n  ]}\n}\n";
+        f << "\n  ]},\n";
+        std::cout << "  지표면: 도로 " << emitted[0] << " 인도 " << emitted[1]
+                  << " 잔디 " << emitted[2] << " 기타 " << emitted[3]
+                  << " (" << kSurfCell << " m 타일)" << std::endl;
+    }
+
+    // --- 노면 밝기 지도 ---
+    //
+    // **차선은 기하가 아니라 무늬다.** 높이 차이가 0 이므로 타일을 아무리
+    // 잘게 쪼개도 나오지 않고, 잘게 쪼갤수록 JSON 만 커진다. 무늬는 무늬로
+    // 내야 한다 - 0.1 m 격자를 그대로 PNG 한 장으로 굽고, 엔진은 그것을
+    // 노면에 입힌다. 15 cm 짜리 주차선이 화소 한 칸 반이라 비로소 선이 된다.
+    {
+        std::int64_t i0 = 0, i1 = 0, j0 = 0, j1 = 0;
+        bool got = false;
+        for (const auto& [key, rc] : road) {
+            if (rc.hits == 0) continue;
+            std::int64_t qi = (key >> 26) & 0x3FFFFFF, qj = key & 0x3FFFFFF;
+            if (qi & 0x2000000) qi -= 0x4000000;
+            if (qj & 0x2000000) qj -= 0x4000000;
+            if (!got) { i0 = i1 = qi; j0 = j1 = qj; got = true; }
+            i0 = std::min(i0, qi); i1 = std::max(i1, qi);
+            j0 = std::min(j0, qj); j1 = std::max(j1, qj);
+        }
+        if (got) {
+            const int W_px = static_cast<int>(i1 - i0) + 1;
+            const int H_px = static_cast<int>(j1 - j0) + 1;
+            cv::Mat img(H_px, W_px, CV_8UC1, cv::Scalar(0));
+            for (const auto& [key, rc] : road) {
+                if (rc.hits == 0) continue;
+                std::int64_t qi = (key >> 26) & 0x3FFFFFF, qj = key & 0x3FFFFFF;
+                if (qi & 0x2000000) qi -= 0x4000000;
+                if (qj & 0x2000000) qj -= 0x4000000;
+                img.at<std::uint8_t>(static_cast<int>(qj - j0),
+                                     static_cast<int>(qi - i0)) = rc.intensity;
+            }
+            fs::path png = path;
+            png.replace_extension();
+            png += "_road.png";
+            cv::imwrite(png.string(), img);
+            const Eigen::Vector3f org3 =
+                road_a * (static_cast<float>(i0) * kRoadCell)
+              + road_b * (static_cast<float>(j0) * kRoadCell);
+            const Eigen::Vector3f o = W(org3);
+            const Eigen::Vector3f au = Wd(road_a), av = Wd(road_b);
+            f << "  \"road_map\": {\"image\": \"" << png.filename().string()
+              << "\", \"cell\": " << kRoadCell
+              << ", \"width\": " << W_px << ", \"height\": " << H_px
+              << ", \"origin\": [" << o.x() << ", " << o.y() << ", " << o.z()
+              << "], \"axis_u\": [" << au.x() << ", " << au.y() << ", " << au.z()
+              << "], \"axis_v\": [" << av.x() << ", " << av.y() << ", " << av.z()
+              << "]}\n}\n";
+            std::cout << "  노면 밝기: " << png.filename().string() << " "
+                      << W_px << "x" << H_px << " px (" << kRoadCell
+                      << " m/px)" << std::endl;
+        } else {
+            f << "  \"road_map\": null\n}\n";
+        }
     }
     return static_cast<bool>(f);
 }
@@ -5515,6 +5620,7 @@ int main(int argc, char** argv) {
                                 rc.range = p.range;
                                 rc.intensity = p.intensity;
                             }
+                            rc.voteSeg(p.seg);
                             if (rc.hits < 255) ++rc.hits;
                         }
                     }

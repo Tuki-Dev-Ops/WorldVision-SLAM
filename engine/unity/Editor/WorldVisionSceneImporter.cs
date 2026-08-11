@@ -79,11 +79,22 @@ namespace WorldVision
         public Vehicle[] vehicles;
     }
 
-    // 노면 타일 하나. [x, y, z, 밝기]
-    public struct RoadTile
+    // 지표면 타일 하나. [x, y, z, 밝기, 종류]
+    public struct SurfaceTile
     {
         public Vector3 p;
-        public float v;     // 0..1
+        public float v;     // 0..1 밝기
+        public int cls;     // 0 도로 / 1 인도 / 2 잔디 / 3 기타
+    }
+
+    // 노면 밝기 지도의 놓임새. 차선은 기하가 아니라 무늬라 이쪽으로 온다.
+    public class RoadMap
+    {
+        public string image;
+        public float cell = 0.1f;
+        public int width, height;
+        public Vector3 origin, axisU, axisV;
+        public bool valid;
     }
 
     public static class SceneImporter
@@ -394,43 +405,65 @@ namespace WorldVision
             Build(path);
         }
 
-        // **노면만 직접 파싱한다.**
+        // **숫자 배열만 직접 훑는다.**
         //
         // JsonUtility 는 중첩 배열(float[][])을 못 읽는다. 나머지는 전부
-        // 객체 배열이라 문제가 없고, 노면만 [x,y,z,i] 형태라 여기서만
-        // 숫자를 훑는다 - 이것 하나 때문에 JSON 라이브러리를 들이지 않는다.
-        static List<RoadTile> ReadRoad(string text, out float cell)
+        // 객체 배열이라 문제가 없고, 지표면만 [x,y,z,밝기,종류] 형태라
+        // 여기서만 손으로 읽는다 - 이것 하나 때문에 JSON 라이브러리를
+        // 들이지 않는다.
+        static float Num(string text, string key, int from, float dflt)
         {
-            var outp = new List<RoadTile>();
-            cell = 1.0f;
-            int at = text.IndexOf("\"road\"");
+            int at = text.IndexOf(key, from);
+            if (at < 0) return dflt;
+            int c0 = text.IndexOf(':', at) + 1;
+            int c1 = text.IndexOfAny(new[] { ',', '}' }, c0);
+            if (c0 <= 0 || c1 < 0) return dflt;
+            float v;
+            return float.TryParse(text.Substring(c0, c1 - c0).Trim(),
+                    System.Globalization.NumberStyles.Float,
+                    System.Globalization.CultureInfo.InvariantCulture, out v)
+                ? v : dflt;
+        }
+
+        static Vector3 Vec(string text, string key, int from)
+        {
+            int at = text.IndexOf(key, from);
+            if (at < 0) return Vector3.zero;
+            int o = text.IndexOf('[', at), c = text.IndexOf(']', o);
+            if (o < 0 || c < 0) return Vector3.zero;
+            string[] pp = text.Substring(o + 1, c - o - 1).Split(',');
+            if (pp.Length < 3) return Vector3.zero;
+            var n = new float[3];
+            for (int k = 0; k < 3; ++k)
+                float.TryParse(pp[k].Trim(),
+                    System.Globalization.NumberStyles.Float,
+                    System.Globalization.CultureInfo.InvariantCulture, out n[k]);
+            // 위치든 방향이든 z 뒤집기는 같다.
+            return new Vector3(n[0], n[1], -n[2]);
+        }
+
+        static List<SurfaceTile> ReadSurfaces(string text, out float cell)
+        {
+            var outp = new List<SurfaceTile>();
+            cell = 0.5f;
+            int at = text.IndexOf("\"surfaces\"");
             if (at < 0) return outp;
-            int cAt = text.IndexOf("\"cell\"", at);
-            if (cAt >= 0)
-            {
-                int c0 = text.IndexOf(':', cAt) + 1;
-                int c1 = text.IndexOfAny(new[] { ',', '}' }, c0);
-                float.TryParse(text.Substring(c0, c1 - c0).Trim(),
-                               System.Globalization.NumberStyles.Float,
-                               System.Globalization.CultureInfo.InvariantCulture,
-                               out cell);
-            }
+            cell = Num(text, "\"cell\"", at, 0.5f);
             int tAt = text.IndexOf('[', text.IndexOf("\"tiles\"", at));
             if (tAt < 0) return outp;
             int i = tAt + 1;
-            var num = new float[4];
+            var num = new float[5];
             while (i < text.Length)
             {
                 int open = text.IndexOf('[', i);
                 if (open < 0) break;
                 int close = text.IndexOf(']', open);
                 if (close < 0) break;
-                string body = text.Substring(open + 1, close - open - 1);
-                string[] parts = body.Split(',');
-                if (parts.Length >= 4)
+                string[] parts = text.Substring(open + 1, close - open - 1).Split(',');
+                if (parts.Length >= 5)
                 {
                     bool ok = true;
-                    for (int k = 0; k < 4; ++k)
+                    for (int k = 0; k < 5; ++k)
                     {
                         ok &= float.TryParse(parts[k].Trim(),
                                 System.Globalization.NumberStyles.Float,
@@ -439,9 +472,10 @@ namespace WorldVision
                     }
                     if (ok)
                     {
-                        outp.Add(new RoadTile {
+                        outp.Add(new SurfaceTile {
                             p = new Vector3(num[0], num[1], -num[2]),
-                            v = Mathf.Clamp01(num[3] / 255f) });
+                            v = Mathf.Clamp01(num[3] / 255f),
+                            cls = Mathf.Clamp((int)num[4], 0, 3) });
                     }
                 }
                 i = close + 1;
@@ -451,62 +485,169 @@ namespace WorldVision
             return outp;
         }
 
-        // 노면을 메시 하나로 만든다. 타일마다 GameObject 를 두면 수천 개가
-        // 되어 씬이 무거워지고, 어차피 하나의 바닥이라 나눌 이유가 없다.
-        // 밝기 단계. 마지막 칸이 차선이다 - 도료는 아스팔트보다 훨씬 밝게
-        // 되돌아오므로 상위 구간만 흰색으로 뽑아 두면 선이 선으로 보인다.
-        static readonly float[] kRoadStep = { 0.16f, 0.24f, 0.34f, 0.48f, 0.90f };
+        static RoadMap ReadRoadMap(string text)
+        {
+            var m = new RoadMap();
+            int at = text.IndexOf("\"road_map\"");
+            if (at < 0 || text.IndexOf("null", at, Mathf.Min(24, text.Length - at))
+                          == at + 12) return m;
+            int q0 = text.IndexOf('"', text.IndexOf("\"image\"", at) + 8);
+            int q1 = text.IndexOf('"', q0 + 1);
+            if (q0 < 0 || q1 < 0) return m;
+            m.image = text.Substring(q0 + 1, q1 - q0 - 1);
+            m.cell = Num(text, "\"cell\"", at, 0.1f);
+            m.width = (int)Num(text, "\"width\"", at, 0);
+            m.height = (int)Num(text, "\"height\"", at, 0);
+            m.origin = Vec(text, "\"origin\"", at);
+            m.axisU = Vec(text, "\"axis_u\"", at);
+            m.axisV = Vec(text, "\"axis_v\"", at);
+            m.valid = m.width > 0 && m.height > 0;
+            return m;
+        }
 
-        static void BuildRoad(Transform parent, List<RoadTile> tiles, float cell)
+        // 표면 종류마다 하나씩. 물성이 다르므로 메시도 갈라야 한다 - 차가
+        // 굴러가는 아스팔트와 밟고 서는 보도와 잔디는 같은 재질일 수 없다.
+        //
+        // 종류 안에서는 타일마다 GameObject 를 두지 않는다. 수천 개가 되어
+        // 씬만 무거워지고, 어차피 이어진 한 장의 바닥이다.
+        static readonly string[] kSurfName = { "Road", "Sidewalk", "Grass", "Ground" };
+
+        static void BuildSurfaces(Transform parent, List<SurfaceTile> tiles,
+                                  float cell, RoadMap rm, Texture2D roadTex,
+                                  string projectDir)
         {
             if (tiles.Count == 0) return;
 
-            // **정점 색이 아니라 서브메시로 나눈다.**
-            //
-            // 처음에는 SetColors 로 밝기를 실었는데 화면에는 흰 리본 하나만
-            // 나왔다. Lit 셰이더는 COLOR_0 을 읽지 않으므로 밝기가 통째로
-            // 버려졌던 것이다. 셰이더를 새로 쓰는 대신 단계별 서브메시로
-            // 나누면 어떤 렌더 파이프라인에서도 그대로 보인다.
-            int nb = kRoadStep.Length;
-            var verts = new List<Vector3>(tiles.Count * 4);
-            var tris = new List<int>[nb];
-            for (int k = 0; k < nb; ++k) tris[k] = new List<int>();
-            float h = cell * 0.5f;
-            foreach (var t in tiles)
+            // **밝기를 정점 색으로 싣지 않는다.** 처음에 그렇게 했더니 화면에
+            // 흰 리본 하나만 나왔다 - Lit 셰이더는 COLOR_0 을 읽지 않는다.
+            // 포장면은 구워 온 밝기 텍스처를 입히고, 잔디처럼 밝기가 뜻이
+            // 없는 표면은 단색으로 둔다.
+            var mats = new Material[4];
+            mats[0] = MakeMaterial("wv_asphalt",  new Color(0.62f, 0.62f, 0.64f));
+            mats[1] = MakeMaterial("wv_sidewalk", new Color(0.74f, 0.72f, 0.69f));
+            mats[2] = MakeMaterial("wv_grass",    new Color(0.30f, 0.46f, 0.22f));
+            mats[3] = MakeMaterial("wv_ground",   new Color(0.55f, 0.54f, 0.52f));
+            if (roadTex != null)
             {
-                int b = verts.Count;
-                verts.Add(t.p + new Vector3(-h, 0, -h));
-                verts.Add(t.p + new Vector3( h, 0, -h));
-                verts.Add(t.p + new Vector3( h, 0,  h));
-                verts.Add(t.p + new Vector3(-h, 0,  h));
-                // 밝기를 제곱해 대비를 세운다 - 뷰어가 화면에서 하는 것과 같다.
-                int bucket = Mathf.Clamp((int)(t.v * t.v * nb), 0, nb - 1);
-                var tl = tris[bucket];
-                tl.Add(b); tl.Add(b + 3); tl.Add(b + 2);
-                tl.Add(b); tl.Add(b + 2); tl.Add(b + 1);
+                // 포장면에만 입힌다. 잔디의 밝기는 풀색이 아니라 노출이다.
+                mats[0].mainTexture = roadTex;
+                mats[1].mainTexture = roadTex;
+                // 색은 흰색으로 둔다. 들어 올리는 일은 텍스처를 구울 때
+                // 끝냈다 - Standard 의 _Color 는 1 을 넘겨도 잘린다.
+                mats[0].color = Color.white;
+                mats[1].color = new Color(1.0f, 0.99f, 0.96f);
+                if (mats[0].HasProperty("_Glossiness")) mats[0].SetFloat("_Glossiness", 0.22f);
+                if (mats[1].HasProperty("_Glossiness")) mats[1].SetFloat("_Glossiness", 0.08f);
             }
+            if (mats[2].HasProperty("_Glossiness")) mats[2].SetFloat("_Glossiness", 0.02f);
 
-            var go = new GameObject("Road");
-            go.transform.SetParent(parent, false);
-            var mesh = new Mesh();
-            mesh.indexFormat = verts.Count > 65000
-                ? UnityEngine.Rendering.IndexFormat.UInt32
-                : UnityEngine.Rendering.IndexFormat.UInt16;
-            mesh.SetVertices(verts);
-            mesh.subMeshCount = nb;
-            var mats = new Material[nb];
-            for (int k = 0; k < nb; ++k)
+            float h = cell * 0.5f;
+            float spanU = Mathf.Max(1e-3f, rm.width * rm.cell);
+            float spanV = Mathf.Max(1e-3f, rm.height * rm.cell);
+
+            for (int c = 0; c < 4; ++c)
             {
-                mesh.SetTriangles(tris[k], k);
-                float g = kRoadStep[k];
-                mats[k] = MakeMaterial("wv_road" + k, new Color(g, g, g * 1.02f));
+                var verts = new List<Vector3>();
+                var uvs = new List<Vector2>();
+                var tris = new List<int>();
+                foreach (var t in tiles)
+                {
+                    if (t.cls != c) continue;
+                    int b = verts.Count;
+                    verts.Add(t.p + new Vector3(-h, 0, -h));
+                    verts.Add(t.p + new Vector3( h, 0, -h));
+                    verts.Add(t.p + new Vector3( h, 0,  h));
+                    verts.Add(t.p + new Vector3(-h, 0,  h));
+                    for (int k = 0; k < 4; ++k)
+                    {
+                        // **UV 는 월드 좌표에서 뽑는다.** 타일마다 0..1 을 주면
+                        // 차선 한 줄이 타일마다 끊겨 점선이 된다. 구워 온
+                        // 지도는 하나의 큰 그림이므로 그 위의 자리를 그대로
+                        // 가리켜야 무늬가 이어진다.
+                        Vector3 d = verts[b + k] - rm.origin;
+                        uvs.Add(rm.valid
+                            ? new Vector2(Vector3.Dot(d, rm.axisU) / spanU,
+                                          Vector3.Dot(d, rm.axisV) / spanV)
+                            : new Vector2(0.5f, 0.5f));
+                    }
+                    tris.Add(b); tris.Add(b + 3); tris.Add(b + 2);
+                    tris.Add(b); tris.Add(b + 2); tris.Add(b + 1);
+                }
+                if (verts.Count == 0) continue;
+
+                var go = new GameObject(kSurfName[c]);
+                go.transform.SetParent(parent, false);
+                var mesh = new Mesh();
+                mesh.indexFormat = verts.Count > 65000
+                    ? UnityEngine.Rendering.IndexFormat.UInt32
+                    : UnityEngine.Rendering.IndexFormat.UInt16;
+                mesh.SetVertices(verts);
+                mesh.SetUVs(0, uvs);
+                mesh.SetTriangles(tris, 0);
+                mesh.RecalculateNormals();
+                go.AddComponent<MeshFilter>().sharedMesh = mesh;
+                go.AddComponent<MeshRenderer>().sharedMaterial = mats[c];
+                // 딛고 설 수 있어야 바닥이다.
+                go.AddComponent<MeshCollider>().sharedMesh = mesh;
+                go.isStatic = true;
             }
-            mesh.RecalculateNormals();
-            go.AddComponent<MeshFilter>().sharedMesh = mesh;
-            go.AddComponent<MeshRenderer>().sharedMaterials = mats;
-            // 달릴 수 있어야 바닥이다.
-            go.AddComponent<MeshCollider>().sharedMesh = mesh;
-            go.isStatic = true;
+        }
+
+        // 구워 온 노면 밝기 지도를 읽는다.
+        //
+        // 빌드에 들어가려면 에셋이어야 한다. 메모리에만 있는 텍스처는 씬에
+        // 직렬화되기는 하지만 임포트 설정이 없어 압축도 밉맵도 없이 그대로
+        // 들어가고, 3 백만 화소면 그것이 12 MB 다.
+        static Texture2D LoadRoadTexture(RoadMap rm, string jsonDir)
+        {
+            if (!rm.valid || string.IsNullOrEmpty(rm.image)) return null;
+            string src = Path.Combine(jsonDir, rm.image);
+            if (!File.Exists(src)) { Debug.LogWarning("WorldVision: 노면 지도 없음 " + src); return null; }
+            const string dstDir = "Assets/WorldVision";
+            Directory.CreateDirectory(dstDir);
+            string dst = dstDir + "/road.png";
+
+            // **그대로 복사하면 검은 바닥이 된다.**
+            //
+            // 카메라 노출은 하늘에 맞춰져 있어 아스팔트가 40/255 언저리로
+            // 찍힌다. 그 값을 albedo 로 쓰면 조명이 다시 곱해져 거의 검게
+            // 된다 - 실제 아스팔트의 반사율은 0.1~0.2 이지 0.02 가 아니다.
+            //
+            // 감마로 들어 올린다. 곱셈이 아니라 감마인 이유는, 곱하면 흰
+            // 페인트가 먼저 포화해 차선이 노면에 녹아 버리기 때문이다.
+            // 감마는 어두운 쪽을 더 많이 올리므로 대비가 남는다.
+            {
+                var raw = new Texture2D(2, 2, TextureFormat.RGBA32, false);
+                raw.LoadImage(File.ReadAllBytes(src));
+                var px = raw.GetPixels32();
+                var lut = new byte[256];
+                for (int i = 0; i < 256; ++i)
+                {
+                    lut[i] = (byte)Mathf.Clamp(
+                        Mathf.RoundToInt(255f * Mathf.Pow(i / 255f, 0.52f)), 0, 255);
+                }
+                for (int i = 0; i < px.Length; ++i)
+                {
+                    byte g = lut[px[i].r];
+                    px[i] = new Color32(g, g, (byte)Mathf.Min(255, g + 3), 255);
+                }
+                raw.SetPixels32(px);
+                raw.Apply();
+                File.WriteAllBytes(dst, raw.EncodeToPNG());
+                UnityEngine.Object.DestroyImmediate(raw);
+            }
+            AssetDatabase.ImportAsset(dst, ImportAssetOptions.ForceUpdate);
+            var imp = AssetImporter.GetAtPath(dst) as TextureImporter;
+            if (imp != null)
+            {
+                imp.textureType = TextureImporterType.Default;
+                imp.wrapMode = TextureWrapMode.Clamp;   // 밖으로 새면 길이 반복된다
+                imp.filterMode = FilterMode.Bilinear;
+                imp.mipmapEnabled = true;
+                imp.maxTextureSize = 4096;              // 2472 px 를 줄이지 않는다
+                imp.SaveAndReimport();
+            }
+            return AssetDatabase.LoadAssetAtPath<Texture2D>(dst);
         }
 
         static bool Build(string path)
@@ -537,11 +678,14 @@ namespace WorldVision
             var matPole  = MakeMaterial("wv_pole",  new Color(0.45f, 0.45f, 0.48f));
             var matCar   = MakeMaterial("wv_car",   new Color(0.20f, 0.55f, 0.52f));
 
-            float roadCell;
-            var roadTiles = ReadRoad(text, out roadCell);
-            var gRoad = new GameObject("Ground").transform;
+            float surfCell;
+            var surfTiles = ReadSurfaces(text, out surfCell);
+            var roadMap = ReadRoadMap(text);
+            var roadTex = LoadRoadTexture(roadMap, Path.GetDirectoryName(path));
+            var gRoad = new GameObject("Surfaces").transform;
             gRoad.SetParent(root.transform, false);
-            BuildRoad(gRoad, roadTiles, roadCell);
+            BuildSurfaces(gRoad, surfTiles, surfCell, roadMap, roadTex,
+                          Path.GetDirectoryName(path));
 
             var gBuild = new GameObject("Buildings").transform;
             gBuild.SetParent(root.transform, false);
@@ -623,13 +767,19 @@ namespace WorldVision
             }
 
             Debug.Log(string.Format(
-                "WorldVision: {0} 프레임 {1} - 건물 {2}, 나무 {3}, 기둥 {4}, 차량 {5}, 노면 {6} 타일",
+                "WorldVision: {0} 프레임 {1} - 건물 {2}, 나무 {3}, 기둥 {4}, 차량 {5}, "
+                + "지표면 {6} 타일 (도로 {7} 인도 {8} 잔디 {9} 기타 {10}), 노면지도 {11}",
                 s.sequence, s.frame,
                 (s.buildings ?? new Building[0]).Length,
                 (s.trees ?? new Tree[0]).Length,
                 (s.poles ?? new Pole[0]).Length,
                 (s.vehicles ?? new Vehicle[0]).Length,
-                roadTiles.Count));
+                surfTiles.Count,
+                surfTiles.FindAll(t => t.cls == 0).Count,
+                surfTiles.FindAll(t => t.cls == 1).Count,
+                surfTiles.FindAll(t => t.cls == 2).Count,
+                surfTiles.FindAll(t => t.cls == 3).Count,
+                roadTex != null ? roadMap.width + "x" + roadMap.height : "없음"));
             Selection.activeGameObject = root;
             return true;
         }
