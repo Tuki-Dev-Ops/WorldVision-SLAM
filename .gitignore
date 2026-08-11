@@ -9,6 +9,9 @@ compile_commands.json
 CMakeUserPresets.json
 *.o
 *.obj
+# 위 *.obj 는 컴파일러 오브젝트 파일이다. 3D 모형도 같은 확장자를 쓰므로
+# models/ 아래의 것만 되돌려 놓는다 - 뷰어가 읽는 자산이라 저장소에 있어야 한다.
+!models/*.obj
 *.so
 *.dylib
 *.dll
@@ -45,3 +48,6 @@ data/
 models/*.onnx
 third_party/**/*.dll
 third_party/**/*.lib
+
+# 의미 분할 결과는 seg_export 가 다시 만들 수 있는 산출물이다.
+results/seg/
