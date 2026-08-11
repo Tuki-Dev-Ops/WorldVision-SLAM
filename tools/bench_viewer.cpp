@@ -1318,6 +1318,27 @@ struct RoadCell {
 };
 
 // 노면 격자 키. 높이 축을 뺀 2 차원이다.
+// 노면 격자의 굵은 타일. 0.1 m 칸을 4 m 단위로 묶어 둔다.
+//
+// 노면 격자는 주행 거리만큼 자라는데 한 프레임에 그리는 것은 자차 주변
+// 28 m 뿐이다. 그런데 그 28 m 를 찾자고 지도 전체를 훑고 있었다 - 실측
+// 26 ms 이고, 달릴수록 늘어난다. 타일에 칸 목록을 달아 두면 반경에 닿는
+// 타일만 열면 되고, 비용이 지도 크기가 아니라 반경으로 정해진다.
+constexpr float kRoadTile = 4.0f;
+
+inline std::int64_t roadTileKey(std::int64_t rk) {
+    // roadKey 의 26 비트 두 칸을 그대로 나눈다. 부호 확장을 해야 음수가 산다.
+    std::int64_t qi = (rk >> 26) & 0x3FFFFFF;
+    std::int64_t qj = rk & 0x3FFFFFF;
+    if (qi & 0x2000000) qi -= 0x4000000;
+    if (qj & 0x2000000) qj -= 0x4000000;
+    const int per = static_cast<int>(kRoadTile / kRoadCell);   // 40
+    const auto fdiv = [per](std::int64_t v) {
+        return (v >= 0) ? v / per : -((-v + per - 1) / per);
+    };
+    return (fdiv(qi) << 26) | (fdiv(qj) & 0x3FFFFFF);
+}
+
 inline std::int64_t roadKey(const Eigen::Vector3f& p, const Eigen::Vector3f& a,
                             const Eigen::Vector3f& b, float inv) {
     const auto q = [inv](float v) {
@@ -1912,6 +1933,8 @@ public:
     // 주차선이 칸보다 굵어져 비로소 화면에 나온다. 도로는 면이니 높이 방향
     // 해상도를 쓸 이유가 없고, 그 예산을 전부 가로세로에 쓰는 것이다.
     void roadTexture(const std::unordered_map<std::int64_t, RoadCell>& cells,
+                     const std::unordered_map<std::int64_t,
+                                              std::vector<std::int64_t>>& tiles,
                      const Eigen::Vector3f& a, const Eigen::Vector3f& b,
                      const Eigen::Vector3d& up_d, const Orbit& orb, double f,
                      const Eigen::Vector3d& ego, double radius) {
@@ -1932,30 +1955,67 @@ public:
         const Eigen::Matrix3d M = orb.basis();
         const Eigen::Vector3d eye = orb.center - M.row(2).transpose() * orb.dist;
 
-        // 밝기 범위는 **보이는 범위에서** 잡는다. 지도 전체로 정규화하면
-        // 그늘진 구간이 대비를 통째로 먹어 여기 선이 안 뜬다.
-        int lo = 255, hi = 0;
-        for (const auto& [k, c] : cells) {
-            if (c.hits == 0) continue;
-            const Eigen::Vector3d p = ad * 0.0 + up * c.h;   // 높이만 필요 없음
-            (void)p;
-            lo = std::min(lo, static_cast<int>(c.intensity));
-            hi = std::max(hi, static_cast<int>(c.intensity));
-        }
-        const double span = std::max(20, hi - lo);
-
-        for (const auto& [key, c] : cells) {
-            if (c.hits == 0) continue;
-            // 키에서 격자 좌표를 되찾는다. 부호 확장을 해야 음수 칸이 살아난다.
+        // 키에서 격자 좌표를 되찾는다. 부호 확장을 해야 음수 칸이 살아난다.
+        const auto decode = [](std::int64_t key) {
             std::int64_t qi = (key >> 26) & 0x3FFFFFF;
             std::int64_t qj = key & 0x3FFFFFF;
             if (qi & 0x2000000) qi -= 0x4000000;
             if (qj & 0x2000000) qj -= 0x4000000;
-            const double ca = (static_cast<double>(qi) + 0.5) * kRoadCell;
-            const double cb = (static_cast<double>(qj) + 0.5) * kRoadCell;
-            const Eigen::Vector3d c3 = ad * ca + bd * cb + up * c.h;
-            if ((c3 - ego).squaredNorm() > r2) continue;
+            return std::pair<double, double>{
+                (static_cast<double>(qi) + 0.5) * kRoadCell,
+                (static_cast<double>(qj) + 0.5) * kRoadCell};
+        };
 
+        // **지도를 한 번만 훑는다.**
+        //
+        // 밝기 범위를 잡는 루프와 그리는 루프가 각각 노면 격자 전체를 돌고
+        // 있었다. 그 격자는 주행 거리만큼 자라므로(kitti_00 265 프레임에서
+        // 이미 수십만 칸) 두 번 도는 비용이 거리에 비례해 늘었다 - 점군
+        // 단계가 30 ms 에서 71 ms 로 자란 몫의 대부분이 여기였다.
+        //
+        // 게다가 첫 루프에는 반경 검사가 빠져 있어 정작 지도 전체로
+        // 정규화하고 있었다. 주석이 말하는 것과 코드가 달랐다.
+        //
+        // 반경 안의 칸만 한 번에 추려 두면, 범위 계산도 그리기도 그 목록
+        // 위에서 끝난다. 지도가 아무리 길어져도 목록의 크기는 반경이 정한다.
+        struct RoadDraw { Eigen::Vector3d c3; std::uint8_t intensity; };
+        std::vector<RoadDraw> near_cells;
+        near_cells.reserve(cells.size() / 4 + 1);
+        // 반경에 닿는 타일만 연다. 지도가 아무리 길어져도 여는 타일 수는
+        // 반경이 정하므로, 비용이 주행 거리를 따라가지 않는다.
+        int lo = 255, hi = 0;
+        {
+            const double ea = ego.dot(ad), eb = ego.dot(bd);
+            const auto tdiv = [](double v) {
+                return static_cast<int>(std::floor(v / kRoadTile));
+            };
+            const int ti0 = tdiv(ea - radius), ti1 = tdiv(ea + radius);
+            const int tj0 = tdiv(eb - radius), tj1 = tdiv(eb + radius);
+            for (int ti = ti0; ti <= ti1; ++ti) {
+                for (int tj = tj0; tj <= tj1; ++tj) {
+                    const std::int64_t tk =
+                        (static_cast<std::int64_t>(ti) << 26)
+                        | (static_cast<std::int64_t>(tj) & 0x3FFFFFF);
+                    const auto tit = tiles.find(tk);
+                    if (tit == tiles.end()) continue;
+                    for (const std::int64_t key : tit->second) {
+                        const auto cit = cells.find(key);
+                        if (cit == cells.end() || cit->second.hits == 0) continue;
+                        const auto [ca, cb] = decode(key);
+                        const Eigen::Vector3d c3 =
+                            ad * ca + bd * cb + up * cit->second.h;
+                        if ((c3 - ego).squaredNorm() > r2) continue;
+                        near_cells.push_back({c3, cit->second.intensity});
+                        lo = std::min(lo, static_cast<int>(cit->second.intensity));
+                        hi = std::max(hi, static_cast<int>(cit->second.intensity));
+                    }
+                }
+            }
+        }
+        const double span = std::max(20, hi - lo);
+
+        for (const auto& nc : near_cells) {
+            const Eigen::Vector3d& c3 = nc.c3;
             const Eigen::Vector3d q[4] = {c3 - ad * h - bd * h, c3 + ad * h - bd * h,
                                           c3 + ad * h + bd * h, c3 - ad * h + bd * h};
             cv::Point poly[4];
@@ -1980,7 +2040,7 @@ public:
             //
             // 제곱은 그대로 둔다. 흰 페인트가 아스팔트보다 확실히 밝게 남는
             // 것이 이 층의 목적이기 때문이다.
-            const double t = std::clamp((c.intensity - lo) / span, 0.0, 1.0);
+            const double t = std::clamp((nc.intensity - lo) / span, 0.0, 1.0);
             const double v = 58.0 + 190.0 * t * t;
             cv::fillConvexPoly(img_, poly, 4, cv::Scalar(v, v, v), cv::LINE_8);
             const double zz = (M * (c3 - eye)).z();
@@ -3970,6 +4030,8 @@ int main(int argc, char** argv) {
     std::unordered_map<std::int64_t, HouseBin> houses[2];
     // 노면 텍스처. 부피 지도와 따로 가는 2 차원 정밀 격자다.
     std::unordered_map<std::int64_t, RoadCell> road[2];
+    // 노면 칸의 타일 색인. 새 칸이 생길 때만 채운다.
+    std::unordered_map<std::int64_t, std::vector<std::int64_t>> road_tile[2];
     // 삼각형 표면. 자차가 의미 있게 움직였을 때만 다시 만든다.
     SurfMesh surf[2];
     Eigen::Vector3d surf_at[2] = {Eigen::Vector3d::Constant(1e9),
@@ -4373,11 +4435,13 @@ int main(int argc, char** argv) {
                     mesh[k].clear();
                     mem[k].clear();
                     road[k].clear();
+                    road_tile[k].clear();
                     acc_frame[k] = frame - 1;
                 } else if (acc_frame[k] > frame || acc_frame[k] < 0) {
                     acc[k].clear();
                     mesh[k].clear();
                     road[k].clear();
+                    road_tile[k].clear();
                     acc_frame[k] = -1;
                 }
                 const int from = acc_frame[k] + 1;
@@ -4508,7 +4572,9 @@ int main(int argc, char** argv) {
                             const float floor_rel = (s.dataset == "kitti") ? -1.65f : -0.8f;
                             if (std::abs(rel - floor_rel) > 0.40f) continue;
                             const std::int64_t rk = roadKey(p.p, road_a, road_b, rinv);
+                            const bool rc_new = (road[k].find(rk) == road[k].end());
                             auto& rc = road[k][rk];
+                            if (rc_new) road_tile[k][roadTileKey(rk)].push_back(rk);
                             // 가까이서 본 관측이 이긴다. 노면 표시는 원거리
                             // 에서 몇 화소뿐이라 멀리서 본 값은 번져 있다.
                             if (rc.hits == 0 || p.range < rc.range) {
@@ -4619,14 +4685,28 @@ int main(int argc, char** argv) {
                 }
                 acc_frame[k] = frame;
 
+                // **반경 밖은 벡터에 담지도 않는다.**
+                //
+                // 지도 전체를 벡터로 복사하고 있었다. 아래에서 어차피 반경
+                // 55 m 로 걸러 쓰는데, 복사와 age 계산은 지도 전체가 받고
+                // 있었던 것이다. 복셀이 31 만에서 55 만으로 자라는 동안
+                // 점군 단계가 30 ms 에서 71 ms 로 같이 자란 것이 이 때문이다 -
+                // 화면에 늘어난 것은 없는데 비용만 늘었다.
+                //
+                // 반경은 장면 규모에서 온 값이고 자차와 함께 움직이므로,
+                // 지도가 아무리 커져도 담기는 양은 일정하게 유지된다.
+                const double flat_r2 = ((s.dataset == "kitti") ? 55.0 : 7.0)
+                                     * ((s.dataset == "kitti") ? 55.0 : 7.0);
+                const Eigen::Vector3f ego_f = ego_k.cast<float>();
                 std::vector<Splat> flat;
-                flat.reserve(acc[k].cells.size());
-                for (const auto& [key, v] : acc[k].cells) flat.push_back(v);
+                flat.reserve(acc[k].cells.size() / 4 + 1);
                 // age 는 최근성이다. 오래 전에 본 표면은 배경으로 가라앉혀
                 // 지금 보고 있는 것과 구분한다 - 지우지는 않는다.
                 const double span = std::max(1, frame);
-                for (auto& v : flat) {
-                    v.age = static_cast<float>(
+                for (const auto& [key, v] : acc[k].cells) {
+                    if ((v.p - ego_f).squaredNorm() > flat_r2) continue;
+                    flat.push_back(v);
+                    flat.back().age = static_cast<float>(
                         std::clamp(1.0 - static_cast<double>(v.seen) / span, 0.0, 1.0));
                 }
                 const auto t_c0 = std::chrono::steady_clock::now();
@@ -4744,7 +4824,8 @@ int main(int argc, char** argv) {
                     // 노면 텍스처는 부피 지도보다 짧은 반경만 그린다. 0.1 m
                     // 칸은 멀어지면 화면에서 사라지므로 그릴 값이 없고, 그
                     // 자리는 아래 격자면이 이미 채우고 있다.
-                    cloud[k].roadTexture(road[k], road_a, road_b, ob.world_up,
+                    cloud[k].roadTexture(road[k], road_tile[k], road_a, road_b,
+                                         ob.world_up,
                                          ob, fpx, ego_k,
                                          std::min(map_r, (s.dataset == "kitti")
                                                          ? 28.0 : 5.0));
