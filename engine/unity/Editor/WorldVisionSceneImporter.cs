@@ -20,6 +20,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using UnityEditor;
+using UnityEditor.Build.Reporting;
 using UnityEditor.SceneManagement;
 using UnityEngine;
 
@@ -229,6 +230,161 @@ namespace WorldVision
             EditorApplication.Exit(0);
         }
 
+        // 걸어 다닐 수 있는 실행 파일을 만든다.
+        //
+        //   Unity.exe -batchmode -quit -projectPath <프로젝트>
+        //             -executeMethod WorldVision.SceneImporter.BuildPlayerFromCommandLine
+        //             -wvScene <장면.json> -wvOut <출력폴더>
+        //
+        // 임포트와 렌더까지는 **보기만 하는 것** 이었다. 여기서 나오는 것은
+        // 실행하면 그 안에 서 있게 되는 프로그램이다 - 노면에 붙인
+        // MeshCollider 와 건물의 BoxCollider 가 그때 비로소 쓰인다.
+        public static void BuildPlayerFromCommandLine()
+        {
+            string scene = null, outDir = null;
+            string[] args = Environment.GetCommandLineArgs();
+            for (int i = 0; i + 1 < args.Length; ++i)
+            {
+                if (args[i] == "-wvScene") scene = args[i + 1];
+                else if (args[i] == "-wvOut") outDir = args[i + 1];
+            }
+            if (string.IsNullOrEmpty(scene) || string.IsNullOrEmpty(outDir))
+            {
+                Debug.LogError("WorldVision: -wvScene 과 -wvOut 이 필요하다");
+                EditorApplication.Exit(2);
+                return;
+            }
+            if (!Build(scene)) { EditorApplication.Exit(1); return; }
+
+            Dress(scene);
+
+            // 창 제목이 "Project" 로 나오면 무엇을 실행한 것인지 알 수 없다.
+            PlayerSettings.companyName = "WorldVision";
+            PlayerSettings.productName = "WorldVision-SLAM";
+            PlayerSettings.defaultScreenWidth = 1600;
+            PlayerSettings.defaultScreenHeight = 900;
+            PlayerSettings.fullScreenMode = FullScreenMode.Windowed;
+            PlayerSettings.resizableWindow = true;
+            PlayerSettings.runInBackground = true;
+
+            const string scenePath = "Assets/WorldVisionScene.unity";
+            EditorSceneManager.SaveScene(EditorSceneManager.GetActiveScene(), scenePath);
+            EditorBuildSettings.scenes = new[] {
+                new EditorBuildSettingsScene(scenePath, true) };
+
+            Directory.CreateDirectory(outDir);
+            var opt = new BuildPlayerOptions {
+                scenes = new[] { scenePath },
+                locationPathName = Path.Combine(outDir, "WorldVision.exe"),
+                target = BuildTarget.StandaloneWindows64,
+                options = BuildOptions.None,
+            };
+            var report = BuildPipeline.BuildPlayer(opt);
+            var sum = report.summary;
+            Debug.Log(string.Format(
+                "WorldVision: 빌드 {0}  {1} 바이트  {2}",
+                sum.result, sum.totalSize, opt.locationPathName));
+            EditorApplication.Exit(sum.result == BuildResult.Succeeded ? 0 : 1);
+        }
+
+        // 해와 하늘과 사람을 놓는다. 임포터가 세우는 것은 형상뿐이라,
+        // 이것 없이는 검은 화면에 회색 덩어리만 뜬다.
+        static void Dress(string scenePath)
+        {
+            var sun = new GameObject("Sun").AddComponent<Light>();
+            sun.type = LightType.Directional;
+            sun.intensity = 1.15f;
+            sun.color = new Color(1f, 0.97f, 0.9f);
+            sun.shadows = LightShadows.Soft;
+            sun.transform.rotation = Quaternion.Euler(48f, -35f, 0f);
+
+            RenderSettings.ambientLight = new Color(0.38f, 0.42f, 0.5f);
+            RenderSettings.fog = true;
+            RenderSettings.fogColor = new Color(0.62f, 0.68f, 0.78f);
+            RenderSettings.fogMode = FogMode.Linear;
+            RenderSettings.fogStartDistance = 60f;
+            RenderSettings.fogEndDistance = 320f;
+
+            // **자차가 섰던 자리에 세운다.** 장면의 한가운데가 아니다 - 거기는
+            // 건물 안일 수도 있다. ego 는 실제로 차가 지나간 자리이므로
+            // 노면 위인 것이 보장된다.
+            Vector3 start = new Vector3(0f, 3f, 0f);
+            var ego = GameObject.Find("Ego");
+            // 3 m 위에서 떨어뜨린다. 자차 높이에 딱 맞춰 놓으면 그 자리에
+            // 주차된 차 안에서 시작하는 일이 생긴다.
+            if (ego != null) start = ego.transform.position + Vector3.up * 3f;
+
+            // **길을 따라 보게 세운다.** 처음 보이는 것이 담벼락이면 무엇을
+            // 세운 것인지 알 수 없다. 주변 노면 타일의 주축이 곧 길의 방향
+            // 이므로 그것을 구해 쓴다 - 고정 방향은 시퀀스마다 어긋난다.
+            float yaw = 0f;
+            {
+                var road = GameObject.Find("Road");
+                if (road != null)
+                {
+                    var mf = road.GetComponent<MeshFilter>();
+                    if (mf != null && mf.sharedMesh != null)
+                    {
+                        // 2 x 2 공분산의 주고유벡터. 평면 문제라 3 차원 분해가
+                        // 필요 없다.
+                        double sxx = 0, sxz = 0, szz = 0; int n = 0;
+                        var vs = mf.sharedMesh.vertices;
+                        for (int i = 0; i < vs.Length; i += 4)
+                        {
+                            Vector3 d = vs[i] - start;
+                            d.y = 0f;
+                            if (d.sqrMagnitude > 900f) continue;   // 30 m
+                            sxx += d.x * d.x; sxz += d.x * d.z; szz += d.z * d.z;
+                            ++n;
+                        }
+                        if (n >= 8)
+                        {
+                            double tr = sxx + szz;
+                            double det = sxx * szz - sxz * sxz;
+                            double l = 0.5 * tr + Math.Sqrt(
+                                Math.Max(0.0, 0.25 * tr * tr - det));
+                            Vector3 axis = Math.Abs(sxz) > 1e-9
+                                ? new Vector3((float)(l - szz), 0f, (float)sxz).normalized
+                                : (sxx >= szz ? Vector3.right : Vector3.forward);
+                            // 주축은 부호가 없다. 노면이 더 많이 뻗은 쪽으로 돌린다.
+                            int fwd = 0, back = 0;
+                            for (int i = 0; i < vs.Length; i += 4)
+                            {
+                                Vector3 d = vs[i] - start; d.y = 0f;
+                                if (d.sqrMagnitude > 900f) continue;
+                                if (Vector3.Dot(d, axis) > 0f) ++fwd; else ++back;
+                            }
+                            if (back > fwd) axis = -axis;
+                            yaw = Quaternion.LookRotation(axis, Vector3.up).eulerAngles.y;
+                        }
+                    }
+                }
+            }
+
+            var body = new GameObject("Player");
+            body.transform.position = start;
+            body.transform.rotation = Quaternion.Euler(0f, yaw, 0f);
+            var cc = body.AddComponent<CharacterController>();
+            cc.height = 1.75f;
+            cc.radius = 0.35f;
+            cc.center = new Vector3(0f, 0.875f, 0f);
+            cc.slopeLimit = 55f;
+            cc.stepOffset = 0.45f;
+
+            var eye = new GameObject("Eye");
+            eye.transform.SetParent(body.transform, false);
+            eye.transform.localPosition = new Vector3(0f, 1.62f, 0f);
+            var cam = eye.AddComponent<Camera>();
+            cam.clearFlags = CameraClearFlags.Skybox;
+            cam.backgroundColor = new Color(0.58f, 0.66f, 0.78f);
+            cam.nearClipPlane = 0.12f;
+            cam.farClipPlane = 400f;
+            cam.fieldOfView = 68f;
+            eye.tag = "MainCamera";
+
+            body.AddComponent<Player>();
+        }
+
         [MenuItem("WorldVision/Import Scene (JSON)")]
         public static void Import()
         {
@@ -367,6 +523,12 @@ namespace WorldVision
 
             var root = new GameObject("WorldVision " + s.sequence + " @" + s.frame);
             Undo.RegisterCreatedObjectUndo(root, "Import WorldVision scene");
+
+            // 자차가 섰던 자리를 표시로 남긴다. 사람을 놓을 때 쓴다 - 장면의
+            // 한가운데는 건물 안일 수도 있지만 여기는 실제로 지나간 자리다.
+            var egoGo = new GameObject("Ego");
+            egoGo.transform.SetParent(root.transform, false);
+            if (s.ego != null && s.ego.Length >= 3) egoGo.transform.position = P(s.ego);
 
             var matWall  = MakeMaterial("wv_wall",  new Color(0.72f, 0.70f, 0.66f));
             var matRoof  = MakeMaterial("wv_roof",  new Color(0.45f, 0.28f, 0.24f));

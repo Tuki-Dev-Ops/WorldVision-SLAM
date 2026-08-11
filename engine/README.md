@@ -24,6 +24,29 @@ wme_bench_viewer --seq 0 --frame 200 \
 충돌체도 재질도 따로 줄 수 없고, 차를 움직이거나 건물을 지울 수도 없다.
 JSON 으로 세우면 엔진이 아는 오브젝트가 되므로 그다음은 엔진의 일이 된다.
 
+## 걸어 다닐 수 있는 실행 파일
+
+```
+powershell -ExecutionPolicy Bypass -File engine/unity/build.ps1 -Run
+```
+
+`build/unity/WorldVision.exe` 가 나온다 (84 MB). 실행하면 자차가 섰던 자리에
+서 있게 된다 - **WASD** 이동, **Shift** 질주, **Space** 점프, 마우스 시점,
+**F** 날기/걷기, **Esc** 마우스 풀기, **Q** 종료.
+
+임포트와 항공 렌더까지는 보기만 하는 것이었다. 여기서부터는 노면의
+`MeshCollider` 와 건물의 `BoxCollider` 가 실제로 쓰인다 - 바닥을 딛고 서고,
+벽을 통과하지 못한다.
+
+시작 방향은 고정값이 아니라 **주변 노면 타일의 주축** 에서 구한다. 30 m 안의
+타일로 2x2 공분산의 주고유벡터를 잡고, 노면이 더 많이 뻗은 쪽으로 돌린다.
+고정 방향을 쓰면 시퀀스마다 담벼락을 보고 시작한다.
+
+자차 자리에서 **3 m 위** 에 놓고 떨어뜨린다. 높이를 딱 맞추면 그 자리에
+주차된 차 안에서 시작하는 일이 생긴다.
+
+![Unity 빌드에서 본 거리](../docs/img/unity_player.png)
+
 ## Unity
 
 `engine/unity/Editor/WorldVisionSceneImporter.cs` 를 프로젝트의 아무
