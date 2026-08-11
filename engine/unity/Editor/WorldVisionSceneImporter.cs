@@ -147,6 +147,74 @@ namespace WorldVision
             EditorApplication.Exit(0);
         }
 
+        // 세운 씬을 위에서 한 장 찍는다.
+        //
+        //   Unity.exe -batchmode -quit -projectPath <프로젝트>
+        //             -executeMethod WorldVision.SceneImporter.RenderFromCommandLine
+        //             -wvScene <장면.json> -wvShot <출력.png>
+        //
+        // **-nographics 를 붙이면 안 된다.** 그래픽 장치가 없으면 렌더가
+        // 빈 그림을 내놓는다 - 임포트만 할 때와 다른 점이다.
+        //
+        // 항공뷰로 찍는 이유는 이것이 확인하려는 것이 배치이기 때문이다.
+        // 조명이나 재질은 눈으로 볼 문제이고, 건물이 길 양옆에 제자리로
+        // 섰는지는 위에서 보면 한눈에 갈린다.
+        public static void RenderFromCommandLine()
+        {
+            string scene = null, shot = null;
+            string[] args = Environment.GetCommandLineArgs();
+            for (int i = 0; i + 1 < args.Length; ++i)
+            {
+                if (args[i] == "-wvScene") scene = args[i + 1];
+                else if (args[i] == "-wvShot") shot = args[i + 1];
+            }
+            if (string.IsNullOrEmpty(scene) || string.IsNullOrEmpty(shot))
+            {
+                Debug.LogError("WorldVision: -wvScene 과 -wvShot 이 필요하다");
+                EditorApplication.Exit(2);
+                return;
+            }
+            if (!Build(scene)) { EditorApplication.Exit(1); return; }
+
+            var sun = new GameObject("Sun").AddComponent<Light>();
+            sun.type = LightType.Directional;
+            sun.intensity = 1.1f;
+            sun.transform.rotation = Quaternion.Euler(52f, -30f, 0f);
+
+            // 씬 전체가 들어오도록 경계에서 카메라 높이를 정한다. 고정
+            // 높이를 쓰면 시퀀스마다 잘리거나 점처럼 작아진다.
+            Bounds bb = new Bounds(Vector3.zero, Vector3.zero);
+            bool got = false;
+            foreach (var r in UnityEngine.Object.FindObjectsByType<Renderer>(
+                         FindObjectsSortMode.None))
+            {
+                if (!got) { bb = r.bounds; got = true; }
+                else bb.Encapsulate(r.bounds);
+            }
+            var camGo = new GameObject("ShotCamera");
+            var cam = camGo.AddComponent<Camera>();
+            cam.clearFlags = CameraClearFlags.SolidColor;
+            cam.backgroundColor = new Color(0.05f, 0.06f, 0.08f);
+            float span = Mathf.Max(bb.size.x, bb.size.z);
+            camGo.transform.position = bb.center + Vector3.up * (span * 0.75f + 30f);
+            camGo.transform.rotation = Quaternion.Euler(90f, 0f, 0f);
+            cam.farClipPlane = span * 3f + 200f;
+
+            const int W = 1600, H = 1000;
+            var rt = new RenderTexture(W, H, 24);
+            cam.targetTexture = rt;
+            cam.Render();
+            RenderTexture.active = rt;
+            var tex = new Texture2D(W, H, TextureFormat.RGB24, false);
+            tex.ReadPixels(new Rect(0, 0, W, H), 0, 0);
+            tex.Apply();
+            RenderTexture.active = null;
+            cam.targetTexture = null;
+            File.WriteAllBytes(shot, tex.EncodeToPNG());
+            Debug.Log("WorldVision: 렌더 저장 " + shot + "  범위 " + bb.size);
+            EditorApplication.Exit(0);
+        }
+
         [MenuItem("WorldVision/Import Scene (JSON)")]
         public static void Import()
         {
