@@ -2819,19 +2819,28 @@ public:
         // 수관에 128 면을 그으면 선이 겹쳐 다시 덩어리가 되고, 눈앞의 수관에
         // 32 면만 그으면 각진 철망으로 보인다. 화면에서 120 px 을 기준으로
         // 가른다 - 그쯤부터 32 면의 각이 눈에 띈다.
-        const double cspan = f * canopy_r
-                           / std::max(1e-3, (M * (cen.cast<double>() - eye)).z());
-        for (const auto& tr : unitSphere(cspan > 120.0 ? 2 : 1)) {
+        for (const auto& tr : unitSphere(1)) {
             Eigen::Vector3f n = (tr[0] + tr[1] + tr[2]) / 3.0f;
             if (n.norm() < 1e-6f) continue;
             n.normalize();
             const Eigen::Vector3f wn = (ex * n.x() + ey * n.y() + ez * n.z());
             const Eigen::Vector3d wc = (cen + wn).cast<double>();
             // 뒷면 선도 남긴다. 앞뒤가 겹쳐 보이는 것이 속이 빈 증거다.
+            //
+            // **다만 눈앞의 수관에서는 뺀다.** 화면을 가득 채운 수관에
+            // 뒷면까지 그으면 선이 두 배가 되어, 나무 한 그루의 격자가
+            // 시야를 덮는 그물이 된다 - 그 거리에서는 앞면만으로도 속이
+            // 빈 것이 충분히 보인다.
+            // **뒷면 선은 긋지 않는다.**
+            //
+            // 앞뒤가 겹쳐 보이는 것이 속이 빈 증거라고 두었는데, 나무가
+            // 수십 그루 서면 그 두 배의 선이 화면에서 포개져 초록 그물이
+            // 된다 - 가로수길에서 실제로 그렇게 나왔다. 앞면만으로도 격자는
+            // 속이 비어 보이고, 그 사이로 뒤가 비치는 것은 그대로다.
+            if ((eye - wc).dot(wn.cast<double>()) < 0.0) continue;
             const double lam = (0.34 + 0.42 * std::abs(wn.normalized().cast<double>().dot(fwd))
                               + 0.24 * std::clamp(static_cast<double>(n.dot(up)), 0.0, 1.0))
-                             * depthFade((M * (wc - eye)).z())
-                             * (((eye - wc).dot(wn.cast<double>()) < 0.0) ? 0.55 : 1.0);
+                             * depthFade((M * (wc - eye)).z());
             const Eigen::Vector3d q[3] = {
                 (cen + ex * tr[0].x() + ey * tr[0].y() + ez * tr[0].z()).cast<double>(),
                 (cen + ex * tr[1].x() + ey * tr[1].y() + ez * tr[1].z()).cast<double>(),
@@ -3338,6 +3347,10 @@ public:
             }
         }
 
+        // 나무는 모아 두었다가 마지막에 그린다. 이유는 아래 참조.
+        struct TreeSeed { Eigen::Vector3f foot; float h, rad; };
+        std::vector<TreeSeed> trees;
+
         for (const auto& [k, c] : cols) {
             if (c.cls == Stuff::Unknown) continue;
             if (merged.count(k)) continue;      // 이미 한 장으로 그렸다
@@ -3436,8 +3449,8 @@ public:
                 // 수관 지름과 비슷해져 그루가 그루로 보인다.
                 int nveg = 0;
                 bool seed = true;
-                for (int di = -2; di <= 2 && seed; ++di) {
-                    for (int dj = -2; dj <= 2; ++dj) {
+                for (int di = -3; di <= 3 && seed; ++di) {
+                    for (int dj = -3; dj <= 3; ++dj) {
                         if (di == 0 && dj == 0) continue;
                         const auto it = cols.find(GroundGrid::key(c.i + di, c.j + dj));
                         if (it == cols.end() || it->second.cls != Stuff::Vegetation) continue;
@@ -3454,7 +3467,9 @@ public:
                 // nveg 는 5x5 에서 최대 24 이므로 계수도 그 범위에 맞춘다.
                 const float spread = cell * (0.60f + 0.045f * static_cast<float>(nveg));
                 const float rad = std::clamp(std::min(spread, h * 0.40f), 0.35f, 2.5f);
-                treeModel(foot, h, rad, up, orb, f, col);
+                // 여기서 바로 그리지 않고 모아 둔다. 겹치는 수관을 걸러내려면
+                // 큰 것부터 봐야 하는데, cols 의 순회 순서는 해시 순서다.
+                trees.push_back({foot, h, rad});
                 continue;
             }
             if (c.cls == Stuff::Pole) {
@@ -3464,6 +3479,67 @@ public:
                 solidBox(mid, (g.a * pw).cast<double>(), hup,
                          (g.b * pw).cast<double>(), orb, f, col, 1.0);
                 continue;
+            }
+        }
+
+        // **겹치는 수관은 하나만 남긴다.**
+        //
+        // 5x5 군집 대표만 세워도 가로수가 빽빽한 구간에서는 수관 반지름이
+        // 간격보다 커서 이웃끼리 파고든다. 채워진 수관이면 서로 가려 티가
+        // 안 나지만, 선으로 그리면 **모든 선이 다 보인다** - 나무 수십 그루의
+        // 격자가 겹쳐 화면 절반이 초록 그물이 된다.
+        //
+        // 큰 것부터 세우고, 이미 선 수관 안으로 들어오는 자리는 건너뛴다.
+        // 차량에 쓴 것과 같은 규칙이다 - 한 자리에 하나만 보이게 한다.
+        // **겹침은 월드가 아니라 화면에서 판정한다.**
+        //
+        // 처음에는 월드 좌표로 걸렀는데 아무 것도 걸러지지 않았다. 5x5 군집
+        // 대표만 세우므로 나무는 이미 5 m 씩 떨어져 있고 수관 반지름은 2.5 m
+        // 라, 세계에서는 서로 닿지도 않는다.
+        //
+        // 그런데 화면에서는 닿는다. 20 m 앞의 가로수 열은 시선 방향으로
+        // 늘어서 있어 투영하면 같은 자리에 겹쳐 보이고, 격자로 그리므로
+        // **뒤 나무의 선이 앞 나무를 통과해 다 보인다** - 수십 그루의 격자가
+        // 포개져 화면 절반이 그물이 된다. 채워 그렸다면 앞이 뒤를 가려
+        // 드러나지 않았을 문제다.
+        //
+        // 가까운 것부터 세우고, 이미 선 수관의 화면 원에 들어오는 자리는
+        // 건너뛴다. 가려질 것을 애초에 그리지 않는 것이라 잃는 것이 없다.
+        {
+            const Eigen::Matrix3d& Mv = orb.basis();
+            const Eigen::Vector3d eyev =
+                orb.center - Mv.row(2).transpose() * orb.dist;
+            struct TS { const TreeSeed* t; double z, sx, sy, sr; };
+            std::vector<TS> vis;
+            vis.reserve(trees.size());
+            for (const auto& t : trees) {
+                const Eigen::Vector3f cen = t.foot + up * (t.h * 0.58f);
+                const Eigen::Vector3d v = Mv * (cen.cast<double>() - eyev);
+                if (v.z() < 1e-3) continue;
+                vis.push_back({&t, v.z(),
+                               ppx() + f * v.x() / v.z(),
+                               ppy() - f * v.y() / v.z(),
+                               f * std::max(t.rad, t.h * 0.35f) / v.z()});
+            }
+            std::sort(vis.begin(), vis.end(),
+                      [](const TS& a, const TS& b) { return a.z < b.z; });
+
+            std::vector<const TS*> shown_t;
+            shown_t.reserve(vis.size());
+            for (const auto& c : vis) {
+                bool dup = false;
+                for (const TS* p2 : shown_t) {
+                    const double dx = c.sx - p2->sx, dy = c.sy - p2->sy;
+                    // 앞 수관의 원 안으로 60 % 넘게 들어오면 가려진다.
+                    if (dx * dx + dy * dy < 0.6 * 0.6 * p2->sr * p2->sr) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (dup) continue;
+                shown_t.push_back(&c);
+                treeModel(c.t->foot, c.t->h, c.t->rad, up, orb, f,
+                          stuffColor(Stuff::Vegetation));
             }
         }
     }
