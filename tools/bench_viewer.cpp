@@ -2988,7 +2988,14 @@ public:
             constexpr float kHouseMax = 12.0f;   // 한 채의 최대 길이
 
             auto emitHouse = [&](const std::vector<const Column*>& cs, Stuff cls) {
-                if (cs.size() < 4) return;
+                // **한 채를 세우려면 근거가 있어야 한다.**
+                //
+                // 문턱이 4 칸일 때 세운 것의 치수를 재 보니 L 2.6 m 에 h 0.5 m
+                // 짜리까지 나왔다. 4 m^2 를 보고 집이라 부른 것이고, 그런
+                // 조각이 서로 비스듬히 겹쳐 쌓이면 화면에서 집이 여러 채로
+                // 불어난 것처럼 보인다. 여섯 칸과 1.5 m 는 사람 키만 한
+                // 구조가 사방 2 m 넘게 이어졌다는 뜻이다.
+                if (cs.size() < 6) return;
                 std::vector<cv::Point2f> pp;
                 std::vector<float> tops, grounds;
                 pp.reserve(cs.size());
@@ -3016,7 +3023,7 @@ public:
                 };
                 const float h  = quant(tops, 0.7);
                 const float wg = quant(grounds, 0.5);
-                if (h <= 0.3f) return;
+                if (h < 1.5f) return;
 
                 double th = rr.angle * kPiV / 180.0;
                 if (rr.size.height > rr.size.width) th += kPiV * 0.5;
@@ -3106,30 +3113,52 @@ public:
                     (g.a * static_cast<float>(std::cos(th0))
                    + g.b * static_cast<float>(std::sin(th0))).normalized();
 
-                std::sort(cs.begin(), cs.end(),
-                          [&](const Column* x, const Column* y) {
-                              return x->rep.dot(d0) < y->rep.dot(d0);
-                          });
-
-                std::vector<const Column*> run;
-                float prev_t = cs.front()->rep.dot(d0);
-                float run_t0 = prev_t;
-                float run_h = static_cast<float>(cs.front()->top_eff + 1) * kBinH;
+                // **한 방향으로만 정렬해서 자르면 안 된다.**
+                //
+                // 모퉁이에서 덩어리는 ㄱ 자로 이어진다. 그것을 한 축으로만
+                // 줄 세우면 서로 수직인 두 팔의 칸이 번갈아 섞이고, 12 m
+                // 마디 하나가 양쪽 팔에 걸친다. 그 마디의 사각형은 두 팔을
+                // 함께 감싸므로 실제로 벽이 없는 안쪽까지 채우고, 마디마다
+                // 그런 상자가 하나씩 나와 **집이 여러 겹으로 겹쳐 쌓인다** -
+                // 실제로 그렇게 나왔다.
+                //
+                // 덩어리 자기 좌표계에서 **가로세로 둘 다** 나눈다. 얇은
+                // 벽면이면 가로줄 하나로 끝나 이전과 같고, ㄱ 자면 두 팔이
+                // 서로 다른 칸으로 떨어져 섞이지 않는다.
+                const Eigen::Vector3f n0 = up.cross(d0).normalized();
+                const auto bdiv = [](float v) {
+                    return static_cast<int>(std::floor(v / kHouseMax));
+                };
+                std::map<std::pair<int, int>, std::vector<const Column*>> bins;
                 for (const Column* c : cs) {
-                    const float t = c->rep.dot(d0);
-                    const float ch = static_cast<float>(c->top_eff + 1) * kBinH;
-                    const bool brk = (t - prev_t > 2.0f)
-                                  || (std::abs(ch - run_h) > 3.0f && run.size() >= 4)
-                                  || (t - run_t0 > kHouseMax);
-                    if (brk) {
-                        emitHouse(run, c0.cls);
-                        run.clear();
-                    }
-                    if (run.empty()) { run_h = ch; run_t0 = t; }
-                    run.push_back(c);
-                    prev_t = t;
+                    bins[{bdiv(c->rep.dot(d0)), bdiv(c->rep.dot(n0))}].push_back(c);
                 }
-                emitHouse(run, c0.cls);
+
+                for (auto& [bk, bc] : bins) {
+                    if (bc.size() < 6) continue;
+                    std::sort(bc.begin(), bc.end(),
+                              [&](const Column* x, const Column* y) {
+                                  return x->rep.dot(d0) < y->rep.dot(d0);
+                              });
+                    // 칸 안에서도 빈 자리와 지붕선 도약은 집의 경계다.
+                    std::vector<const Column*> run;
+                    float prev_t = bc.front()->rep.dot(d0);
+                    float run_h = static_cast<float>(bc.front()->top_eff + 1) * kBinH;
+                    for (const Column* c : bc) {
+                        const float t = c->rep.dot(d0);
+                        const float ch = static_cast<float>(c->top_eff + 1) * kBinH;
+                        const bool brk = (t - prev_t > 2.0f)
+                                      || (std::abs(ch - run_h) > 3.0f && run.size() >= 6);
+                        if (brk) {
+                            emitHouse(run, c0.cls);
+                            run.clear();
+                        }
+                        if (run.empty()) run_h = ch;
+                        run.push_back(c);
+                        prev_t = t;
+                    }
+                    emitHouse(run, c0.cls);
+                }
             }
         }
 
