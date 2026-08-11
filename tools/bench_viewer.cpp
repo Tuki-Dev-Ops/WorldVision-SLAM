@@ -769,6 +769,9 @@ struct Column {
     // 1 차 훑기에서 이 칸의 높이 목록이 어디에 담겼는가. 지도에 합쳐질
     // 때는 쓰이지 않는 임시 값이다.
     int hidx{-1};
+    // 이 칸을 **가장 가까이서 본 거리.** 스테레오 깊이 오차는 거리의
+    // 제곱으로 커지므로, 멀리서만 본 칸은 자리 자체가 못 미덥다.
+    float best_range{1e9f};
     // 이 칸에 속한 복셀들의 분할 라벨 표. 화소가 말해 준 것이라 기하보다
     // 훨씬 믿을 만하다 - 기하로는 아스팔트와 잔디가, 벽과 나무줄기가
     // 갈리지 않는다.
@@ -1033,6 +1036,7 @@ inline void labelScene(const std::unordered_map<std::int64_t, Splat>& cells,
         if (h > c.high) { c.high = h; c.rep = v.p; }
         c.low = std::min(c.low, h);
         ++c.n;
+        if (v.range > 0.0f) c.best_range = std::min(c.best_range, v.range);
         if (v.seg <= 18) {
             ++c.seg_votes[static_cast<int>(stuffFromCityscapes(v.seg))];
         }
@@ -1638,6 +1642,7 @@ struct HouseFit {
     Eigen::Vector3f dir{Eigen::Vector3f::UnitX()};
     Eigen::Vector3f nrm{Eigen::Vector3f::UnitZ()};
     float L{0}, W{0}, hb{0}, rise{0};
+    float rng{0};      // 이 집을 이룬 칸들의 최근접 관측 거리 중앙값
     Stuff cls{Stuff::Unknown};
 };
 
@@ -3119,12 +3124,13 @@ public:
                 // 구조가 사방 2 m 넘게 이어졌다는 뜻이다.
                 if (cs.size() < 6) return;
                 std::vector<cv::Point2f> pp;
-                std::vector<float> tops, grounds;
+                std::vector<float> tops, grounds, rngs;
                 pp.reserve(cs.size());
                 for (const Column* c : cs) {
                     pp.emplace_back(c->rep.dot(g.a), c->rep.dot(g.b));
                     tops.push_back(static_cast<float>(c->top_eff + 1) * kBinH);
                     grounds.push_back(c->ground);
+                    rngs.push_back(c->best_range);
                 }
                 const cv::RotatedRect rr = cv::minAreaRect(pp);
                 const float L = std::min(std::max(rr.size.width, rr.size.height) + cell,
@@ -3166,6 +3172,22 @@ public:
                     return;
                 }
 
+                // **멀리서만 본 것으로는 집을 세우지 않는다.**
+                //
+                // 스테레오 깊이 오차는 거리의 제곱으로 커진다. KITTI 의
+                // 기선 0.54 m, f 718.9 에 시차 오차 0.5 px 를 넣으면 20 m 에서
+                // 0.5 m, 30 m 에서 1.2 m, 40 m 에서 2.1 m 다. 30 m 를 넘으면
+                // **자리의 불확실성이 그리려는 집의 두께보다 커진다** - 그
+                // 자리에 벽이 있다는 말을 할 근거가 못 된다.
+                //
+                // 재 보니 세워지던 집의 47 % 가 25 m 안에서 한 번도 관측된 적이
+                // 없었다. 없는 곳에 건물이 서 보이던 것이 그것이다.
+                //
+                // 버리는 것이 아니라 미루는 것이다. 지도는 남으므로, 자차가
+                // 그 앞을 가까이 지나가면 그때 제대로 선다.
+                const float rng_med = quant(rngs, 0.5);
+                if (rng_med > 30.0f) return;
+
                 double th = rr.angle * kPiV / 180.0;
                 if (rr.size.height > rr.size.width) th += kPiV * 0.5;
                 const Eigen::Vector3f dir =
@@ -3190,6 +3212,7 @@ public:
                 hf.hb   = hb;
                 hf.rise = roofed ? rise : 0.0f;
                 hf.cls  = cls;
+                hf.rng  = rng_med;
                 pending.push_back(hf);
             };
 
