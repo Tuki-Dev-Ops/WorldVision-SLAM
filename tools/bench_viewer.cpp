@@ -2539,6 +2539,56 @@ public:
         return (z > 1e-3) ? f * size / z : 0.0;
     }
 
+    // 한 면을 법선에서 뽑은 밝기로 채운다. solidBox 와 같은 두 광원을 쓴다.
+    void shadedFace(const Eigen::Vector3d* q, int n, const Eigen::Vector3d& vup,
+                    const Orbit& orb, double f, const cv::Scalar& base,
+                    double fade) {
+        if (n < 3) return;
+        const Eigen::Matrix3d& M = orb.basis();
+        const Eigen::Vector3d eye = orb.center - M.row(2).transpose() * orb.dist;
+        const Eigen::Vector3d fwd = M.row(2).transpose();
+        Eigen::Vector3d nh = (q[1] - q[0]).cross(q[2] - q[0]);
+        if (nh.norm() < 1e-12) return;
+        nh.normalize();
+        if ((eye - q[0]).dot(nh) < 0.0) nh = -nh;   // 바깥은 시점이 정한다
+        const double lam = 0.26 + 0.46 * std::abs(nh.dot(fwd))
+                         + 0.28 * std::clamp(nh.dot(vup), 0.0, 1.0);
+        const double a = std::clamp(lam, 0.0, 1.0) * fade;
+        fillPoly3(q, n, orb, f,
+                  cv::Scalar(base[0] * a, base[1] * a, base[2] * a));
+    }
+
+    // **박공지붕.** 집을 집으로 읽게 하는 것은 결국 지붕이다.
+    //
+    // 꼭대기가 평평한 상자는 아무리 제자리에 잘 세워도 담벼락으로 읽힌다 -
+    // 주택가에서 눈이 "집" 을 알아보는 단서가 경사진 지붕이기 때문이다.
+    // 마루가 건물의 긴 방향으로 뻗고 처마가 양쪽으로 흘러내린다.
+    //
+    // **지붕면은 관측이 아니라 표현이다.** 차량 카메라는 길에서 벽면만 보므로
+    // 지붕을 볼 수가 없다. 그래서 경사각은 측정값이 아니고, 대신 마루 높이가
+    // **관측된 꼭대기를 넘지 않게** 묶어 둔다 - 없는 높이를 지어내지는 않는다.
+    void gableRoof(const Eigen::Vector3d& eaves_c, const Eigen::Vector3d& half_len,
+                   const Eigen::Vector3d& rise, const Eigen::Vector3d& half_w,
+                   const Orbit& orb, double f, const cv::Scalar& base,
+                   double fade) {
+        const Eigen::Vector3d vup = rise.normalized();
+        const Eigen::Vector3d e00 = eaves_c - half_len - half_w;
+        const Eigen::Vector3d e01 = eaves_c - half_len + half_w;
+        const Eigen::Vector3d e10 = eaves_c + half_len - half_w;
+        const Eigen::Vector3d e11 = eaves_c + half_len + half_w;
+        const Eigen::Vector3d r0  = eaves_c - half_len + rise;
+        const Eigen::Vector3d r1  = eaves_c + half_len + rise;
+
+        const Eigen::Vector3d slopeA[4] = {e00, e10, r1, r0};
+        const Eigen::Vector3d slopeB[4] = {e01, e11, r1, r0};
+        const Eigen::Vector3d gable0[3] = {e00, e01, r0};
+        const Eigen::Vector3d gable1[3] = {e10, e11, r1};
+        shadedFace(slopeA, 4, vup, orb, f, base, fade);
+        shadedFace(slopeB, 4, vup, orb, f, base, fade);
+        shadedFace(gable0, 3, vup, orb, f, base, fade);
+        shadedFace(gable1, 3, vup, orb, f, base, fade);
+    }
+
     // 자동차. 차체 + 그 위에 얹힌 캐빈. 진행 방향으로 눕힌다.
     void carModel(const Eigen::Vector3d& c, const Eigen::Vector3d& size,
                   const Eigen::Vector3d& fwd, const Eigen::Vector3d& up,
@@ -2917,80 +2967,167 @@ public:
         // 칸 단위로 넘긴다 - 억지로 한 장으로 펴면 없는 벽이 생긴다.
         std::unordered_set<std::int64_t> merged;
         if (walls) {
-            // **그리는 것의 크기에 상한이 있어야 한다.**
+            // **집 한 채를 세운다.**
             //
-            // 앞선 판은 이어진 칸 덩어리마다 minAreaRect 를 하나 씌워 통째로
-            // 세웠다. 그런데 실제 지도에서 길 한쪽 건물은 담장과 생울타리로
-            // 전부 이어져 **한 덩어리** 다. 그래서 100 m x 14 m 짜리 판
-            // 하나가 시야를 덮었고, 코너에서 L 자로 이어지면 그 사각형이
-            // 꺾인 두 변을 다 감싸 카메라에 보이는 것과 전혀 다른 그림이
-            // 되었다 - 차량이 돌 때 특히 심했던 것이 그것이다.
+            // 3 m 블록으로 자르는 판은 크기가 절대 번지지 않아 안전했지만,
+            // 집이 집으로 보이지는 않았다 - 꼭대기가 평평한 블록이 늘어선
+            // 것은 담벼락이지 주택가가 아니다.
             //
-            // 잘못은 사각형을 씌운 데 있지 않고 **크기에 상한이 없던 데**
-            // 있다. 관측이 뒷받침하는 범위는 국소적인데 한 번의 맞춤이
-            // 지도 전체로 번질 수 있었다.
+            // 그 앞에는 이어진 덩어리마다 사각형 하나를 씌웠고, 그것은 길
+            // 한쪽 건물이 담장으로 전부 이어져 100 m 짜리 판이 되었다.
+            // 잘못은 사각형이 아니라 **길이에 상한이 없던 것** 이었다.
             //
-            // 그래서 3 m 블록으로 자른다. 블록 하나는 격자칸 아홉 개를
-            // 묶으므로 칸 사이의 빈틈은 안에서 메워지고 (말뚝 울타리가
-            // 사라진다), 블록 밖으로는 절대 번지지 않는다 (없는 벽이
-            // 생기지 않는다). 무엇을 그리든 3 m 를 넘지 않는다.
-            const float S = cell * 3.0f;
-            const auto sdiv = [](int v) { return (v >= 0) ? v / 3 : -((-v + 2) / 3); };
+            // 그래서 둘을 합친다: 덩어리의 방향을 잡고, 그 방향을 따라
+            // 걸으며 (가) 2 m 넘게 비거나 (나) 지붕선이 3 m 넘게 뛰거나
+            // (다) 한 채가 12 m 를 넘으려 하면 끊는다. (가)와 (나)는 집과
+            // 집의 경계이고, (다)는 그 둘이 다 없을 때도 번지지 않게 하는
+            // 마지막 빗장이다. 끊긴 마디마다 제 사각형을 다시 맞추므로
+            // 굽은 길도 따라간다.
+            constexpr float kHouseMax = 12.0f;   // 한 채의 최대 길이
 
-            struct Blk {
-                std::vector<float> tops, gnds;
-                Eigen::Vector3f psum{Eigen::Vector3f::Zero()};
-                int n{0};
-                Stuff cls{Stuff::Unknown};
-            };
-            std::unordered_map<std::int64_t, Blk> blocks;
-            for (const auto& [k, c] : cols) {
-                if (c.cls != Stuff::Building && c.cls != Stuff::Fence) continue;
-                if (c.top_eff < 0) continue;
-                if (r2f > 0.0f && (c.rep - egof).squaredNorm() > r2f) continue;
-                const std::int64_t bk =
-                    GroundGrid::key(sdiv(c.i), sdiv(c.j)) * 8
-                    + static_cast<std::int64_t>(c.cls);
-                Blk& b = blocks[bk];
-                b.cls = c.cls;
-                b.tops.push_back(static_cast<float>(c.top_eff + 1) * kBinH);
-                b.gnds.push_back(c.ground);
-                b.psum += c.rep;
-                ++b.n;
-                merged.insert(k);
-            }
+            auto emitHouse = [&](const std::vector<const Column*>& cs, Stuff cls) {
+                if (cs.size() < 4) return;
+                std::vector<cv::Point2f> pp;
+                std::vector<float> tops, grounds;
+                pp.reserve(cs.size());
+                for (const Column* c : cs) {
+                    pp.emplace_back(c->rep.dot(g.a), c->rep.dot(g.b));
+                    tops.push_back(static_cast<float>(c->top_eff + 1) * kBinH);
+                    grounds.push_back(c->ground);
+                }
+                const cv::RotatedRect rr = cv::minAreaRect(pp);
+                const float L = std::min(std::max(rr.size.width, rr.size.height) + cell,
+                                         kHouseMax + cell);
+                // **깊이는 본 만큼만.** 길에서 보면 벽면 한 겹뿐이라 사각형이
+                // 얇게 나온다. 집 안쪽까지 지어내지 않되, 종잇장이 되지 않을
+                // 만큼은 세운다 - 두께 0 인 벽에는 지붕을 얹을 자리가 없다.
+                const float W = std::clamp(std::min(rr.size.width, rr.size.height)
+                                           + cell, 2.2f, 12.0f);
 
-            const auto quant = [](std::vector<float>& v, double q) {
-                const std::size_t i = std::min(
-                    v.size() - 1,
-                    static_cast<std::size_t>(static_cast<double>(v.size()) * q));
-                std::nth_element(v.begin(),
-                                 v.begin() + static_cast<std::ptrdiff_t>(i), v.end());
-                return v[i];
-            };
+                const auto quant = [](std::vector<float>& v, double q) {
+                    const std::size_t i = std::min(
+                        v.size() - 1,
+                        static_cast<std::size_t>(static_cast<double>(v.size()) * q));
+                    std::nth_element(v.begin(),
+                                     v.begin() + static_cast<std::ptrdiff_t>(i), v.end());
+                    return v[i];
+                };
+                const float h  = quant(tops, 0.7);
+                const float wg = quant(grounds, 0.5);
+                if (h <= 0.3f) return;
 
-            for (auto& [bk, b] : blocks) {
-                // 아홉 칸 중 한 칸만 찬 블록은 근거가 얇다. 잡음이 한 칸에
-                // 뭉친 것을 3 m 짜리 건물로 세우지 않는다.
-                if (b.n < 2) continue;
-                const float h  = quant(b.tops, 0.7);
-                const float wg = quant(b.gnds, 0.5);
-                if (h <= 0.3f) continue;
+                double th = rr.angle * kPiV / 180.0;
+                if (rr.size.height > rr.size.width) th += kPiV * 0.5;
+                const Eigen::Vector3f dir =
+                    (g.a * static_cast<float>(std::cos(th))
+                   + g.b * static_cast<float>(std::sin(th))).normalized();
+                const Eigen::Vector3f nrm = up.cross(dir).normalized();
+                const Eigen::Vector3f foot2 = g.a * rr.center.x + g.b * rr.center.y;
 
-                // 블록 중심의 수평 위치는 그 안 칸들의 평균이다. 격자에
-                // 딱 맞추면 벽이 실제보다 최대 1.5 m 옮겨 앉는다.
-                const Eigen::Vector3f pm = b.psum / static_cast<float>(b.n);
-                const Eigen::Vector3f mid =
-                    pm + up * (wg + h * 0.5f - pm.dot(up));
+                // 담장에는 지붕이 없고, 낮은 것에도 없다 - 1 m 짜리에 박공을
+                // 얹으면 집이 아니라 개집이다.
+                const bool roofed = (cls == Stuff::Building && h >= 2.5f);
+                const float rise = roofed
+                    ? std::clamp(W * 0.30f, 0.8f, h * 0.32f) : 0.0f;
+                const float hb = h - rise;
 
-                // 밑면은 블록보다 살짝 크게. 이웃 블록과 맞닿아 벽이 이어진다.
-                const float hw = S * 0.55f;
+                const Eigen::Vector3f mid = foot2 + up * (wg + hb * 0.5f);
+                if (r2f > 0.0f && (mid - egof).squaredNorm() > r2f) return;
+
                 solidBox(mid.cast<double>(),
-                         (g.a * hw).cast<double>(),
-                         (up * (h * 0.5f)).cast<double>(),
-                         (g.b * hw).cast<double>(),
-                         orb, f, stuffColor(b.cls),
-                         (b.cls == Stuff::Fence) ? 0.92 : 1.0);
+                         (dir * (L * 0.5f)).cast<double>(),
+                         (up * (hb * 0.5f)).cast<double>(),
+                         (nrm * (W * 0.5f)).cast<double>(),
+                         orb, f, stuffColor(cls),
+                         (cls == Stuff::Fence) ? 0.92 : 1.0);
+                if (!roofed) return;
+
+                const Eigen::Matrix3d& Mv = orb.basis();
+                const Eigen::Vector3d eyev =
+                    orb.center - Mv.row(2).transpose() * orb.dist;
+                const Eigen::Vector3f eav = foot2 + up * (wg + hb);
+                gableRoof(eav.cast<double>(),
+                          (dir * (L * 0.5f)).cast<double>(),
+                          (up * rise).cast<double>(),
+                          (nrm * (W * 0.5f)).cast<double>(),
+                          orb, f, stuffColor(cls),
+                          depthFade((Mv * (eav.cast<double>() - eyev)).z()));
+            };
+
+            std::unordered_set<std::int64_t> seen;
+            std::vector<std::int64_t> stack, part;
+            for (const auto& [k0, c0] : cols) {
+                if (c0.cls != Stuff::Building && c0.cls != Stuff::Fence) continue;
+                if (c0.top_eff < 0 || seen.count(k0)) continue;
+                if (r2f > 0.0f && (c0.rep - egof).squaredNorm() > r2f) continue;
+
+                part.clear();
+                stack.assign(1, k0);
+                seen.insert(k0);
+                while (!stack.empty()) {
+                    const std::int64_t k = stack.back();
+                    stack.pop_back();
+                    const auto it = cols.find(k);
+                    if (it == cols.end()) continue;
+                    part.push_back(k);
+                    for (int di = -1; di <= 1; ++di) {
+                        for (int dj = -1; dj <= 1; ++dj) {
+                            if (di == 0 && dj == 0) continue;
+                            const std::int64_t nk =
+                                GroundGrid::key(it->second.i + di, it->second.j + dj);
+                            if (seen.count(nk)) continue;
+                            const auto nit = cols.find(nk);
+                            if (nit == cols.end()) continue;
+                            if (nit->second.cls != c0.cls) continue;
+                            if (nit->second.top_eff < 0) continue;
+                            seen.insert(nk);
+                            stack.push_back(nk);
+                        }
+                    }
+                }
+                if (part.size() < 4) continue;
+                for (const std::int64_t k : part) merged.insert(k);
+
+                std::vector<const Column*> cs;
+                cs.reserve(part.size());
+                for (const std::int64_t k : part) cs.push_back(&cols.find(k)->second);
+
+                std::vector<cv::Point2f> pp0;
+                pp0.reserve(cs.size());
+                for (const Column* c : cs) {
+                    pp0.emplace_back(c->rep.dot(g.a), c->rep.dot(g.b));
+                }
+                const cv::RotatedRect rr0 = cv::minAreaRect(pp0);
+                double th0 = rr0.angle * kPiV / 180.0;
+                if (rr0.size.height > rr0.size.width) th0 += kPiV * 0.5;
+                const Eigen::Vector3f d0 =
+                    (g.a * static_cast<float>(std::cos(th0))
+                   + g.b * static_cast<float>(std::sin(th0))).normalized();
+
+                std::sort(cs.begin(), cs.end(),
+                          [&](const Column* x, const Column* y) {
+                              return x->rep.dot(d0) < y->rep.dot(d0);
+                          });
+
+                std::vector<const Column*> run;
+                float prev_t = cs.front()->rep.dot(d0);
+                float run_t0 = prev_t;
+                float run_h = static_cast<float>(cs.front()->top_eff + 1) * kBinH;
+                for (const Column* c : cs) {
+                    const float t = c->rep.dot(d0);
+                    const float ch = static_cast<float>(c->top_eff + 1) * kBinH;
+                    const bool brk = (t - prev_t > 2.0f)
+                                  || (std::abs(ch - run_h) > 3.0f && run.size() >= 4)
+                                  || (t - run_t0 > kHouseMax);
+                    if (brk) {
+                        emitHouse(run, c0.cls);
+                        run.clear();
+                    }
+                    if (run.empty()) { run_h = ch; run_t0 = t; }
+                    run.push_back(c);
+                    prev_t = t;
+                }
+                emitHouse(run, c0.cls);
             }
         }
 
