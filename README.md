@@ -16,7 +16,7 @@
 ![pybind11](https://img.shields.io/badge/pybind11-2.11-FFD43B)
 ![ONNX Runtime](https://img.shields.io/badge/ONNX%20Runtime-1.22-005CED?logo=onnx&logoColor=white)
 ![GoogleTest](https://img.shields.io/badge/GoogleTest-236%20passing-brightgreen)
-![pytest](https://img.shields.io/badge/pytest-639%20passing-brightgreen)
+![pytest](https://img.shields.io/badge/pytest-645%20cases-brightgreen)
 
 <br>
 
@@ -104,7 +104,7 @@ WME는 다른 질문에서 출발한다. **사람은 기술자를 매칭하지 �
 
 ```
 WorldVision-SLAM/
-├── include/wme/              공개 헤더 (27)
+├── include/wme/              공개 헤더 (25)
 │   ├── core/                 SE3, Frame, Result, ThreadPool, Assignment
 │   ├── localization/         DirectAligner            ← Tier 0 (ECDA)
 │   ├── token/                TokenStore, ConstellationIndex, WorldToken
@@ -116,15 +116,18 @@ WorldVision-SLAM/
 │   │                         StereoDepth, YoloRuntime{Cv,Ort}
 │   └── confidence/           ConfidenceEngine
 │
-├── src/                      구현 (20 파일, ~17 kLOC)
+├── src/                      구현 (19 파일, 4.3 kLOC / 헤더 포함 6.7 kLOC)
 │
-├── tools/                    실행 가능한 실험 바이너리 (10)
+├── tools/                    실행 가능한 실험 바이너리 (13)
 │   ├── tum_odometry.cpp      WME 오도메트리
 │   ├── tum_baseline.cpp      ORB+PnP 대조군 ← "안 쓴다"고 선언한 바로 그것
 │   ├── kitti_convert.cpp     KITTI → TUM 배치 + StereoSGBM 깊이
 │   ├── tum_loopclose.cpp     대칭 루프 클로저 (ORB vs TCG)
 │   ├── tum_degrade.cpp       실측 깊이 기반 산란 열화
 │   ├── tum_fusion.cpp        3계층 융합 실행
+│   ├── scene_export.cpp      검출 상자 사전 내보내기
+│   ├── seg_export.cpp        SegFormer-B0 의미 분할 사전 내보내기 (ONNX)
+│   ├── bench_viewer.cpp      벤치 결과 뷰어
 │   └── …                     relocalize, tcg_density, plane_density, env_probe
 │
 ├── tests/                    C++ 테스트 (16 파일, 236 케이스)
@@ -142,12 +145,12 @@ WorldVision-SLAM/
 │   │   ├── association/ calib/ planner/
 │   │   └── yolo.py
 │   ├── bindings/             pybind11 → wme._core
-│   ├── tools/                실험·벤치 스크립트 (30)
+│   ├── tools/                실험·벤치 스크립트 (35)
 │   │   ├── bench_run.py      두 시스템 실행 + 채점 → benchmark.json
 │   │   ├── bench_report.py   → results/bench/index.html  (좌/우 비교 뷰어)
 │   │   ├── fetch_kitti.py    KITTI 내려받기 (이어받기 지원)
 │   │   └── …
-│   └── tests/                Python 테스트 (27 파일, 639 케이스)
+│   └── tests/                Python 테스트 (27 파일, 645 케이스)
 │
 ├── docs/
 │   ├── 00-manifesto.md       왜 기술자를 버리는가
@@ -242,10 +245,19 @@ cmake --build build/win
 
 ```bash
 ctest --test-dir build --output-on-failure     # C++  236 케이스
-cd python && python -m pytest -q               # Python 639 케이스
+cd python && python -m pytest -q               # Python 645 케이스
 ```
 
 Python 쪽 상당수는 **C++ ↔ numpy 차분 테스트**다. 여기가 초록이라는 것은 두 개의 독립 구현이 같은 답을 냈다는 뜻이고, 이 저장소에서 숫자를 믿는 근거는 그것뿐이다.
+
+> **초록색을 그대로 믿으면 안 된다.** 차분 테스트는 `wme._core` 확장을 빌드하지 않으면 **전부 skip 된다**. 확장 없이 돌리면 645 개 중 409 통과 / 234 skip / 2 xfail 이 나오고, 아무것도 실패하지 않았으므로 초록으로 보인다 — 실제로 그렇게 41 개가 조용히 지나간 적이 있다 ([§19](docs/06-results.md)). 그래서 skip 한 줄에 `ImportError` 원문이 남고, `WME_REQUIRE_NATIVE=1` 을 켜면 skip 자체가 사라진다 (모듈이 없으면 임포트에서 터진다).
+>
+> 다만 **지금 CI 는 그 변수를 켜지 않는다.** `linux` 워크플로가 확장을 빌드한 뒤 차분 테스트를 돌리므로 현재는 실제로 실행되지만, 확장 빌드가 조용히 실패하면 같은 함정이 다시 열린다. 로컬에서 돌릴 때는 켜 두는 편이 안전하다.
+
+```bash
+cmake -S . -B build -DWME_BUILD_PYTHON=ON && cmake --build build
+cd python && WME_REQUIRE_NATIVE=1 python -m pytest -q tests/test_differential.py   # 76 케이스
+```
 
 ### 4. 벤치마크 실행 → 좌/우 비교 뷰어
 

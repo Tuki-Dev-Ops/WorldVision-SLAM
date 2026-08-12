@@ -56,6 +56,13 @@ inline std::size_t popcountAll(const std::uint64_t* w, std::size_t words) {
 // 점수는 1e-2 규모로 움직이므로 진짜 차이는 그대로 남는다.
 inline constexpr double kScoreQuantum = 1e-12;
 
+// 같은 이유로 retrieve() 의 투표값에도 격자가 필요하다. 투표는 [0,1] 이 아니라
+// idf 합이므로 간격이 다르다: idf = log(1+n/df) 는 장소 1000 개에서도 6.9 이하고,
+// 서명 항이 수십 개, 노드 수 제곱근으로 나누므로 실제 값은 O(1)~O(1000) 이다.
+// 그 상단에서 1 ULP 는 약 2.3e-13 이니 1e-9 는 잡음을 충분히 덮고, 반대로 진짜
+// 차이(항 하나가 다르면 최소 O(0.1))보다는 여덟 자리 아래다.
+inline constexpr double kVoteQuantum = 1e-9;
+
 // 양자화한 순위 키. 격자값끼리의 비교는 전순서라 std::sort 의 strict weak
 // ordering 을 만족한다 - |a-b| < eps 식 비교는 추이적이지 않아 쓸 수 없다
 // (동치가 전이되지 않아 정렬이 미정의 동작이 된다).
@@ -64,7 +71,10 @@ inline constexpr double kScoreQuantum = 1e-12;
 // 짝수 반올림이라 정확히 절반인 값에서 std::round 와 갈린다. 두 구현이 같은
 // 답을 내야 하므로 양쪽 다 floor(x+0.5) 로 맞춘다. 점수는 [0,1] 로 clamp 되어
 // 있어 음수 처리는 고려하지 않아도 된다.
-inline double rankKey(double score) { return std::floor(score / kScoreQuantum + 0.5); }
+inline double quantise(double x, double q) { return std::floor(x / q + 0.5); }
+
+inline double rankKey(double score) { return quantise(score, kScoreQuantum); }
+inline double voteKey(double vote) { return quantise(vote, kVoteQuantum); }
 
 // Bron-Kerbosch (피벗 + 예산 제한). 최대 클리크 하나만 찾으면 되므로
 // 현재 최선보다 커질 수 없는 가지는 잘라낸다.
@@ -283,8 +293,16 @@ std::vector<std::pair<std::uint64_t, double>> ConstellationIndex::retrieve(
     // 점수만으로 정렬하면 동점 구간에 그 순서가 그대로 남고, 그 뒤의
     // top_candidates 절단이 무엇을 자를지가 해시에 달리게 된다.
     // place_id 로 타이브레이크하면 전순서가 되어 초기 순서와 무관해진다.
+    //
+    // 투표값도 격자에 올려서 비교한다. 원시 double 을 == 로 재면 queryAll 에서와
+    // 같은 이유로 타이브레이크가 발동하지 못한다 - 투표는 idf 를 순서대로 더한
+    // 합이라, 수학적으로 같은 값이어도 어떤 항들이 어떤 순서로 더해졌는지에 따라
+    // 마지막 비트가 갈린다. 그 상태로는 top_candidates 절단이 무엇을 자를지가
+    // 다시 잡음에 걸린다 (kVoteQuantum 주석 참고).
     std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
-        if (a.second != b.second) return a.second > b.second;
+        const double ka = voteKey(a.second);
+        const double kb = voteKey(b.second);
+        if (ka != kb) return ka > kb;
         return a.first < b.first;
     });
     if (ranked.size() > cfg_.top_candidates) ranked.resize(cfg_.top_candidates);

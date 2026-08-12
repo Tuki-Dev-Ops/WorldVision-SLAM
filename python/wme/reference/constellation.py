@@ -55,15 +55,31 @@ NO_RIVAL_MARGIN = 999.0
 # 윈도우가 갈렸다). 격자에 올린 뒤 비교하면 동률이 실제로 동률로 판정된다.
 SCORE_QUANTUM = 1e-12
 
+# 같은 이유로 _retrieve 의 투표값에도 격자가 필요하다. C++ 의 kVoteQuantum 과
+# 같은 값이어야 한다. 투표는 [0,1] 이 아니라 idf 합이라 간격이 다르다:
+# idf = log(1+n/df) 는 장소 1000 개에서도 6.9 이하고, 서명 항이 수십 개, 노드 수
+# 제곱근으로 나누므로 실제 값은 O(1)~O(1000) 이다. 그 상단에서 1 ULP 는 약
+# 2.3e-13 이니 1e-9 는 잡음을 덮고, 진짜 차이(항 하나가 다르면 최소 O(0.1))
+# 보다는 여덟 자리 아래다.
+VOTE_QUANTUM = 1e-9
 
-def _rank_key(score: float) -> float:
-    """양자화한 순위 키.
+
+def _quantise(x: float, q: float) -> float:
+    """양자화한 비교 키.
 
     파이썬 내장 round() 는 짝수 반올림이라 정확히 절반인 값에서 C++ std::round
     와 갈린다. 두 구현이 같은 순서를 내야 하므로 양쪽 다 floor(x+0.5) 를 쓴다.
-    점수는 [0,1] 로 clip 되어 있어 음수는 고려하지 않는다.
+    점수는 [0,1] 로 clip 되고 투표는 idf 합이라 둘 다 음수가 아니다.
     """
-    return math.floor(score / SCORE_QUANTUM + 0.5)
+    return math.floor(x / q + 0.5)
+
+
+def _rank_key(score: float) -> float:
+    return _quantise(score, SCORE_QUANTUM)
+
+
+def _vote_key(vote: float) -> float:
+    return _quantise(vote, VOTE_QUANTUM)
 
 
 @dataclass
@@ -234,7 +250,12 @@ class ConstellationIndex:
         """idf 가중 투표. 어디에나 있는 흔한 쌍은 변별력이 없다."""
         n_places = max(1, len(self._places))
         votes: dict[int, float] = {}
-        for k in set(sig):
+        # 키를 *정렬해서* 훑는다. C++ retrieve 가 unique_keys 를 sort 한 뒤
+        # 누적하므로 여기서도 같은 순서여야 한다. set 순회 순서로 더하면 같은
+        # idf 들을 다른 순서로 더하게 되고, 부동소수 덧셈은 결합법칙이 성립하지
+        # 않으므로 두 구현의 투표값이 마지막 비트에서 갈린다. 아래 격자가 그
+        # 대부분을 덮지만, 애초에 같은 순서로 더하는 편이 옳다.
+        for k in sorted(set(sig)):
             hits = self._inverted.get(k)
             if not hits:
                 continue
@@ -247,7 +268,10 @@ class ConstellationIndex:
             (pid, s / math.sqrt(len(self._places[pid].nodes)))
             for pid, s in votes.items()
         ]
-        ranked.sort(key=lambda x: (-x[1], x[0]))
+        # 투표값도 격자에 올려서 비교한다. 원시 float 로 재면 query_all 에서와
+        # 같은 이유로 타이브레이크가 발동하지 못하고, top_candidates 절단이
+        # 무엇을 자를지가 잡음에 걸린다 (VOTE_QUANTUM 주석 참고).
+        ranked.sort(key=lambda x: (-_vote_key(x[1]), x[0]))
         return ranked[: self.cfg.top_candidates]
 
     def _verify(self, query: list[Node], place: Place,
