@@ -182,6 +182,7 @@ namespace WorldVision
 
             Drive();
             if (view != View.Free) Frame();
+            Sense();
         }
 
         void Apply()
@@ -220,6 +221,41 @@ namespace WorldVision
                 Cursor.lockState = freeMode ? CursorLockMode.Locked : CursorLockMode.None;
                 Cursor.visible = !freeMode;
             }
+        }
+
+        // **지금 자차 앞에 무엇이 들어왔는가.**
+        //
+        // 부팅 로그만 흐르면 터미널이 정지 화면이다. 달리면서 시야에 물체가
+        // 들어오는 순간을 적으면, 화면의 상자가 어디서 왔는지 글로도 따라갈
+        // 수 있다 - 그림과 로그가 같은 것을 가리켜야 한다.
+        readonly HashSet<int> seenNear = new HashSet<int>();
+        float senseAt;
+
+        void Sense()
+        {
+            if (boot == null || car == null || boot.log == null) return;
+            // 매 프레임 다 훑을 이유가 없다. 물체는 초 단위로 들어온다.
+            if (Time.time - senseAt < 0.25f) return;
+            senseAt = Time.time;
+
+            var near = new HashSet<int>();
+            for (int i = 0; i < boot.detections.Count; ++i)
+            {
+                var d = boot.detections[i];
+                Vector3 v = d.center - car.position;
+                float dist = v.magnitude;
+                if (dist > 28f) continue;
+                // 뒤에 있는 것은 지나간 것이다. 진행 방향 앞쪽만 센다.
+                if (Vector3.Dot(v.normalized, car.forward) < 0.15f) continue;
+                near.Add(i);
+                if (seenNear.Contains(i)) continue;
+                boot.log.Add("track", string.Format(
+                    "{0} 진입  {1:0.0} m  {2}  관측 {3}회",
+                    d.cls, dist, d.moving ? "이동" : "정지", d.seen),
+                    LogKind.Detect);
+            }
+            seenNear.Clear();
+            foreach (var i in near) seenNear.Add(i);
         }
 
         void Drive()

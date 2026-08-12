@@ -47,6 +47,10 @@ Remove-Item (Join-Path $proj "Library\Bee") -Recurse -Force -ErrorAction Silentl
 # 프로젝트를 열고 있는 Unity 가 남아 있으면 잠금 때문에 배치 모드가 아예
 # 시작하지 않는다 - 로그 파일조차 안 생겨서 원인이 잘 안 보인다.
 Get-Process -Name Unity -ErrorAction SilentlyContinue | Stop-Process -Force
+# **돌고 있는 플레이어도 먼저 죽인다.** 그것이 WorldVision_Data 를 잡고
+# 있으면 출력 폴더 삭제가 반쪽만 되고, 그다음 빌드는 성공했다고 하면서
+# 데이터 폴더가 없는 실행 파일을 남긴다 - 실행하면 "Data folder not found".
+Get-Process -Name WorldVision -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep -Seconds 2
 
 $log = Join-Path $env:TEMP "wv_unity_build.log"
