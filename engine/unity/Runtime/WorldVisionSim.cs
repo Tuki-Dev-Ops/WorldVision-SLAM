@@ -6,64 +6,18 @@
 //
 // 달릴 자리를 지어내지 않는다. 이 시퀀스에서 차가 실제로 지나간 자리가
 // 궤적으로 들어와 있고, 그것이 곧 정답 주행이다. 속도까지 그 안에 있다.
+//
+// **이 파일에 MonoBehaviour 는 Director 하나뿐이다.** Route 와 Stats 가 여기
+// 같이 있었는데, .cs 하나에 MonoScript 는 하나뿐이라 (fileID 11500000) 셋 중
+// 둘은 씬에서 가리킬 에셋이 없었다. Director 가 그 둘 중 하나였고, 그래서
+// 씬이 저장될 때마다 guid 없는 끊긴 참조가 하나씩 들어갔다 - 그것이 빌드된
+// 실행 파일의 "level0 is corrupted / Position out of bounds" 다.
+// 자세한 것은 WorldVisionRoute.cs 의 주석 참조.
 using System.Collections.Generic;
 using UnityEngine;
 
 namespace WorldVision
 {
-    // 자차가 지나간 자리.
-    public class Route : MonoBehaviour
-    {
-        public Vector3[] points;
-
-        public float Length
-        {
-            get
-            {
-                float s = 0f;
-                if (points == null) return 0f;
-                for (int i = 0; i + 1 < points.Length; ++i)
-                    s += Vector3.Distance(points[i], points[i + 1]);
-                return s;
-            }
-        }
-
-        // 거리 s (m) 위의 자리와 진행 방향.
-        public bool Sample(float s, out Vector3 pos, out Vector3 fwd)
-        {
-            pos = Vector3.zero; fwd = Vector3.forward;
-            if (points == null || points.Length < 2) return false;
-            float acc = 0f;
-            for (int i = 0; i + 1 < points.Length; ++i)
-            {
-                float seg = Vector3.Distance(points[i], points[i + 1]);
-                if (seg < 1e-4f) continue;
-                if (acc + seg >= s)
-                {
-                    float t = (s - acc) / seg;
-                    pos = Vector3.Lerp(points[i], points[i + 1], t);
-                    fwd = (points[i + 1] - points[i]).normalized;
-                    return true;
-                }
-                acc += seg;
-            }
-            pos = points[points.Length - 1];
-            fwd = (points[points.Length - 1] - points[points.Length - 2]).normalized;
-            return true;
-        }
-    }
-
-    // 무엇이 몇 개 인식되었는가.
-    public class Stats : MonoBehaviour
-    {
-        public string sequence = "";
-        public int frame;
-        public int buildings, trees, poles, vehicles, lanes;
-        public int tRoad, tSidewalk, tGrass, tOther;
-        public float surfaceCell = 0.5f;
-        public string roadMap = "";
-    }
-
     // 뷰와 주행과 화면 표시를 한곳에서 맡는다.
     public class Director : MonoBehaviour
     {

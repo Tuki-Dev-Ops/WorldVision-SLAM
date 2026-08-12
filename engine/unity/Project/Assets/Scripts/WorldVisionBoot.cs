@@ -632,28 +632,4 @@ namespace WorldVision
 
     }
 
-    public enum LogKind { Info, Ok, Warn, Error, Detect }
-
-    // 아래쪽 터미널에 흐르는 줄들.
-    //
-    // 그림만 보여 주면 무엇을 근거로 그렸는지가 안 보인다. 인식이 일어난
-    // 순간을 글로 남기면, 화면의 상자가 어디서 왔는지 따라갈 수 있다.
-    public class Log : MonoBehaviour
-    {
-        public struct Line
-        {
-            public float t;
-            public string tag, msg;
-            public LogKind kind;
-        }
-
-        public readonly List<Line> lines = new List<Line>();
-
-        public void Add(string tag, string msg, LogKind kind)
-        {
-            lines.Add(new Line { t = Time.realtimeSinceStartup, tag = tag,
-                                 msg = msg, kind = kind });
-            if (lines.Count > 400) lines.RemoveRange(0, 100);
-        }
-    }
 }

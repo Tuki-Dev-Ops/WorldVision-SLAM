@@ -16,6 +16,11 @@ $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $importer = Join-Path $here "..\Editor\WorldVisionSceneImporter.cs"
 $player = Join-Path $here "..\Runtime\WorldVisionPlayer.cs"
 $sim = Join-Path $here "..\Runtime\WorldVisionSim.cs"
+# Route 와 Stats 는 제 파일로 갈라 두었다. .cs 하나에 MonoBehaviour 가 둘
+# 이상이면 그중 하나만 MonoScript 를 갖고, 나머지는 씬에 끊긴 참조로
+# 직렬화된다 - WorldVisionRoute.cs 의 주석 참조.
+$route = Join-Path $here "..\Runtime\WorldVisionRoute.cs"
+$stats = Join-Path $here "..\Runtime\WorldVisionStats.cs"
 $stubs = Join-Path $here "UnityStubs.cs"
 
 # Roslyn 은 Visual Studio 나 Build Tools 와 함께 온다. 없으면 .NET Framework
@@ -31,7 +36,7 @@ if (-not $csc) {
 }
 
 $out = Join-Path $env:TEMP "wv_unity_check.dll"
-& $csc /nologo /target:library /warn:4 /out:$out $stubs $importer $player $sim
+& $csc /nologo /target:library /warn:4 /out:$out $stubs $importer $player $sim $route $stats
 if ($LASTEXITCODE -ne 0) {
     Write-Error "임포터가 컴파일되지 않는다."
 }

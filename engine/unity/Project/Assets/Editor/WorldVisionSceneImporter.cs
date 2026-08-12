@@ -609,6 +609,16 @@ namespace WorldVision
                 EditorApplication.Exit(3);
                 return;
             }
+            // **붙은 스크립트가 전부 에셋으로 풀리는지 본다.**
+            //
+            // 이것이 "level0 is corrupted" 의 원인이다 - 아래 VerifySceneScripts
+            // 주석 참조. 여기서 막지 않으면 빌드는 Succeeded 를 내고 실행할 때
+            // 죽는다. 조용히 넘기지 않는다.
+            if (!VerifySceneScripts(scenePath))
+            {
+                EditorApplication.Exit(4);
+                return;
+            }
             EditorBuildSettings.scenes = new[] {
                 new EditorBuildSettingsScene(scenePath, true) };
 
@@ -624,6 +634,114 @@ namespace WorldVision
             Debug.Log(string.Format("WorldVision: 빌드 {0}  {1} 바이트  {2}",
                 sum.result, sum.totalSize, opt.locationPathName));
             EditorApplication.Exit(sum.result == BuildResult.Succeeded ? 0 : 1);
+        }
+
+        // **저장한 씬의 MonoBehaviour 가 전부 스크립트 에셋을 가리키는지 본다.**
+        //
+        // 성한 참조는 이렇게 쓰인다:
+        //
+        //     m_Script: {fileID: 11500000, guid: c5dd9132..., type: 3}
+        //
+        // guid 가 없는 것은 씬 안의 없는 오브젝트를 가리키는 끊긴 참조다:
+        //
+        //     m_Script: {fileID: 574151018}
+        //
+        // 이렇게 나오는 이유는 **한 .cs 파일이 MonoBehaviour 를 둘 이상 담고
+        // 있을 때** 다. 파일 하나에 MonoScript 는 하나뿐이라 (fileID 11500000)
+        // 나머지 클래스는 가리킬 에셋이 없다. AddComponent 는 에디터 메모리
+        // 안에서 멀쩡히 되므로 여기까지는 아무 일도 없는 것처럼 보이고, 씬을
+        // **직렬화할 때** 비로소 끊긴다.
+        //
+        // 그렇게 나온 level0 은 스크립트를 풀 수 없는 컴포넌트를 담은 채로
+        // 빌드되고, 실행하면 "level0 is corrupted / Position out of bounds" 가
+        // 된다. Unity 는 빌드 중에 "Script attached to '...' is missing or no
+        // valid script is attached" 를 로그에 남기지만 그것은 경고일 뿐이라
+        // 빌드가 멈추지 않는다 - 그래서 하루 종일 간헐적으로 보였다.
+        //
+        // 텍스트로 확인하는 이유는, 실제로 배에 실리는 것이 이 파일이기
+        // 때문이다. 메모리 상의 컴포넌트는 멀쩡하다.
+        static bool VerifySceneScripts(string scenePath)
+        {
+            string full = Path.Combine(
+                Path.GetDirectoryName(Application.dataPath) ?? ".", scenePath);
+            if (!File.Exists(full))
+            {
+                Debug.LogError("WorldVision: 씬 파일이 없다 - " + full);
+                return false;
+            }
+            string[] lines = File.ReadAllLines(full);
+
+            // fileID -> GameObject 이름. 끊긴 컴포넌트가 어느 오브젝트에
+            // 붙어 있는지 말해 주지 않으면 찾는 데 또 하루가 든다.
+            var names = new Dictionary<string, string>();
+            for (int i = 0; i < lines.Length; ++i)
+            {
+                if (lines[i] != "GameObject:") continue;
+                string id = FileIdOfBlock(lines, i);
+                if (id == null) continue;
+                for (int j = i + 1; j < lines.Length && !lines[j].StartsWith("---"); ++j)
+                {
+                    if (!lines[j].StartsWith("  m_Name: ")) continue;
+                    names[id] = lines[j].Substring(10).Trim();
+                    break;
+                }
+            }
+
+            int bad = 0;
+            for (int i = 0; i < lines.Length; ++i)
+            {
+                string t = lines[i].TrimStart();
+                if (!t.StartsWith("m_Script:")) continue;
+                if (t.Contains("guid:")) continue;
+
+                // 어느 오브젝트인가. 같은 블록 안의 m_GameObject 를 거슬러 찾는다.
+                string owner = "?";
+                for (int j = i; j >= 0 && !lines[j].StartsWith("---"); --j)
+                {
+                    string u = lines[j].TrimStart();
+                    if (!u.StartsWith("m_GameObject:")) continue;
+                    string id = Between(u, "fileID: ", "}");
+                    if (id != null && names.ContainsKey(id)) owner = names[id];
+                    break;
+                }
+                ++bad;
+                Debug.LogError(string.Format(
+                    "WorldVision: 스크립트 참조가 끊겼다 - 오브젝트 '{0}', {1} "
+                    + "({2}:{3}). 이 컴포넌트의 클래스가 제 파일을 갖고 있지 "
+                    + "않다 - .cs 하나에 MonoBehaviour 는 하나만 둔다.",
+                    owner, t, scenePath, i + 1));
+            }
+            if (bad > 0)
+            {
+                Debug.LogError(string.Format(
+                    "WorldVision: 씬에 끊긴 스크립트 {0} 개. 빌드하지 않는다 - "
+                    + "이대로 지으면 실행할 때 \"level0 is corrupted\" 로 죽는다.",
+                    bad));
+                return false;
+            }
+            Debug.Log("WorldVision: 씬의 스크립트 참조 이상 없음");
+            return true;
+        }
+
+        // "--- !u!1 &213802038" 에서 213802038 을 꺼낸다. 블록 머리는 바로
+        // 윗줄이다.
+        static string FileIdOfBlock(string[] lines, int at)
+        {
+            if (at <= 0) return null;
+            int amp = lines[at - 1].IndexOf('&');
+            if (amp < 0) return null;
+            string s = lines[at - 1].Substring(amp + 1).Trim();
+            int sp = s.IndexOf(' ');
+            return sp > 0 ? s.Substring(0, sp) : s;
+        }
+
+        static string Between(string s, string a, string b)
+        {
+            int i = s.IndexOf(a);
+            if (i < 0) return null;
+            i += a.Length;
+            int j = s.IndexOf(b, i);
+            return j < 0 ? null : s.Substring(i, j - i).Trim();
         }
 
         // 점군 셰이더는 씬에서 참조되지 않으므로 빌드에서 빠진다. 그래픽

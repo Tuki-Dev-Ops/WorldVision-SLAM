@@ -81,7 +81,20 @@ while ((Get-Process -Name Unity -ErrorAction SilentlyContinue) -and $n -lt 240) 
     Start-Sleep -Seconds 5; $n++
 }
 
-$lines = Get-Content $log -Encoding UTF8 | Select-String "WorldVision:|error CS"
+# **유니티가 하는 말도 흘린다.**
+#
+# 여기가 "WorldVision:|error CS" 만 보고 있었다. 그래서 유니티가 매 빌드마다
+# 남기던
+#
+#   Script attached to 'WorldVision' in scene 'Assets/WorldVisionSim.unity'
+#   is missing or no valid script is attached.
+#
+# 이 한 줄이 한 번도 화면에 뜨지 않았다. 그것이 바로 "level0 is corrupted" 의
+# 원인이었는데 (씬에 끊긴 스크립트 참조가 직렬화된다 - 임포터의
+# VerifySceneScripts 주석 참조) 로그 필터가 지우고 있었던 것이다. 네 번을
+# 엉뚱한 데서 찾은 까닭이 여기 있다.
+$lines = Get-Content $log -Encoding UTF8 |
+    Select-String "WorldVision:|error CS|is missing or no valid script|Script attached to|Failed to build|BuildFailedException|UnityEditor\.BuildPlayerWindow"
 $lines | ForEach-Object { Write-Output $_.Line }
 
 $exe = Join-Path $outPath "WorldVision.exe"
