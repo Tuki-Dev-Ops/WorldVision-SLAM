@@ -572,6 +572,19 @@ namespace WorldVision
 
             const string scenePath = "Assets/WorldVisionSim.unity";
             EditorSceneManager.SaveScene(EditorSceneManager.GetActiveScene(), scenePath);
+            // **저장한 씬이 에셋 데이터베이스에 들어왔는지 확인하고 짓는다.**
+            //
+            // Library 를 지우고 나면 저장 직후의 씬을 데이터베이스가 아직
+            // 모른다. 그 상태로 BuildPlayer 를 부르면 **조용히 씬 없이**
+            // 빌드된다 - 결과물에 level0 이 아예 없고, 실행하면 "level0 is
+            // corrupted" 로 죽는다. 파일이 깨진 것이 아니라 없는 것이었다.
+            AssetDatabase.Refresh();
+            if (AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(scenePath) == null)
+            {
+                Debug.LogError("WorldVision: 씬이 에셋으로 안 잡혔다 - " + scenePath);
+                EditorApplication.Exit(3);
+                return;
+            }
             EditorBuildSettings.scenes = new[] {
                 new EditorBuildSettingsScene(scenePath, true) };
 

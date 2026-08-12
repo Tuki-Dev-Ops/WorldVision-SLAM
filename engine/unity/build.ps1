@@ -63,6 +63,14 @@ $log = Join-Path $env:TEMP "wv_unity_build.log"
 $scenePath = (Resolve-Path (Join-Path $repo $Scene)).Path
 $outPath = Join-Path $repo $Out
 
+# **출력 폴더도 지우고 시작한다.**
+#
+# BuildPlayer 는 기존 폴더에 덧쓴다. 이전 빌드의 WorldVision_Data 가 남아
+# 있으면 새 level0 과 옛 sharedassets 가 섞여, 빌드는 성공하는데 실행할 때
+# "level0 is corrupted" 로 죽는다 - 이것이 하루 종일 간헐적으로 보이던
+# 현상의 마지막 조각이다. 성공한 빌드들은 전부 이 폴더를 먼저 지운 것들이었다.
+Remove-Item $outPath -Recurse -Force -ErrorAction SilentlyContinue
+
 & $Editor -batchmode -quit -projectPath $proj `
     -executeMethod WorldVision.SceneImporter.BuildSimFromCommandLine `
     -wvScene $scenePath -wvOut $outPath -logFile $log
@@ -79,6 +87,15 @@ $lines | ForEach-Object { Write-Output $_.Line }
 $exe = Join-Path $outPath "WorldVision.exe"
 if (-not (Test-Path $exe)) {
     Write-Error "빌드 실패. 로그: $log"
+    exit 1
+}
+# **씬이 실제로 들어갔는지 본다.**
+#
+# 씬 없이 빌드되어도 BuildPlayer 는 Succeeded 를 돌려준다. 그 결과물은
+# 실행할 때 "level0 is corrupted" 로 죽는데, 사실은 깨진 것이 아니라 없는
+# 것이다. 여기서 잡으면 실행해 보기 전에 안다.
+if (-not (Test-Path (Join-Path $outPath "WorldVision_Data\level0"))) {
+    Write-Error "빌드에 씬이 없다 (level0 없음). 로그: $log"
     exit 1
 }
 Write-Output "빌드 완료: $exe"

@@ -402,6 +402,7 @@ namespace UnityEditor
         public static string CreateFolder(string parent, string name) { return ""; }
         public static bool DeleteAsset(string p) { return true; }
         public static void SaveAssets() { }
+        public static void Refresh() { }
         public static T LoadAssetAtPath<T>(string p) where T : UnityEngine.Object { return null; }
     }
     public static class EditorApplication { public static void Exit(int code) { } }

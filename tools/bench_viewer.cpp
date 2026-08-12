@@ -4496,7 +4496,7 @@ inline bool exportCloud(const fs::path& path,
                         const std::unordered_map<std::int64_t, Column>& cols,
                         const Eigen::Vector3d& up_d, float cell,
                         const Eigen::Vector3f& ga, const Eigen::Vector3f& gb,
-                        std::size_t cap = 900000) {
+                        std::size_t cap = 4000000) {
     const GroundGrid g(up_d.cast<float>(), cell);
     std::ofstream f(path, std::ios::binary);
     if (!f) return false;
@@ -5311,6 +5311,10 @@ int main(int argc, char** argv) {
     // 않고 성겨진다. 260k 는 KITTI 00 에서 0.3 m -> 1.2 m 까지 두 번
     // 거칠어져, 라이다 지도라면 있어야 할 밀도가 남지 않았다.
     int cloud_cap = 900000;
+    // 복셀 한 변 (m). 작게 하면 전선·연석·나뭇가지가 살아나지만 점 수가
+    // 세제곱으로 늘고, 상한을 넘으면 coarsen 이 도로 굵게 만든다 - 둘을
+    // 같이 올려야 뜻이 있다.
+    float voxel_m = 0.3f;
     int start_cam = 0;      // 0 1인칭 / 1 3인칭 / 2 지도 / 3 항공
     // 자동차 3D 모형(OBJ). 없으면 상자 모형으로 그린다.
     std::string car_obj;
@@ -5331,6 +5335,7 @@ int main(int argc, char** argv) {
         else if (k == "--verify-tiles") verify_tiles = std::atoi(argv[i + 1]) != 0;
         else if (k == "--frame") shot_frame = std::atoi(argv[i + 1]);
         else if (k == "--cloud-cap") cloud_cap = std::atoi(argv[i + 1]);
+        else if (k == "--voxel") voxel_m = static_cast<float>(std::atof(argv[i + 1]));
         else if (k == "--dump-features") dump_feat = argv[i + 1];
         else if (k == "--all") drive_only = false;
         else if (k == "--cam") start_cam = std::atoi(argv[i + 1]);
@@ -5828,6 +5833,12 @@ int main(int argc, char** argv) {
 
             // 점군 누적. 프레임이 뒤로 가면 다시 쌓는다.
             if (kDrawCloud) {
+                // 요청한 복셀 크기를 지도에 적용한다. clear() 는 크기를
+                // 되돌리지 않으므로 (coarsen 이 키운 값을 유지해야 한다)
+                // 여기서 한 번만 맞춘다.
+                if (acc_frame[k] < 0 && acc[k].cells.empty()) {
+                    acc[k].voxel = voxel_m;
+                }
                 if (!has_memory) {
                     // 기억이 없으므로 매 프레임 지운다. 지금 프레임만 남는다.
                     acc[k].clear();
