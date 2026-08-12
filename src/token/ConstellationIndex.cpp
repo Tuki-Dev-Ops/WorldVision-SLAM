@@ -201,7 +201,13 @@ const Place* ConstellationIndex::place(std::uint64_t id) const {
 }
 
 int ConstellationIndex::distanceBin(double d) const {
-    if (d < cfg_.min_distance || d > cfg_.max_distance) return -1;
+    // isfinite 를 먼저 본다. NaN 은 모든 비교에서 거짓이라 아래 범위 검사를
+    // 그대로 통과하고, 그러면 t 가 NaN 이 되어 static_cast<int>(NaN) 에 닿는다.
+    // 그것은 미정의 동작이고, 실제로는 INT_MIN 이 나온 뒤 std::clamp 가 그것을
+    // 얌전히 0 으로 만들어 **멀쩡해 보이는 bin 0** 을 돌려준다 - 조용한 오답이다.
+    // 참조 구현은 같은 자리에서 ValueError 로 터졌으므로 두 구현이 갈리기도 했다.
+    // 범위 밖과 똑같이 -1 로 취급해 그 쌍을 서명에서 빼면 양쪽이 같아진다.
+    if (!std::isfinite(d) || d < cfg_.min_distance || d > cfg_.max_distance) return -1;
     // 로그 스케일 구간화: 근거리 정밀, 원거리 관대
     const double t = std::log(d / cfg_.min_distance) /
                      std::log(cfg_.max_distance / cfg_.min_distance);
@@ -417,6 +423,21 @@ Result<ConstellationMatch> ConstellationIndex::verify(
         chi2 += r2 / var;
     }
     const double rms = std::sqrt(sse / static_cast<double>(src.size()));
+
+    // 유한하지 않은 잔차는 여기서 끊는다.
+    //
+    // NaN 은 모든 비교에서 거짓이므로 아래 `rms > max_rms_error` 관문을 그대로
+    // 통과한다. 그러면 score 가 NaN 이 되고, 그 NaN 이 queryAll 의 정렬
+    // 비교자까지 흘러간다. 거기서 NaN 은 *어떤 값과도* 동등으로 판정되므로
+    // (NaN > x 와 x > NaN 이 둘 다 거짓) 동등관계의 추이성이 깨지고, strict
+    // weak ordering 을 요구하는 std::sort 가 미정의 동작에 빠진다.
+    //
+    // 도달 경로는 좁지만 닫혀 있지 않았다. 카이제곱 게이트는 NaN 잔차를
+    // 떨어뜨리지만(r2/(s*s) < gate 가 NaN 에서 거짓), 나머지 대응만으로
+    // min_inliers 를 채우면 통과한다. 그때도 sse 는 여전히 NaN 이다.
+    if (!std::isfinite(rms)) {
+        return {ErrorCode::DidNotConverge, "정합 잔차가 유한하지 않음"};
+    }
 
     if (rms > cfg_.max_rms_error || gated < cfg_.min_inliers) {
         return {ErrorCode::DidNotConverge, "정합 잔차 과대"};

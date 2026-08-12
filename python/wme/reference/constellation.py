@@ -199,7 +199,11 @@ class ConstellationIndex:
 
     def _distance_bin(self, d: float) -> int:
         c = self.cfg
-        if d < c.min_distance or d > c.max_distance:
+        # isfinite 를 먼저 본다. NaN 은 모든 비교에서 거짓이라 아래 범위 검사를
+        # 통과하고, 그러면 int(NaN) 이 ValueError 로 터진다. C++ 은 같은 자리에서
+        # static_cast<int>(NaN) 이라 미정의 동작이고 조용히 bin 0 을 돌려줬다.
+        # 범위 밖과 똑같이 -1 로 취급해 그 쌍을 서명에서 빼면 양쪽이 같아진다.
+        if not math.isfinite(d) or d < c.min_distance or d > c.max_distance:
             return -1
         t = math.log(d / c.min_distance) / math.log(c.max_distance / c.min_distance)
         return int(min(max(t * c.distance_bins, 0), c.distance_bins - 1))
@@ -345,6 +349,15 @@ class ConstellationIndex:
         sq = np.array([query[pairs[i][0]].sigma for i in clique])
         sp = np.array([place.nodes[pairs[i][1]].sigma for i in clique])
         gated = int(np.sum(r2 / ((sq + sp + 0.05) ** 2) < cfg.chi2_gate))
+
+        # 유한하지 않은 잔차는 여기서 끊는다. C++ verify 와 같은 자리다.
+        #
+        # NaN 은 모든 비교에서 거짓이라 아래 `rms > max_rms_error` 관문을 그대로
+        # 통과하고, 그러면 score 가 NaN 이 되어 query_all 의 정렬 키까지 흘러간다.
+        # 파이썬 sort 는 C++ 처럼 미정의 동작에 빠지지는 않지만 순서가 무의미해지고,
+        # 무엇보다 두 구현이 같은 답을 내야 하므로 같은 자리에서 같은 이유로 끊는다.
+        if not math.isfinite(rms):
+            return None
 
         if rms > cfg.max_rms_error or gated < cfg.min_inliers:
             return None
