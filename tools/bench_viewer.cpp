@@ -4584,9 +4584,37 @@ inline bool exportCloud(const fs::path& path,
         pos.push_back(w.x()); pos.push_back(w.y()); pos.push_back(w.z());
         pos.push_back(rel);
         attr.push_back(v.intensity);
-        // 클래스는 그 기둥의 라벨이다. 점마다 다시 판정하지 않는다 -
-        // 같은 기둥의 점들이 서로 다른 색이면 그것은 잡음이다.
-        attr.push_back(static_cast<std::uint8_t>(cls_i));
+        // **기둥의 라벨을 그 기둥의 모든 점에 찍으면 안 된다.**
+        //
+        // 라벨은 1 x 1 m 기둥 하나에 하나뿐인데 그 기둥에는 노면부터 나뭇가지
+        // 까지 다 들어 있다. 그대로 찍으면 도로 위를 덮은 나무가 전부 "지면"
+        // 이 된다 - kitti_04 에서 지면으로 표시된 21 만 점의 높이 중앙값이
+        // 1.6 m 였다. 지면이 1.6 m 위에 있을 수는 없다.
+        //
+        // 높이로 갈라 준다. 지면 가까이는 지면이고, 그 위는 그 기둥이
+        // 무엇이었든 기둥의 구조 클래스다. 기둥이 지면이라고 했는데 점이
+        // 높이 떠 있으면 그것은 판정할 근거가 없는 점이므로 미상으로 둔다.
+        int pcls = cls_i;
+        if (rel < 0.35f) {
+            pcls = static_cast<int>(Stuff::Ground);
+        } else if (cls_i == static_cast<int>(Stuff::Ground) ||
+                   cls_i == static_cast<int>(Stuff::Terrain)) {
+            // 기둥은 지면이라는데 점은 떠 있다. 도로 위를 덮은 나뭇가지가
+            // 대개 그렇다. **그 복셀이 자기 표를 갖고 있으므로 그것을 쓴다** -
+            // 기둥 하나에 라벨 하나라는 제약이 여기서 풀린다. 표가 없으면
+            // 그때만 미상이다.
+            pcls = static_cast<int>(Stuff::Unknown);
+            if (v.seg <= 18) {
+                const Stuff sv = stuffFromCityscapes(v.seg);
+                // **높이 뜬 점이 "도로" 일 수는 없다.** 복셀의 표가 그렇게
+                // 나와도 받지 않는다 - 나뭇가지 화소가 도로로 잘못 분류된
+                // 것이고, 그것을 받으면 지면의 중앙 높이가 0.7 m 로 뜬다.
+                if (sv != Stuff::Ground && sv != Stuff::Terrain) {
+                    pcls = static_cast<int>(sv);
+                }
+            }
+        }
+        attr.push_back(static_cast<std::uint8_t>(pcls));
         ++kept;
     }
 
