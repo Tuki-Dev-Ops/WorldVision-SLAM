@@ -325,12 +325,32 @@ KITTI 베이스라인 0.54 m 를 쓰면 참 시차 140 px 인데 범위가 128 p
 베이스라인과 존재하지 않는 시간 연속성은 어떤 코드로도 만들어지지 않는다.
 IDD-AW 는 시맨틱 분할 벤치마크이고, 그 목적에는 아무 문제가 없다. 우리 목적이 아닐 뿐이다.
 
-> 부모 계열 중 **IDD Multimodal**(16.1 GB) 은 *"stereo images from front camera at 15 fps,
+> 부모 계열 중 **IDD Multimodal** 은 *"stereo images from front camera at 15 fps,
 > GPS points at 15 Hz – latitude & longitude, and 16-channel LIDAR and OBD data"* 를 밝히고
-> 있어 유일하게 근접한다(확인). 다만 GPS 가 **위도·경도 2-DoF** 뿐이라 6-DoF 정답이
-> 아니고, 정렬 제공 여부와 캘리브 파일 동봉 여부는 **미확인**이다. 그리고 IDD Multimodal
-> 에는 악천후 라벨이 없다 — 즉 "악천후" 와 "스테레오+포즈" 가 IDD 계열 안에서 서로 다른
-> 배포본에 갈라져 있다.
+> 있어 유일하게 근접한다(확인). 뒤이어 따로 조사해 다음까지 확인했다.
+>
+> - **우측 영상은 `Multimodal - Secondary` 에만 들어 있다.** 즉 스테레오 쌍을 얻으려면
+>   `Primary`(6.5 GB, `primary/dN/leftCamImgs/`) + `Secondary`(6.6 GB, `secondary/dN/rightCamImgs/`)
+>   두 개가 필요하다. Segmentation / Detection / Lite / Temporal 배포본에는 우측 트리가
+>   아예 없다 — `leftImg8bit` 는 Cityscapes 에서 물려받은 이름일 뿐이다.
+> - **연속 주행이 맞다.** 드라이브별(`d0`, `d1`, …) 15 fps 연속 촬영이고 프레임마다
+>   `HH-MM-SS-us` 타임스탬프가 있다. Segmentation/Detection 쪽이 "교차로 근처를 더 촘촘히"
+>   비균일 표본한 낱장인 것과 대조된다. Temporal 은 ±15 프레임 토막이라 역시 안 된다.
+> - **정답은 위치 전용이다.** 공식 로컬라이제이션 벤치마크의 정답이
+>   `timestamp,latitude,longitude,altitude` 이고 제출이 `timestamp,tx,ty,tz`, 채점은 Umeyama
+>   정렬 후 평균 거리 오차다. **회전 정답이 없다.** ATE 는 잴 수 있어도 RPE 회전은 못 잰다.
+>   프레임별 GPS 는 Primary 안의 `train/val/test.csv` 에 들어 있다(열: timestamp, image_idx,
+>   latitude, longitude, altitude — altitude 는 IIIT 자신의 설명에는 없고 실제 파일에는 있다).
+> - **정렬·캘리브 파일은 여전히 미확인이다.** 공식 페이지·devkit·논문 어디에도 내부파라미터,
+>   베이스라인, 정렬 언급이 없다. 제3자 로더의 디렉터리 트리에도 `calib*` 가 없고 로더
+>   소스가 캘리브를 전혀 읽지 않는다. **정렬은 우리가 해야 한다고 가정하고 계획해야 한다.**
+> - **IDD-3D 는 배제다.** 논문 전문에 `stereo` 라는 단어가 없고 `GPS`/`IMU`/`odometry`/
+>   `ego-pose` 도 나오지 않는다. 6대 카메라는 서라운드 리그이지 정렬된 스테레오 쌍이라는
+>   근거가 없다. 게다가 150 개 × 10 초 클립이라 오도메트리 평가에 쓰기 어렵다. 공식 툴킷은
+>   아직 "coming soon" 상태라 236 GiB 를 받기 전에는 파일 구조조차 확인할 수 없다.
+>
+> 그리고 IDD Multimodal 에는 악천후 라벨이 없다 — 즉 "악천후" 와 "스테레오+포즈" 가
+> IDD 계열 안에서 서로 다른 배포본에 갈라져 있다는 결론은 그대로다.
 
 ### 2.4 WADS — Winter Adverse Driving dataSet (Michigan Tech)
 
@@ -763,6 +783,15 @@ darkness / motion_blur 계수는 §23 이 부분적으로 만질 수 있었지�
    수 있는지 미확인.
 10. **IDD-AW 데이터셋 라이선스.** 명시 문구를 찾지 못했다.
 11. **IDD Multimodal 의 정렬 제공 여부와 캘리브 파일 동봉 여부.** 다운로드 없이 확인 불가.
+    공식 페이지·devkit·논문·제3자 로더 어디에도 근거가 없다는 것까지는 확인했다 —
+    없다는 증거는 아니지만, 있다는 증거도 없다. `mobility@research.iiit.ac.in` 에
+    물으면 다운로드 없이 해소된다.
+11b. **IDD Multimodal 의 드라이브 수와 총 프레임 수.** 13 GB JPEG @15 fps 면 수만 장이라는
+    추정만 가능하다. 챌린지 페이지의 "20000 프레임 이상" 문구는 원문에서 확인하지 못했다.
+11c. **IDD-3D 배포본에 자차 포즈/GNSS 스트림이 들어 있는지.** 논문에는 없지만 원본
+    rosbag 을 보존한다고 했으므로 `/tf` 나 GNSS 토픽이 있을 수 있다. 236 GiB 를 받거나
+    저자에게 묻는 것 외에 확인할 방법이 없다. 다만 스테레오가 없으므로 포즈가 있어도
+    이 파이프라인에는 들어오지 못한다.
 12. **악천후에서 SGBM 의 `valid_ratio`.** 아무도 모른다. 이 문서의 작업량 산정에서
     가장 큰 미지수이며, 데이터를 받기 전에는 알 수 없다.
 13. **`raw` CADC 의 실제 프레임 레이트가 전 시퀀스에서 10 Hz 로 유지되는지.** 논문은
