@@ -4527,9 +4527,11 @@ inline bool exportCloud(const fs::path& path,
         // 내보내기 좌표계 (오른손 +y up) 로 옮긴 뒤 원점을 뺀다. 원점을
         // 빼는 이유는 float 정밀도다 - 수 km 를 달린 뒤 좌표가 커지면
         // 0.3 m 복셀이 뭉개진다.
+        // 세 번째 축의 부호를 뒤집어야 오른손계다 - exportSceneJson 의 W 와
+        // 같은 이유이고, 같지 않으면 점군만 뒤집혀 상자와 어긋난다.
         const Eigen::Vector3f w(v.p.dot(g.a) - org.dot(g.a),
                                 v.p.dot(g.up) - org.dot(g.up),
-                                v.p.dot(g.b) - org.dot(g.b));
+                                -(v.p.dot(g.b) - org.dot(g.b)));
         pos.push_back(w.x()); pos.push_back(w.y()); pos.push_back(w.z());
         pos.push_back(rel);
         attr.push_back(v.intensity);
@@ -4540,7 +4542,7 @@ inline bool exportCloud(const fs::path& path,
         ++kept;
     }
 
-    const Eigen::Vector3f org_w(org.dot(g.a), org.dot(g.up), org.dot(g.b));
+    const Eigen::Vector3f org_w(org.dot(g.a), org.dot(g.up), -org.dot(g.b));
     const std::uint32_t ver = 1, cnt = static_cast<std::uint32_t>(kept);
     f.write("WVPC", 4);
     f.write(reinterpret_cast<const char*>(&ver), 4);
@@ -4568,12 +4570,21 @@ inline bool exportSceneJson(const fs::path& path,
                             const std::vector<Eigen::Vector3d>& traj) {
     const GroundGrid g(up_d.cast<float>(), cell);
     const Eigen::Vector3f up = g.up;
+    // **오른손계로 내보낸다 - 세 번째 축의 부호를 뒤집어서.**
+    //
+    // GroundGrid 는 b = up x a 로 잡는다. 그러면 (a, up, b) 는 a x up = -b 라
+    // 왼손계다. 형식에는 "right-handed" 라고 적어 놓고 왼손계를 내보내고
+    // 있었으므로, z 를 뒤집어 왼손계로 바꾸는 엔진 임포터를 지나면 장면이
+    // **좌우로 뒤집혀** 나왔다 - 거울은 거리를 보존하므로 좌표 검사에서는
+    // 잡히지 않는다. 눈으로만 잡힌다.
+    //
+    // z = -b 로 두면 a x up = -b = z 가 되어 실제로 오른손계가 된다.
     const auto W = [&](const Eigen::Vector3f& p) {
-        return Eigen::Vector3f(p.dot(g.a), p.dot(up), p.dot(g.b));
+        return Eigen::Vector3f(p.dot(g.a), p.dot(up), -p.dot(g.b));
     };
     // 방향 벡터는 위치가 아니므로 원점 보정 없이 축만 바꾼다.
     const auto Wd = [&](const Eigen::Vector3f& v) {
-        return Eigen::Vector3f(v.dot(g.a), v.dot(up), v.dot(g.b));
+        return Eigen::Vector3f(v.dot(g.a), v.dot(up), -v.dot(g.b));
     };
 
     std::ofstream f(path);
@@ -4900,10 +4911,11 @@ inline bool exportScene(const fs::path& path,
     const GroundGrid g(up_d.cast<float>(), cell);
     const Eigen::Vector3f up = g.up;
 
-    // glTF 는 +y 가 위다. 이 지도의 위는 up 이므로 (a, up, b) 를 (x, y, z) 로
-    // 옮긴다. 엔진에서 장면이 눕지 않으려면 여기서 맞춰야 한다.
+    // glTF 는 +y 가 위이고 **오른손계** 다. 이 지도의 위는 up 이므로
+    // (a, up, -b) 를 (x, y, z) 로 옮긴다 - b = up x a 라 (a, up, b) 는
+    // 왼손계이고, 그대로 내면 규격을 어기는 데다 장면이 좌우로 뒤집힌다.
     const auto W = [&](const Eigen::Vector3f& p) {
-        return Eigen::Vector3f(p.dot(g.a), p.dot(up), p.dot(g.b));
+        return Eigen::Vector3f(p.dot(g.a), p.dot(up), -p.dot(g.b));
     };
 
     GlbMesh m_house, m_roof, m_tree, m_trunk, m_pole, m_road, m_car;

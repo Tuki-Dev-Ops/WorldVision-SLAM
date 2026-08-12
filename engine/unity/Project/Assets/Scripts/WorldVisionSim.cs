@@ -108,9 +108,9 @@ namespace WorldVision
         //
         // 무엇을 봤고(카메라), 무엇으로 읽었고(3D), 왜 그렇게 읽었는가
         // (터미널)가 한 화면에 있어야 한다.
-        const float kPanelW = 300f;
-        const float kTermH = 168f;
-        const float kCamW = 340f;
+        const float kPanelW = 336f;
+        const float kTermH = 176f;
+        const float kCamW = 348f;
 
         void Start()
         {
@@ -317,22 +317,45 @@ namespace WorldVision
         // ------------------------------------------------------------------
         GUIStyle st, stDim, stHead, stNum, stMono;
 
+        // 간격 체계
+        // ---------
+        // **한 줄의 높이를 글자 크기에서 정한다.** 처음에는 13 px 글자에
+        // 18 px 줄을 줬는데, 한글은 라틴 글자보다 세로로 크고 받침이 기준선
+        // 아래로 내려가서 "건물" 이 "거물" 로, "488 동" 이 "488 두" 로 잘렸다.
+        // 라틴 문자만 보고 맞춘 간격은 한글에서 틀린다.
+        //
+        // 글자 크기의 1.65 배면 받침까지 들어가고 줄 사이도 답답하지 않다.
+        const float kFont = 13f;
+        const float kRow = 22f;      // kFont * 1.65
+        const float kHeadRow = 20f;
+        const float kGap = 12f;      // 묶음 사이
+        const float kPadX = 18f;
+
         void MakeStyles()
         {
             if (st != null) return;
             st = new GUIStyle(GUI.skin.label);
-            st.fontSize = 13;
+            st.fontSize = (int)kFont;
             st.normal.textColor = new Color(0.88f, 0.92f, 0.97f);
+            // 잘라내지 않는다. 폰트 대체로 글자가 예상보다 커져도 사라지는
+            // 것보다 조금 넘치는 편이 낫다.
+            st.clipping = TextClipping.Overflow;
+            st.wordWrap = false;
+            st.padding = new RectOffset(0, 0, 2, 2);
+
             stDim = new GUIStyle(st);
             stDim.normal.textColor = new Color(0.55f, 0.62f, 0.72f);
+
             stHead = new GUIStyle(st);
-            stHead.fontSize = 11;
-            stHead.normal.textColor = new Color(0.45f, 0.72f, 0.85f);
+            stHead.fontSize = 12;
+            stHead.normal.textColor = new Color(0.42f, 0.70f, 0.84f);
+
             stNum = new GUIStyle(st);
-            stNum.fontSize = 20;
+            stNum.fontSize = 26;
             stNum.normal.textColor = new Color(0.55f, 0.92f, 0.86f);
+
             stMono = new GUIStyle(st);
-            stMono.fontSize = 11;
+            stMono.fontSize = 12;
         }
 
         void Box(Rect r) { GUI.DrawTexture(r, panelTex); }
@@ -379,21 +402,32 @@ namespace WorldVision
         void Term(Rect r)
         {
             Box(r);
-            GUI.Label(new Rect(r.x + 12, r.y + 5, 400, 16), "인식 로그", stHead);
+            var g = GUI.color;
+            GUI.color = new Color(0.20f, 0.28f, 0.38f, 0.8f);
+            GUI.DrawTexture(new Rect(r.x, r.y, r.width, 1f), barTex);
+            GUI.color = g;
+            GUI.Label(new Rect(r.x + kPadX, r.y + 6f, 400f, kHeadRow),
+                      "인식 로그", stHead);
             if (boot == null || boot.log == null) return;
             var lines = boot.log.lines;
-            int rows = (int)((r.height - 26f) / 15f);
+            // 줄 높이도 한글에 맞춘다. 12 px 글자에 15 px 줄이면 받침이 잘린다.
+            const float row = 18f;
+            int rows = (int)((r.height - 32f) / row);
             int from = Mathf.Max(0, lines.Count - rows);
-            float y = r.y + 22f;
+            float y = r.y + 30f;
             for (int i = from; i < lines.Count; ++i)
             {
                 var L = lines[i];
                 var st2 = new GUIStyle(stMono);
                 st2.normal.textColor = Kind(L.kind);
-                GUI.Label(new Rect(r.x + 12, y, r.width - 24, 15),
-                    string.Format("[{0,7:0.00}]  {1,-8}  {2}", L.t, L.tag, L.msg),
-                    st2);
-                y += 15f;
+                // 시각과 꼬리표를 고정된 자리에 놓는다. 비례 폭 글꼴이라
+                // 문자열 안에서 칸을 맞추면 줄마다 어긋난다.
+                GUI.Label(new Rect(r.x + kPadX, y, 74f, row),
+                          string.Format("{0,7:0.00}", L.t), st2);
+                GUI.Label(new Rect(r.x + kPadX + 80f, y, 68f, row), L.tag, st2);
+                GUI.Label(new Rect(r.x + kPadX + 154f, y,
+                                   r.width - kPadX - 166f, row), L.msg, st2);
+                y += row;
             }
         }
 
@@ -440,108 +474,139 @@ namespace WorldVision
             Labels();
 
             Box(new Rect(0, 0, W, H));
-            float y = 14f;
-            GUI.Label(new Rect(16, y, W, 22), "WORLDVISION—SLAM", st); y += 18f;
-            GUI.Label(new Rect(16, y, W, 20),
-                "카메라로 지은 주행 시뮬레이션", stDim); y += 26f;
+            // 패널 오른쪽에 얇은 경계선. 배경이 검은 3D 라 면만으로는 어디
+            // 까지가 패널인지 흐릿하다.
+            var gEdge = GUI.color;
+            GUI.color = new Color(0.20f, 0.28f, 0.38f, 0.8f);
+            GUI.DrawTexture(new Rect(W - 1f, 0f, 1f, H), barTex);
+            GUI.color = gEdge;
 
-            GUI.Label(new Rect(16, y, W, 16), "시퀀스", stHead); y += 16f;
+            float y = 18f;
+            GUI.Label(new Rect(kPadX, y, W - kPadX * 2f, 26f),
+                      "WORLDVISION—SLAM", st);
+            y += 24f;
+            GUI.Label(new Rect(kPadX, y, W - kPadX * 2f, kRow),
+                      "카메라로 지은 주행 시뮬레이션", stDim);
+            y += kRow;
+
+            Head(ref y, "시퀀스");
             string seq = stats != null ? stats.sequence : "—";
             int fr = stats != null ? stats.frame : 0;
-            GUI.Label(new Rect(16, y, W, 20),
-                string.Format("{0}   누적 {1} 프레임", seq, fr), st); y += 26f;
+            GUI.Label(new Rect(kPadX, y, W - kPadX * 2f, kRow),
+                string.Format("{0}   누적 {1} 프레임", seq, fr), st);
+            y += kRow;
 
-            GUI.Label(new Rect(16, y, W, 16), "주행", stHead); y += 18f;
-            GUI.Label(new Rect(16, y, W, 26), string.Format("{0:0} m", s), stNum);
-            GUI.Label(new Rect(120, y + 6, W, 20),
-                string.Format("/ {0:0} m", routeLen), stDim); y += 30f;
-            GUI.Label(new Rect(16, y, W, 20), string.Format(
-                "속도 {0:0.0} m/s  ({1:0} km/h)   {2}",
-                speed, speed * 3.6f, playing ? "재생" : "정지"), st); y += 24f;
+            Head(ref y, "주행");
+            GUI.Label(new Rect(kPadX, y, 170f, 34f),
+                      string.Format("{0:n0} m", s), stNum);
+            GUI.Label(new Rect(kPadX + 140f, y + 12f, 170f, kRow),
+                      string.Format("/ {0:n0} m", routeLen), stDim);
+            y += 38f;
+            GUI.Label(new Rect(kPadX, y, W - kPadX * 2f, kRow), string.Format(
+                "{0:0.0} m/s      {1:0} km/h      {2}",
+                speed, speed * 3.6f, playing ? "재생" : "정지"), st);
+            y += kRow + 4f;
 
-            var track = new Rect(16, y, W - 32, 5);
+            var track = new Rect(kPadX, y, W - kPadX * 2f, 6f);
             var g0 = GUI.color;
-            GUI.color = new Color(1f, 1f, 1f, 0.14f);
+            GUI.color = new Color(1f, 1f, 1f, 0.12f);
             GUI.DrawTexture(track, barTex);
             GUI.color = new Color(0.42f, 0.86f, 0.80f, 0.95f);
             GUI.DrawTexture(new Rect(track.x, track.y,
                 track.width * Mathf.Clamp01(s / routeLen), track.height), barTex);
             GUI.color = g0;
-            y += 22f;
+            y += 12f;
 
-            GUI.Label(new Rect(16, y, W, 16), "인식한 것", stHead); y += 18f;
+            Head(ref y, "인식한 것");
             if (stats != null)
             {
                 float a = stats.surfaceCell * stats.surfaceCell;
                 Row(ref y, cRoad, "도로", stats.tRoad, a, "m2");
                 Row(ref y, cSide, "인도", stats.tSidewalk, a, "m2");
                 Row(ref y, cGrass, "잔디", stats.tGrass, a, "m2");
-                Row(ref y, cLane, "차선(예측)", stats.lanes, 0f, "줄");
-                y += 6f;
+                Row(ref y, cLane, "차선 (예측)", stats.lanes, 0f, "줄");
+                y += 4f;
                 Row(ref y, cBuild, "건물", stats.buildings, 0f, "동");
                 Row(ref y, cTree, "나무", stats.trees, 0f, "그루");
                 Row(ref y, cCar, "차량", stats.vehicles, 0f, "대");
-                y += 8f;
-                if (boot != null)
-                {
-                    GUI.Label(new Rect(16, y, W, 18),
-                        string.Format("점군 {0:n0} 점", boot.cloudPoints), stDim);
-                    y += 18f;
-                    GUI.Label(new Rect(16, y, W, 18), "C  색: " +
-                        (boot.paint == Boot.Paint.Height ? "지면 위 높이"
-                         : boot.paint == Boot.Paint.Intensity ? "관측 밝기"
-                         : "분류"), st);
-                    y += 22f;
-                    // 색이 무엇을 뜻하는지 눈금으로 보인다. 색만 있고 자가
-                    // 없으면 "파란 쪽이 낮다" 는 것 말고는 읽을 수 없다.
-                    Ramp(new Rect(16, y, W - 32, 8));
-                    y += 10f;
-                    GUI.Label(new Rect(16, y, W, 16),
-                        boot.paint == Boot.Paint.Height ? "0 m                                12 m"
-                        : boot.paint == Boot.Paint.Intensity ? "어둠                                  밝음"
-                        : "지면 · 건물 · 나무 · 잔디 · 기둥", stDim);
-                    y += 22f;
-                }
+            }
+
+            if (boot != null)
+            {
+                Head(ref y, "점군 색      C 로 전환");
+                GUI.Label(new Rect(kPadX, y, W - kPadX * 2f, kRow),
+                    boot.paint == Boot.Paint.Height ? "지면 위 높이"
+                    : boot.paint == Boot.Paint.Intensity ? "관측 밝기" : "분류",
+                    st);
+                y += kRow;
+                // 색이 무엇을 뜻하는지 눈금으로 보인다. 색만 있고 자가 없으면
+                // "파란 쪽이 낮다" 는 것 말고는 읽을 수 없다.
+                Ramp(new Rect(kPadX, y, W - kPadX * 2f, 9f));
+                y += 13f;
+                var hi = new GUIStyle(stDim);
+                hi.alignment = TextAnchor.UpperRight;
+                string a0, a1;
+                if (boot.paint == Boot.Paint.Height) { a0 = "0 m"; a1 = "12 m"; }
+                else if (boot.paint == Boot.Paint.Intensity) { a0 = "어둠"; a1 = "밝음"; }
+                else { a0 = "지면"; a1 = "기둥"; }
+                GUI.Label(new Rect(kPadX, y, 140f, kRow), a0, stDim);
+                GUI.Label(new Rect(W - kPadX - 140f, y, 140f, kRow), a1, hi);
+                y += kRow;
             }
 
             // 클래스 표시/숨김. 레퍼런스의 눈 아이콘과 같은 자리다.
             if (boot != null && boot.byClass[0] != null)
             {
-                GUI.Label(new Rect(16, y, W, 16), "점군 표시  (F1~F7)", stHead);
-                y += 18f;
+                Head(ref y, "점군 표시      F1~F7");
+                var right2 = new GUIStyle(st);
+                right2.alignment = TextAnchor.UpperRight;
+                var rightDim = new GUIStyle(stDim);
+                rightDim.alignment = TextAnchor.UpperRight;
                 for (int c = 0; c < Boot.kClassN; ++c)
                 {
                     if (boot.classCount[c] == 0) continue;
                     bool on = boot.classOn[c];
-                    Swatch(18f, y, on
+                    Swatch(kPadX, y, on
                         ? (Color)Boot.Shade(Boot.Paint.Class, 0f, 230, (byte)c)
                         : new Color(0.18f, 0.20f, 0.24f));
-                    var stc = on ? st : stDim;
-                    GUI.Label(new Rect(36, y, 120, 18),
-                        "F" + (c + 1) + "  " + Boot.kClassName[c], stc);
-                    GUI.Label(new Rect(170, y, 130, 18),
-                        string.Format("{0:n0}", boot.classCount[c]), stc);
-                    y += 18f;
+                    GUI.Label(new Rect(kPadX + 20f, y, 160f, kRow),
+                        "F" + (c + 1) + "   " + Boot.kClassName[c],
+                        on ? st : stDim);
+                    GUI.Label(new Rect(W - kPadX - 130f, y, 130f, kRow),
+                        string.Format("{0:n0}", boot.classCount[c]),
+                        on ? right2 : rightDim);
+                    y += kRow;
                 }
-                y += 6f;
             }
 
-            GUI.Label(new Rect(16, y, W, 16), "성능", stHead); y += 18f;
+            Head(ref y, "성능");
             float ms = Median();
-            GUI.Label(new Rect(16, y, W, 20), string.Format(
-                "{0:0.0} ms / 프레임   {1:0} fps", ms, ms > 0f ? 1000f / ms : 0f),
-                st); y += 26f;
+            GUI.Label(new Rect(kPadX, y, W - kPadX * 2f, kRow), string.Format(
+                "{0:0.0} ms / 프레임        {1:0} fps",
+                ms, ms > 0f ? 1000f / ms : 0f), st);
+            y += kRow;
+            if (boot != null)
+            {
+                GUI.Label(new Rect(kPadX, y, W - kPadX * 2f, kRow),
+                    string.Format("점군 {0:n0} 점", boot.cloudPoints), stDim);
+                y += kRow;
+            }
 
-            GUI.Label(new Rect(16, y, W, 16), "보기", stHead); y += 18f;
-            ViewRow(ref y, View.Driver, "1  운전석");
-            ViewRow(ref y, View.Chase, "2  추적");
-            ViewRow(ref y, View.Aerial, "3  항공");
-            ViewRow(ref y, View.Free, "4  자유 (WASD·마우스)");
-            y += 10f;
-            GUI.Label(new Rect(16, y, W, 20),
-                "Space 재생/정지   ← → 위치   [ ] 속도", stDim); y += 18f;
-            GUI.Label(new Rect(16, y, W, 20),
-                "L 라벨   T 터미널   C 색   R 처음   H 표시   Q 종료", stDim);
+            Head(ref y, "보기");
+            ViewRow(ref y, View.Driver, "1    운전석");
+            ViewRow(ref y, View.Chase, "2    추적");
+            ViewRow(ref y, View.Aerial, "3    항공");
+            ViewRow(ref y, View.Free, "4    자유 · WASD 마우스");
+
+            Head(ref y, "조작");
+            GUI.Label(new Rect(kPadX, y, W - kPadX * 2f, kRow),
+                "Space   재생 · 정지", stDim); y += kRow;
+            GUI.Label(new Rect(kPadX, y, W - kPadX * 2f, kRow),
+                "← →   위치          [ ]   속도", stDim); y += kRow;
+            GUI.Label(new Rect(kPadX, y, W - kPadX * 2f, kRow),
+                "L 라벨      T 터미널      C 색", stDim); y += kRow;
+            GUI.Label(new Rect(kPadX, y, W - kPadX * 2f, kRow),
+                "R 처음      H 표시      Q 종료", stDim); y += kRow;
 
             if (showTerminal)
                 Term(new Rect(W, H - kTermH, Screen.width - W - kCamW, kTermH));
@@ -607,23 +672,37 @@ namespace WorldVision
             GUI.color = g;
         }
 
+        // 값을 오른쪽에 맞춘다. 왼쪽 정렬하면 자리수가 다른 숫자가 들쭉
+        // 날쭉해서 세로로 훑을 수가 없다.
         void Row(ref float y, Color c, string name, int n, float area, string unit)
         {
-            Swatch(18f, y, c);
-            GUI.Label(new Rect(36, y, 150, 18), name, st);
+            Swatch(kPadX, y, c);
+            GUI.Label(new Rect(kPadX + 20f, y, 150f, kRow), name, st);
             string v = area > 0f
-                ? string.Format("{0:0} {1}", n * area, unit)
-                : string.Format("{0} {1}", n, unit);
-            GUI.Label(new Rect(170, y, 130, 18), v, st);
-            y += 18f;
+                ? string.Format("{0:n0} {1}", n * area, unit)
+                : string.Format("{0:n0} {1}", n, unit);
+            var right = new GUIStyle(st);
+            right.alignment = TextAnchor.UpperRight;
+            GUI.Label(new Rect(kPanelW - kPadX - 130f, y, 130f, kRow), v, right);
+            y += kRow;
         }
 
         void ViewRow(ref float y, View v, string label)
         {
             bool on = view == v;
-            if (on) Swatch(18f, y, new Color(0.42f, 0.86f, 0.80f));
-            GUI.Label(new Rect(36, y, 260, 18), label, on ? st : stDim);
-            y += 18f;
+            if (on) Swatch(kPadX, y, new Color(0.42f, 0.86f, 0.80f));
+            GUI.Label(new Rect(kPadX + 20f, y, kPanelW - kPadX * 2f - 20f, kRow),
+                      label, on ? st : stDim);
+            y += kRow;
+        }
+
+        // 묶음 제목. 위에 여백을 두고 아래는 붙인다 - 제목이 아래 내용에
+        // 붙어야 어느 묶음의 제목인지가 보인다.
+        void Head(ref float y, string text)
+        {
+            y += kGap;
+            GUI.Label(new Rect(kPadX, y, kPanelW - kPadX * 2f, kHeadRow), text, stHead);
+            y += kHeadRow;
         }
     }
 }
