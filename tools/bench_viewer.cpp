@@ -793,15 +793,63 @@ inline const char* stuffName(Stuff s) {
 }
 
 // 클래스 색. turbo 팔레트와 섞이면 안 되므로 채도를 낮춘 고유색을 쓴다.
+//
+// **앞선 판은 적록색맹에게 클래스가 갈리지 않았다.** 색쌍마다 CIEDE2000 을
+// 재 보니 (2 색형 모의는 Viénot-Brettel-Mollon 1999) 이랬다.
+//
+//     담장 #BEB084 / 나무 #82BE6E : dE00 18.4, 2 색형에서 3.6-6.4, 명암비 1.02:1
+//     담장 / 잔디                 : 2 색형에서  9.1-11.9
+//     담장 / 기둥                 : 2 색형에서 10.0-13.6
+//     나무 / 잔디                 : 정상 시각에서도 10.5
+//     노면 #4E5C68 / 미상 #5A5A5A : 정상 시각에서도  7.7
+//
+// dE00 3.6 은 "비슷한 색" 이 아니라 같은 색이다. 게다가 담장과 나무는 밝기도
+// 1.02:1 이라 색을 못 봐도 밝기로 갈릴 여지가 없었다 - 적록색맹에게 이 화면의
+// 담장과 나무는 문자 그대로 구별되지 않는다.
+//
+// 고치는 기준은 둘이다.
+//  (1) 그려지는 클래스의 모든 쌍은 정상 / 2 색형(deut, prot) 세 가지 시각
+//      **전부** 에서 dE00 >= 11 이어야 한다. 11 은 이 화면의 값이 아니라
+//      "다른 색" 의 통상 하한이다.
+//  (2) 범례 견본은 패널 배경(#12161D) 대비 3:1 이상. WCAG 2.1 1.4.11 이
+//      비문자 그래픽에 요구하는 값이다. 앞선 판의 노면 견본은 2.64:1 로
+//      이 선 아래였다.
+//
+// 적록축(a*)은 2 색형에서 사라지므로 클래스를 가르는 축은 **밝기(L*)와
+// 청황축(b*)** 둘뿐이다. 그래서 색을 고를 때 채도가 아니라 이 둘을 벌렸다.
+// 아래 값의 실측 (dE00 정상 / deut / prot, 최소 12.8):
+//
+//     노면 #78838E  L* 54.2  b*  -7.3   패널  4.69:1
+//     건물 #6C9CC4  L* 62.5  b* -25.6   패널  6.21:1   (그대로 둔다, 아래 참조)
+//     담장 #C07800  L* 56.7  b*  63.3   패널  5.12:1
+//     나무 #6ECD5A  L* 74.6  b*  48.0   패널  9.10:1
+//     기둥 #F0C8E0  L* 84.6  b*  -6.6   패널 12.12:1
+//     잔디 #357A5E  L* 46.3  b*   8.8   패널  3.54:1
+//
+// **건물색은 건드리지 않았다.** 화면이 건물투성이로 보이는 것은 건물색이
+// 튀어서가 아니다 - 렌더된 화소를 재 보면 건물 화소의 배경 대비 중앙값은
+// 1.24-1.93:1 로 오히려 노면(1.76-2.22:1)보다 **어둡다.** 문제는 밝기가
+// 아니라 면끼리 안 갈리는 쪽이었고, 그것은 색이 아니라 음영에서 고친다
+// (solidBox 참조). 측정이 문제라고 말하지 않은 값은 그대로 둔다.
 inline cv::Scalar stuffColor(Stuff s) {
     switch (s) {                                    // BGR
-        case Stuff::Ground:     return {104,  92,  78};
+        case Stuff::Ground:     return {142, 131, 120};
         case Stuff::Building:   return {196, 156, 108};
-        case Stuff::Fence:      return {132, 176, 190};
-        case Stuff::Vegetation: return {110, 190, 130};
-        case Stuff::Pole:       return {168, 168, 214};
-        // 잔디. 수관보다 어둡고 노랗다 - 같은 초록이면 나무와 안 갈린다.
-        case Stuff::Terrain:    return { 92, 156,  96};
+        // 담장. 앞선 판의 연한 베이지는 2 색형에서 나무와 같은 색이 되었다.
+        // 주황 쪽으로 옮기고 어둡게 내려 나무와 L* 를 18 벌린다 - 색상이
+        // 무너져도 밝기가 남게 하는 것이 요점이다. Okabe-Ito 의 주황
+        // #E69F00 을 밝기만 낮춰 쓴 값이다.
+        case Stuff::Fence:      return {  0, 120, 192};
+        case Stuff::Vegetation: return { 90, 205, 110};
+        case Stuff::Pole:       return {224, 200, 240};
+        // 잔디. 앞선 주석은 "수관보다 어둡고 노랗게" 두었는데, 그 방향이
+        // 바로 담장(주황)과 겹치는 방향이었다 - 2 색형에서 잔디와 담장이
+        // dE00 9.1 까지 붙었다. 어둡게는 맞고 노랗게는 틀렸다. 수관보다
+        // 어둡되 **파란 쪽** 으로 옮기면 나무와도 담장과도 떨어진다.
+        case Stuff::Terrain:    return { 94, 122,  53};
+        // 미상은 화면에 그려지지 않고(위 루프가 건너뛴다) 범례에도 없다.
+        // 노면색과 dE00 7.7 로 붙어 있지만 둘이 같이 보이는 자리가 없으므로
+        // 그대로 둔다.
         default:                return {90, 90, 90};
     }
 }
@@ -3055,6 +3103,41 @@ public:
         const Eigen::Vector3d vup = axes[1].normalized();
         const Eigen::Vector3d fwd = M.row(2).transpose();
 
+        // **헤드라이트만으로는 주행 장면의 벽이 전부 같은 밝기가 된다.**
+        //
+        // 위 문단은 "면의 방향에서 음영을 뽑는다" 고 해 놓고, 실제로는 시선
+        // 축 하나에서만 뽑고 있었다. 주행 장면에서 가장 흔한 면은 진행
+        // 방향과 나란한 좌우 벽인데, 그 면은 n·fwd = 0 이고 n·up = 0 이라
+        // **주변광 0.26 하나만 남는다.** 왼쪽 벽도 0.26, 오른쪽 벽도 0.26,
+        // 앞뒤로 늘어선 벽도 전부 0.26 이다.
+        //
+        // 실측이 그대로 나왔다. kitti_07 1 인칭에서 건물 화소의 밝기 배율은
+        // 4 분위 [0.204, 0.307] - 건물 화소의 절반이 서로 명암비 1.23:1 안에
+        // 들어 있었다. 그 폭으로는 벽과 벽 사이 모서리가 안 보이므로, 늘어선
+        // 건물이 한 장의 파란 덩어리로 읽힌다. 화면이 "건물투성이" 로 보이는
+        // 것의 절반은 건물이 많아서가 아니라 **건물끼리 안 갈려서** 다.
+        //
+        // 그래서 시선 축에서 좌우로 45 도 튼 키/필 두 광원으로 바꾼다. 좌우로
+        // 튼 것이 요점이다 - 시선 축 위의 광원은 좌우 벽을 절대 못 가른다.
+        // 필을 반대쪽에 둔 것은 키만으로는 한쪽 벽이 통째로 주변광까지
+        // 떨어지기 때문이다 (키+필은 조명의 기본형이다).
+        //
+        // 가중치는 항공에서 지붕(n = 위 = 시선 반대)이 1.0 이 되도록 맞췄다.
+        // 앞선 판의 최댓값도 1.0 이었으므로 밝은 쪽 끝은 안 움직인다.
+        //
+        //                          앞선 판    이번 판
+        //     왼쪽 벽                0.26      0.401
+        //     오른쪽 벽              0.26      0.642
+        //     정면 벽                0.72      0.783
+        //     항공에서 본 지붕       1.00      1.00
+        //
+        // 좌우 벽 사이가 L* 로 0 -> 16.5 벌어지고, 벽의 최저 밝기가 배경
+        // 대비 1.32:1 -> 1.84:1 로 올라간다.
+        const Eigen::Vector3d ehat = -fwd;                       // 면 -> 카메라
+        const Eigen::Vector3d rt   = M.row(0).transpose();       // 화면 오른쪽
+        const Eigen::Vector3d key  = (ehat + rt).normalized();   // 오른쪽 45 도
+        const Eigen::Vector3d fil  = (ehat - rt).normalized();   // 왼쪽 45 도
+
         for (int k = 0; k < 3; ++k) {
             const double sgn = ((eye - c).dot(axes[k]) >= 0.0) ? 1.0 : -1.0;
             const Eigen::Vector3d n  = axes[k] * sgn;
@@ -3065,9 +3148,10 @@ public:
                                           fc + u1 + u2, fc - u1 + u2};
 
             const Eigen::Vector3d nh = n.normalized();
-            const double lam = 0.26                               // 주변광
-                             + 0.46 * std::abs(nh.dot(fwd))       // 헤드라이트
-                             + 0.28 * std::clamp(nh.dot(vup), 0.0, 1.0);  // 하늘
+            const double lam = 0.26                                       // 주변광
+                             + 0.54 * std::clamp(nh.dot(key), 0.0, 1.0)   // 키
+                             + 0.20 * std::clamp(nh.dot(fil), 0.0, 1.0)   // 필
+                             + 0.22 * std::clamp(nh.dot(vup), 0.0, 1.0);  // 하늘
             const double a = std::clamp(lam * bright, 0.0, 1.0) * fade;
             fillPoly3(q, 4, orb, f,
                       cv::Scalar(base[0] * a, base[1] * a, base[2] * a));
@@ -4337,6 +4421,27 @@ void label(cv::Mat& c, const std::string& s, cv::Point at, const cv::Scalar& col
         text(c, one, {x, at.y}, sc, col, 1);
         x += textW(one, sc, 1) + track;
     }
+}
+
+// label 이 실제로 차지하는 폭. **textW 로 재면 안 된다.**
+//
+// label 은 받은 글자를 대문자로 바꾸고 자간을 벌려 한 글자씩 찍는데, textW 는
+// 넘긴 문자열 그대로를 자간 없이 잰다. 두 값이 다르다는 것을 범례가 드러냈다
+// (T_MICRO, track 1 기준 실측):
+//
+//     "ground 380"       textW  46 px   실제 그려진 폭  73 px
+//     "building 675"     textW  49 px                   80 px
+//     "fence / wall 33"  textW  60 px                  100 px
+//
+// 18-40 px 이 덜 잡혔고 범례가 항목 사이에 둔 여백은 7 px 이라, 다음 항목의
+// 색 견본이 앞 항목의 숫자 위에 찍혔다 - 화면에는 "GROUND 38▉BUILDING 6▉7FENCE"
+// 처럼 개수의 끝자리와 클래스 이름 첫 글자가 가려져 나왔다.
+int labelW(const std::string& s, double sc = T_LABEL, int track = 2) {
+    int x = 0;
+    for (char ch : s) {
+        x += textW(std::string(1, static_cast<char>(std::toupper(ch))), sc, 1) + track;
+    }
+    return x;
 }
 
 void fill(cv::Mat& c, cv::Rect r, const cv::Scalar& col) {
@@ -7279,7 +7384,7 @@ int main(int argc, char** argv) {
                             const std::string t = std::string(stuffName(sc)) + " " +
                                                   std::to_string(cnt);
                             label(canvas, t, {lx + 15, vp.y + 145}, C_INK2, T_MICRO, 1);
-                            lx += 22 + textW(t, T_MICRO, 1);
+                            lx += 22 + labelW(t, T_MICRO, 1);
                         }
                     }
                 }
