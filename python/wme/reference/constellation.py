@@ -44,6 +44,27 @@ class Place:
 # 경쟁 후보가 없을 때의 pose_margin 표시값. 무한대를 CSV 로 내보내지 않는다.
 NO_RIVAL_MARGIN = 999.0
 
+# 순위용 점수 격자. C++ 의 kScoreQuantum 과 같은 값이어야 한다.
+#
+# 점수는 Kabsch 의 SVD 를 거친 rms 로 만들어지므로, 수학적으로 완전히 동률인
+# 후보들도 마지막 1 ULP 가 갈린다. 실측: 같은 방을 평행이동만 다르게 세 번 넣고
+# 질의하면 세 후보 모두 정확 정합인데 rms 가 5.567e-16 / 5.574e-16 / 6.863e-16
+# 으로 나오고 점수가 0x1.ffffffffffffap-1 대 0x1.ffffffffffff9p-1 이 된다.
+# 그 1 ULP 가 place_id 타이브레이크를 건너뛰면 순위가 반올림 잡음에 걸리고,
+# LAPACK 구현이 다른 기계에서는 다른 장소가 뽑힌다 (실제로 리눅스 CI 와
+# 윈도우가 갈렸다). 격자에 올린 뒤 비교하면 동률이 실제로 동률로 판정된다.
+SCORE_QUANTUM = 1e-12
+
+
+def _rank_key(score: float) -> float:
+    """양자화한 순위 키.
+
+    파이썬 내장 round() 는 짝수 반올림이라 정확히 절반인 값에서 C++ std::round
+    와 갈린다. 두 구현이 같은 순서를 내야 하므로 양쪽 다 floor(x+0.5) 를 쓴다.
+    점수는 [0,1] 로 clip 되어 있어 음수는 고려하지 않는다.
+    """
+    return math.floor(score / SCORE_QUANTUM + 0.5)
+
 
 @dataclass
 class Match:
@@ -426,7 +447,10 @@ class ConstellationIndex:
         # 그러면 C++ (place_id 순)과 파이썬 (투표 순)이 갈린다. query() 는
         # out[0] 을 대표로 뽑고 annotate() 는 이 순서로 군집 대표를 정하므로
         # 그 차이가 그대로 결과가 된다.
-        out.sort(key=lambda m: (-m.score, m.place_id))
+        #
+        # 점수는 격자에 올려서 비교한다. 원시 float 로 재면 SVD 반올림 잡음
+        # 1 ULP 가 타이브레이크를 건너뛰게 만든다 (SCORE_QUANTUM 주석 참고).
+        out.sort(key=lambda m: (-_rank_key(m.score), m.place_id))
         self.annotate(out)
         return out
 

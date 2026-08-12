@@ -41,6 +41,31 @@ inline std::size_t popcountAll(const std::uint64_t* w, std::size_t words) {
     return c;
 }
 
+// 순위용 점수 격자.
+//
+// 점수는 Kabsch 의 SVD 를 거친 rms 로 만들어진다. 그래서 수학적으로 완전히
+// 동률인 후보들도 마지막 1 ULP 가 갈린다. 실측: 같은 방을 평행이동만 다르게
+// 세 번 넣고 질의하면 세 후보 모두 정확 정합인데 rms 가 5.567e-16 / 5.574e-16
+// / 6.863e-16 으로 나오고 점수가 0x1.ffffffffffffap-1 대 0x1.ffffffffffff9p-1
+// 이 된다. score 를 == 로 비교하면 아래 place_id 타이브레이크가 이 1 ULP 때문에
+// 발동하지 못하고, 순위가 SVD 반올림 잡음에 걸린다 - 같은 지도를 다른 BLAS 나
+// 다른 컴파일러로 돌리면 다른 장소가 루프 클로저로 뽑힌다. 격자에 올린 뒤
+// 비교하면 그 잡음이 사라지고 동률이 실제로 동률로 판정된다.
+//
+// 간격은 점수의 물리적 분해능보다 열 자리 아래다: 인라이어 하나가 바뀌면
+// 점수는 1e-2 규모로 움직이므로 진짜 차이는 그대로 남는다.
+inline constexpr double kScoreQuantum = 1e-12;
+
+// 양자화한 순위 키. 격자값끼리의 비교는 전순서라 std::sort 의 strict weak
+// ordering 을 만족한다 - |a-b| < eps 식 비교는 추이적이지 않아 쓸 수 없다
+// (동치가 전이되지 않아 정렬이 미정의 동작이 된다).
+//
+// std::round 가 아니라 floor(x+0.5) 인 이유: 참조 구현의 파이썬 round() 는
+// 짝수 반올림이라 정확히 절반인 값에서 std::round 와 갈린다. 두 구현이 같은
+// 답을 내야 하므로 양쪽 다 floor(x+0.5) 로 맞춘다. 점수는 [0,1] 로 clamp 되어
+// 있어 음수 처리는 고려하지 않아도 된다.
+inline double rankKey(double score) { return std::floor(score / kScoreQuantum + 0.5); }
+
 // Bron-Kerbosch (피벗 + 예산 제한). 최대 클리크 하나만 찾으면 되므로
 // 현재 최선보다 커질 수 없는 가지는 잘라낸다.
 struct CliqueSolver {
@@ -512,8 +537,13 @@ std::vector<ConstellationMatch> ConstellationIndex::queryAll(
     // 여기서도 동점 타이브레이크가 필요하다. query() 는 all.front() 를 대표로
     // 뽑고 annotate() 는 이 순서로 군집 대표를 정하므로, 동점이 남으면 후보
     // 생성 순서(= retrieve 의 순서)가 결과로 새어 나간다.
+    //
+    // 점수는 격자에 올려서 비교한다. 원시 double 을 == 로 재면 SVD 반올림
+    // 잡음 1 ULP 가 타이브레이크를 건너뛰게 만든다 (kScoreQuantum 주석 참고).
     std::sort(results.begin(), results.end(), [](const auto& a, const auto& b) {
-        if (a.score != b.score) return a.score > b.score;
+        const double ka = rankKey(a.score);
+        const double kb = rankKey(b.score);
+        if (ka != kb) return ka > kb;
         return a.place_id < b.place_id;
     });
     annotate(results);
