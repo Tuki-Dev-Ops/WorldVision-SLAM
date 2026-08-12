@@ -1115,6 +1115,11 @@ inline long long g_by_seg = 0, g_by_geom = 0;
 inline long long g_both = 0, g_both_agree = 0;
 inline long long g_seg_cls[kStuffN] = {0, 0, 0, 0, 0, 0, 0};
 inline long long g_geom_cls[kStuffN] = {0, 0, 0, 0, 0, 0, 0};
+// 키 때문에 담장 표를 물린 칸의 수와, 그것들이 무엇이 되었는가. 물리기만
+// 하고 무엇이 되었는지 세지 않으면, 담장이 줄어든 것이 필터 덕분인지
+// 그냥 그 프레임에 담장이 없었던 것인지 화면에서 구분되지 않는다.
+inline long long g_fence_tall = 0;
+inline long long g_fence_tall_to[kStuffN] = {0, 0, 0, 0, 0, 0, 0};
 
 inline void labelScene(const std::unordered_map<std::int64_t, Splat>& cells,
                        const Eigen::Vector3d& up_d, float cell, float voxel,
@@ -1297,7 +1302,10 @@ inline void labelScene(const std::unordered_map<std::int64_t, Splat>& cells,
     // 기하를 물을 이유가 없고, 그런 칸이 지금은 대다수다.
     long long tensor_n = 0;
     g_by_seg = g_by_geom = g_both = g_both_agree = 0;
-    for (int ci = 0; ci < kStuffN; ++ci) { g_seg_cls[ci] = 0; g_geom_cls[ci] = 0; }
+    g_fence_tall = 0;
+    for (int ci = 0; ci < kStuffN; ++ci) {
+        g_seg_cls[ci] = 0; g_geom_cls[ci] = 0; g_fence_tall_to[ci] = 0;
+    }
     for (auto& [k, c] : fresh) {
         {
             int best = -1, bn = 0, tot = 0;
@@ -1305,10 +1313,75 @@ inline void labelScene(const std::unordered_map<std::int64_t, Splat>& cells,
                 tot += c.seg_votes[ci];
                 if (c.seg_votes[ci] > bn) { bn = c.seg_votes[ci]; best = ci; }
             }
+            // **담장은 키가 담장다워야 담장이다.**
+            //
+            // Cityscapes 의 wall(3) / fence(4) 가 kitti_04 에서는 방음벽 뒤에
+            // 선 가로수·생울타리 벽까지 통째로 덮는다. 그 라벨을 그대로 받으면
+            // 지도에 4.5 m 짜리 담장이 늘어선다.
+            //
+            // 실측 1 - 화소가 담장이라 못박은 칸의 키 (각 시퀀스를 끝까지
+            // 재생한 뒤의 누적 지도, 지면은 이 함수가 이미 잡아 둔 이웃 최저
+            // 높이의 중앙값):
+            //
+            //             n     p50   p75   p90   p95   p99   최고
+            //   kitti_00  471   1.5   2.0   3.0   3.5   5.5   10.0
+            //   kitti_05 1799   1.5   1.5   2.5   3.5   6.5    9.5
+            //   kitti_07  461   1.5   2.0   4.0   4.5   7.7    9.0
+            //   kitti_04  451   4.0   6.0   7.5   9.0  10.5   13.0
+            //
+            // 담장이 실제로 담장인 세 도시 시퀀스에서 중앙값이 1.5 m 이고
+            // 4 분의 3 이 2 m 아래다. kitti_04 는 **중앙값이 도시 시퀀스의
+            // p90 보다 높다.** 같은 라벨이 다른 것에 붙었다는 뜻이다.
+            //
+            // 상한은 세 도시 시퀀스를 합친 분포(2731 칸)의 **p90 = 3.0 m** 다.
+            // "담장이 담장인 곳에서 열에 아홉은 그대로 받아 준다" 는 뜻이고,
+            // 그 위를 잘라도 도시 쪽은 7.3 % 를 잃는 데 그친다 (kitti_04 는
+            // 63.6 %). 눈대중이 아니라 두 분포가 갈라지는 자리다.
+            //
+            // classifyColumn 의 2.5 m 와 다른 수인 것은 묻는 것이 다르기
+            // 때문이다. 저쪽은 **수직 평면 하나** 를 건물과 담장으로 가르는
+            // 선이고, 이쪽은 "담장일 수 있는 키인가" 의 상한이다.
+            //
+            // **왜 나무인가 - 다른 답을 전부 재 보고 남은 것이다.**
+            //
+            // (1) 그림을 봤다. kitti_04 의 wall/fence 화소를 RGB 에 겹쳐 보면
+            //     길가의 낮은 방음벽과 **그 뒤에 선 나무 벽이 한 덩어리로**
+            //     칠해진다. 도시 시퀀스에서 같은 라벨은 정원 담장과 울타리에
+            //     깔끔히 붙는다 - 라벨 자체가 나쁜 것이 아니라 kitti_04 에서
+            //     수목까지 번진 것이다.
+            //     기둥이 뒤의 나무를 끌어들인 것이 아니라는 것도 재 봤다:
+            //     **담장 화소 자신이** 닿는 최고 높이가 키 3 m 초과 칸에서
+            //     p50 = 4.97 m 이고, 기둥 꼭대기와의 차이는 p50 0.33 m 다.
+            //     분할기가 나무를 담장이라고 부르고 있다.
+            // (2) 기하에 물어보면 답을 못 한다. 그 287 칸의 지배 성분은
+            //     평면 120 / 선형 137 / 산포 29 로 갈리고 1 등과 2 등의 여유가
+            //     p50 0.24 다. 그대로 classifyColumn 에 넘기면 건물 143 칸이
+            //     되는데, kitti_04 는 건물이 열 몇 채뿐인 시골길이다. 이 파일이
+            //     이미 적어 둔 "벽 조각과 나무줄기는 국소 구조가 같다" 가
+            //     여기서도 그대로 성립한다.
+            // (3) 이웃에 물어봐도 못 한다. 5x5 이웃의 74 % 가 지면(도로)이고,
+            //     키 1.5 m 를 넘는 이웃이 아예 없는 칸이 287 중 182 다.
+            // (4) 같은 칸의 2 등 표는 32 % 에서만 존재한다. 다만 **도시
+            //     시퀀스에서도** 3 m 를 넘는 담장 칸 200 개의 2 등 표는
+            //     51 % 가 vegetation 이다 - 키 큰 wall/fence 라벨이 수목에
+            //     붙는 것은 kitti_04 만의 일이 아니다.
+            //
+            // 그래서 기하로 되돌리지 않고 여기서 수목으로 부른다. 근거가
+            // 그림과 두 분포에 있고, 되돌림은 재 보니 더 틀린 답을 냈다.
+            constexpr float kFenceTopMax = 3.0f;
+            const float top_m = static_cast<float>(c.top_eff + 1) * kBinH;
+            const bool tall_fence = (best > 0 && bn >= 3 && bn * 2 > tot
+                                     && best == static_cast<int>(Stuff::Fence)
+                                     && top_m > kFenceTopMax);
+            if (tall_fence) best = static_cast<int>(Stuff::Vegetation);
             if (best > 0 && bn >= 3 && bn * 2 > tot) {
                 c.cls = static_cast<Stuff>(best);
                 ++g_by_seg;
                 ++g_seg_cls[best];
+                if (tall_fence) {
+                    ++g_fence_tall;
+                    ++g_fence_tall_to[best];
+                }
                 continue;
             }
             // 분할이 답하지 못한 칸이다. 기하로 간다 - 다만 분할이 약하게나마
@@ -4504,6 +4577,45 @@ inline std::vector<LaneLine> predictLanes(
     return out;
 }
 
+// 담장 판정의 근거를 칸 단위로 그대로 쏟아 낸다.
+//
+// **문턱을 눈대중으로 정하지 않기 위한 덤프다.** 화소가 wall/fence 라고 한
+// 칸이 실제로 몇 미터인지 세어 보지 않으면, 담장의 키 상한을 몇으로 잡든
+// 그것은 지어낸 수다. --dump-features 가 구조 텐서 문턱에 대해 한 일을
+// 담장 높이에 대해 한다.
+//
+// seg_bn / seg_tot / seg_2nd 를 함께 내는 이유: 그 칸이 seg 경로로 갔는지
+// (bn >= 3 && bn*2 > tot) 를 사후에 재구성할 수 있어야 하고, 2 등이
+// 무엇이었는지를 알아야 "화소가 담장이라 한 것을 물리면 무엇이 되는가" 를
+// 물을 수 있다.
+inline bool dumpFenceStats(const fs::path& path,
+                           const std::unordered_map<std::int64_t, Column>& cols) {
+    std::ofstream o(path);
+    if (!o) return false;
+    o << "i\tj\th_m\tground\tcls\tseg_best\tseg_bn\tseg_tot\tseg_2nd\tseg_2n"
+         "\tv_ground\tv_build\tv_fence\tv_veg\tv_pole\tv_terrain"
+         "\tvert\tplanarity\tlinearity\tscatter\tcrowd\tn\tby_seg\n";
+    for (const auto& [k, c] : cols) {
+        int b1 = 0, n1 = 0, b2 = 0, n2 = 0, tot = 0;
+        for (int ci = 1; ci < kStuffN; ++ci) {
+            tot += c.seg_votes[ci];
+            if (c.seg_votes[ci] > n1) { b2 = b1; n2 = n1; b1 = ci; n1 = c.seg_votes[ci]; }
+            else if (c.seg_votes[ci] > n2) { b2 = ci; n2 = c.seg_votes[ci]; }
+        }
+        const bool by_seg = (b1 > 0 && n1 >= 3 && n1 * 2 > tot);
+        o << c.i << '\t' << c.j << '\t'
+          << static_cast<float>(c.top_eff + 1) * kBinH << '\t' << c.ground << '\t'
+          << static_cast<int>(c.cls) << '\t' << b1 << '\t' << n1 << '\t' << tot
+          << '\t' << b2 << '\t' << n2;
+        for (int ci = 1; ci < kStuffN; ++ci) o << '\t' << c.seg_votes[ci];
+        o << '\t'
+          << c.vert << '\t' << c.planarity << '\t' << c.linearity << '\t'
+          << c.scatter << '\t' << static_cast<int>(c.crowd) << '\t' << c.n
+          << '\t' << (by_seg ? 1 : 0) << '\n';
+    }
+    return static_cast<bool>(o);
+}
+
 // ---------------------------------------------------------------------------
 // 점군 — 지도를 점 그대로 내보낸다
 // ---------------------------------------------------------------------------
@@ -5025,6 +5137,21 @@ inline bool exportSceneJson(const fs::path& path,
                     }
                 }
                 std::cout << std::endl;
+                // 키 때문에 담장 표를 물린 칸. 0 이면 아무 말도 하지 않는다 -
+                // 걸린 것이 없는데 줄이 남으면 필터가 도는지 안 도는지가
+                // 화면에서 구분되지 않는다.
+                if (g_fence_tall > 0) {
+                    std::cout << "    키가 담장일 수 없어(3.0 m 초과) 담장 표를 "
+                                 "물린 칸: " << g_fence_tall << " -> ";
+                    for (int ci = 0; ci < kStuffN; ++ci) {
+                        if (g_fence_tall_to[ci]) {
+                            const char* nm = stuffName(static_cast<Stuff>(ci));
+                            std::cout << (*nm ? nm : "unknown") << " "
+                                      << g_fence_tall_to[ci] << "  ";
+                        }
+                    }
+                    std::cout << std::endl;
+                }
             }
         }
         std::cout << "  차선(예측): " << lanes.size() << " 개, 점 " << npts;
@@ -5442,6 +5569,8 @@ int main(int argc, char** argv) {
     bool autoplay = true;
     std::string shot_path;
     std::string dump_feat;
+    // 담장 높이 분포 덤프. 담장의 키 상한을 데이터에서 고르기 위한 것이다.
+    std::string dump_fence;
     // 기본은 차량 주행 시퀀스만. --all 이면 전부 싣는다.
     bool drive_only = true;
     int shot_frame = 0;
@@ -5475,6 +5604,7 @@ int main(int argc, char** argv) {
         else if (k == "--cloud-cap") cloud_cap = std::atoi(argv[i + 1]);
         else if (k == "--voxel") voxel_m = static_cast<float>(std::atof(argv[i + 1]));
         else if (k == "--dump-features") dump_feat = argv[i + 1];
+        else if (k == "--dump-fence") dump_fence = argv[i + 1];
         else if (k == "--all") drive_only = false;
         else if (k == "--cam") start_cam = std::atoi(argv[i + 1]);
         else if (k == "--car-model") car_obj = argv[i + 1];
@@ -7415,6 +7545,16 @@ int main(int argc, char** argv) {
                           << ", 상자 " << s.boxes.size()
                           << ", orbit dist " << orb.dist
                           << " pitch " << orb.pitch << "\n";
+            }
+            if (!dump_fence.empty()) {
+                // 오른쪽 패널만 낸다 - 왼쪽은 매 프레임 지도를 비우므로
+                // 누적된 기둥이 없다.
+                if (!dumpFenceStats(dump_fence, stuff[1])) {
+                    std::cerr << "담장 덤프 저장 실패: " << dump_fence << "\n";
+                    return 1;
+                }
+                std::cout << "담장 덤프: " << dump_fence << "  ("
+                          << stuff[1].size() << " 칸)\n";
             }
             if (!cv::imwrite(shot_path, canvas)) {
                 std::cerr << "스크린샷 저장 실패: " << shot_path << "\n";
