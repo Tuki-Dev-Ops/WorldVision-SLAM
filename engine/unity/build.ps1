@@ -37,6 +37,12 @@ Remove-Item (Join-Path $proj "Assets\WorldVision") -Recurse -Force -ErrorAction 
 Remove-Item (Join-Path $proj "Assets\WorldVision.meta") -Force -ErrorAction SilentlyContinue
 Remove-Item (Join-Path $proj "Assets\WorldVisionScene.unity") -Force -ErrorAction SilentlyContinue
 Remove-Item (Join-Path $proj "Assets\WorldVisionScene.unity.meta") -Force -ErrorAction SilentlyContinue
+Remove-Item (Join-Path $proj "Assets\WorldVisionSim.unity") -Force -ErrorAction SilentlyContinue
+Remove-Item (Join-Path $proj "Assets\WorldVisionSim.unity.meta") -Force -ErrorAction SilentlyContinue
+# Library 의 빌드 캐시도 함께 버린다. 남겨 두면 지운 에셋을 가리키는 항목이
+# 살아남아, 빌드는 성공하는데 실행할 때 level0 을 못 읽는 일이 생긴다.
+Remove-Item (Join-Path $proj "Library\BuildPlayerData") -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item (Join-Path $proj "Library\Bee") -Recurse -Force -ErrorAction SilentlyContinue
 
 # 프로젝트를 열고 있는 Unity 가 남아 있으면 잠금 때문에 배치 모드가 아예
 # 시작하지 않는다 - 로그 파일조차 안 생겨서 원인이 잘 안 보인다.

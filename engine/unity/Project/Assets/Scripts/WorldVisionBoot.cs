@@ -24,6 +24,14 @@ namespace WorldVision
         [NonSerialized] public Stats stats;
         [NonSerialized] public Route route;
         [NonSerialized] public List<Detection> detections = new List<Detection>();
+        [NonSerialized] public List<Lane> lanes = new List<Lane>();
+
+        // 예측한 차선 한 줄.
+        public class Lane
+        {
+            public List<Vector3> pts = new List<Vector3>();
+            public bool center;
+        }
 
         // 인식한 물체 하나. 화면에 상자와 이름표로 뜬다.
         public class Detection
@@ -195,7 +203,45 @@ namespace WorldVision
                 "도로 {0:0} m² · 인도 {1:0} m² · 잔디 {2:0} m²",
                 cnt[0] * a, cnt[1] * a, cnt[2] * a), LogKind.Ok);
 
-            stats.lanes = Arrays(text, "lanes", out e).Count > 0 ? 3 : 0;
+            ReadLanes(text);
+            stats.lanes = lanes.Count;
+            log.Add("lane", string.Format("차선 {0} 줄 (도로 구조에서 예측)",
+                lanes.Count), lanes.Count > 0 ? LogKind.Ok : LogKind.Warn);
+        }
+
+        // 차선. {"kind": ..., "points": [[x,y,z], ...]} 가 여러 개다.
+        void ReadLanes(string text)
+        {
+            int at = text.IndexOf("\"lanes\"", StringComparison.Ordinal);
+            if (at < 0) return;
+            int i = at;
+            while (true)
+            {
+                int k0 = text.IndexOf("\"kind\"", i, StringComparison.Ordinal);
+                if (k0 < 0) break;
+                var L = new Lane();
+                L.center = Str(text, "kind", k0) == "center";
+                int p0 = text.IndexOf("\"points\"", k0, StringComparison.Ordinal);
+                if (p0 < 0) break;
+                int open = text.IndexOf('[', p0);
+                int close = text.IndexOf("]]", open);
+                if (open < 0 || close < 0) break;
+                int j = open + 1;
+                while (j < close + 1)
+                {
+                    int a2 = text.IndexOf('[', j);
+                    if (a2 < 0 || a2 > close) break;
+                    int b2 = text.IndexOf(']', a2);
+                    if (b2 < 0) break;
+                    L.pts.Add(V(text.Substring(a2 + 1, b2 - a2 - 1)));
+                    j = b2 + 1;
+                }
+                if (L.pts.Count >= 2) lanes.Add(L);
+                i = close + 2;
+                int nxt = text.IndexOf("\"kind\"", i, StringComparison.Ordinal);
+                int end = text.IndexOf("],", i, StringComparison.Ordinal);
+                if (nxt < 0 || (end >= 0 && end < nxt)) break;
+            }
         }
 
         static string Between(string body, string key)

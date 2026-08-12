@@ -555,6 +555,12 @@ namespace WorldVision
             dir.car = carGo.transform;
             dir.free = body.GetComponent<Player>();
 
+            // 선 그리기는 카메라에 붙어야 OnRenderObject 가 그 카메라의
+            // 렌더 중에 불린다.
+            var lines = eye.AddComponent<Lines>();
+            lines.boot = boot;
+            lines.car = carGo.transform;
+
             PlayerSettings.companyName = "WorldVision";
             PlayerSettings.productName = "WorldVision-SLAM";
             PlayerSettings.defaultScreenWidth = 1600;

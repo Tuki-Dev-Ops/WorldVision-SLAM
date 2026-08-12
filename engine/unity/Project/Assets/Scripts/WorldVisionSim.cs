@@ -347,50 +347,31 @@ namespace WorldVision
             }
         }
 
-        // 인식한 물체에 상자와 이름표를 씌운다.
+        // 이름표만 그린다. **상자는 3D 로 간다** (WorldVisionLines).
         //
-        // 상자만 그리면 무엇인지 모르고, 이름만 띄우면 어디까지가 그것인지
-        // 모른다. 둘이 같이 있어야 라벨이다.
+        // 처음에는 여덟 꼭짓점을 감싸는 화면 사각형을 그렸는데, 비스듬히 선
+        // 차에서는 그 사각형이 차보다 훨씬 넓어 상자가 과대해 보였고 물체가
+        // 어느 쪽을 보는지도 사라졌다.
         void Labels()
         {
             if (!showLabels || boot == null || cam == null) return;
             float sy = Screen.height;
             foreach (var d in boot.detections)
             {
-                Vector3 sp = cam.WorldToScreenPoint(d.center);
-                if (sp.z <= 1f || sp.z > 70f) continue;
-                float L = Mathf.Max(d.size.x, Mathf.Max(d.size.y, d.size.z));
-                float W2 = Mathf.Max(0.4f, Mathf.Min(d.size.x, d.size.z));
                 float H2 = Mathf.Max(0.4f, d.size.y);
-                Vector3 f = d.forward.sqrMagnitude > 1e-6f
-                    ? d.forward.normalized : Vector3.forward;
-                Vector3 rgt = Vector3.Cross(Vector3.up, f).normalized;
-                float minx = 1e9f, maxx = -1e9f, miny = 1e9f, maxy = -1e9f;
-                bool ok = true;
-                for (int k = 0; k < 8; ++k)
-                {
-                    Vector3 p = d.center
-                        + f * ((k & 1) == 0 ? L * 0.5f : -L * 0.5f)
-                        + rgt * ((k & 2) == 0 ? W2 * 0.5f : -W2 * 0.5f)
-                        + Vector3.up * ((k & 4) == 0 ? H2 * 0.5f : -H2 * 0.5f);
-                    Vector3 q = cam.WorldToScreenPoint(p);
-                    if (q.z <= 0f) { ok = false; break; }
-                    minx = Mathf.Min(minx, q.x); maxx = Mathf.Max(maxx, q.x);
-                    miny = Mathf.Min(miny, q.y); maxy = Mathf.Max(maxy, q.y);
-                }
-                if (!ok) continue;
-                var r = new Rect(minx, sy - maxy, maxx - minx, maxy - miny);
-                if (r.width < 6f || r.height < 6f) continue;
-                if (r.x + r.width < kPanelW) continue;
-                if (showTerminal && r.y > sy - kTermH) continue;
-                Color c = d.moving ? new Color(0.98f, 0.55f, 0.30f)
-                                   : new Color(0.30f, 0.85f, 0.95f);
-                Outline(r, c);
+                Vector3 top = d.center + Vector3.up * (H2 * 0.5f + 0.15f);
+                Vector3 q = cam.WorldToScreenPoint(top);
+                if (q.z <= 1f || q.z > 60f) continue;
+                float x = q.x, y = sy - q.y;
+                if (x < kPanelW || x > Screen.width - 40f) continue;
+                if (showTerminal && y > sy - kTermH) continue;
+                Color c = d.moving ? new Color(0.98f, 0.60f, 0.30f)
+                                   : new Color(0.35f, 0.88f, 0.98f);
                 var lab = new GUIStyle(stMono);
                 lab.normal.textColor = c;
-                GUI.Label(new Rect(r.x, r.y - 15f, 260f, 15f),
-                    string.Format("{0}  {1:0.0}m  {2}회{3}", d.cls, sp.z,
-                                  d.seen, d.moving ? "  이동" : ""), lab);
+                GUI.Label(new Rect(x - 40f, y - 16f, 240f, 15f),
+                    string.Format("{0} {1:0.0}m {2}회{3}", d.cls, q.z,
+                                  d.seen, d.moving ? " 이동" : ""), lab);
             }
         }
 
