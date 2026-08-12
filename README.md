@@ -244,18 +244,22 @@ cmake --build build/win
 ### 3. 테스트 — 먼저 이것부터
 
 ```bash
+cmake -S . -B build -DWME_BUILD_PYTHON=ON && cmake --build build   # ← 확장까지 빌드한다
 ctest --test-dir build --output-on-failure     # C++  236 케이스
 cd python && python -m pytest -q               # Python 645 케이스
 ```
 
 Python 쪽 상당수는 **C++ ↔ numpy 차분 테스트**다. 여기가 초록이라는 것은 두 개의 독립 구현이 같은 답을 냈다는 뜻이고, 이 저장소에서 숫자를 믿는 근거는 그것뿐이다.
 
-> **초록색을 그대로 믿으면 안 된다.** 차분 테스트는 `wme._core` 확장을 빌드하지 않으면 **전부 skip 된다**. 확장 없이 돌리면 645 개 중 409 통과 / 234 skip / 2 xfail 이 나오고, 아무것도 실패하지 않았으므로 초록으로 보인다 — 실제로 그렇게 41 개가 조용히 지나간 적이 있다 ([§19](docs/06-results.md)). 그래서 skip 한 줄에 `ImportError` 원문이 남고, `WME_REQUIRE_NATIVE=1` 을 켜면 skip 자체가 사라진다 (모듈이 없으면 임포트에서 터진다).
+> **`-DWME_BUILD_PYTHON=ON` 을 빼먹으면 안 된다.** 차분 테스트는 `wme._core` 확장이 없으면 전부 skip 되고, skip 은 초록으로 보인다 — 실제로 그렇게 41 개가 조용히 지나간 적이 있다 ([§19](docs/06-results.md)).
 >
-> 다만 **지금 CI 는 그 변수를 켜지 않는다.** `linux` 워크플로가 확장을 빌드한 뒤 차분 테스트를 돌리므로 현재는 실제로 실행되지만, 확장 빌드가 조용히 실패하면 같은 함정이 다시 열린다. 로컬에서 돌릴 때는 켜 두는 편이 안전하다.
+> 그래서 지금은 **확장 없이 그냥 돌리면 조용히 초록이 되는 대신 시끄럽게 죽는다.** `wme/__init__.py` 가 `RuntimeWarning` 을 띄우고 `pyproject` 의 `filterwarnings = ["error::RuntimeWarning"]` 이 그것을 오류로 올리므로, 테스트 파일 26 개가 전부 **수집 단계에서** 실패한다 (실측: `no tests collected, 26 errors`). 확장이 없는 상태를 의도한 것이라면 `WME_NATIVE_OPTIONAL=1` 로 **선언해야** 하고, 그때 비로소 645 개 중 409 통과 / 234 skip / 2 xfail 이 나온다. 반대로 `WME_REQUIRE_NATIVE=1` 은 임포트 자체를 터뜨린다.
+>
+> CI 의 두 잡도 각각 그 계약을 명시한다. `linux` 는 차분 테스트 **직전에** `assert HAS_NATIVE` 를 두어, 확장 빌드가 조용히 실패하면 skip 이 아니라 잡이 터지게 한다. `python` 은 확장을 **일부러** 빌드하지 않는 잡이라 `WME_NATIVE_OPTIONAL=1` 을 선언한다.
+
+확장을 포함해 차분 테스트만 따로 돌릴 때:
 
 ```bash
-cmake -S . -B build -DWME_BUILD_PYTHON=ON && cmake --build build
 cd python && WME_REQUIRE_NATIVE=1 python -m pytest -q tests/test_differential.py   # 76 케이스
 ```
 
