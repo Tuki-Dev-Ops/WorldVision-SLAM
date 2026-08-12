@@ -134,6 +134,20 @@ set_target_properties(wme_kitti_convert PROPERTIES FOLDER "wme/tools")
 wme_stage_runtime_dlls(wme_kitti_convert)
 
 
+# 360° 등장방형 -> 원근 뷰 TUM 배치 변환. 파이프라인 전체가 핀홀을 가정하므로
+# 잘라내는 단계가 없으면 등장방형은 실패하지 않고 조용히 틀린다 - 이유는
+# equirect_convert.cpp 머리말 참조. numpy 오라클은
+# python/wme/reference/equirect.py, 차등 검증은 python/tools/equirect_validate.py.
+# wme_perception 은 --right(360 스테레오 리그) 경로의 StereoDepth 때문에 건다.
+add_executable(wme_equirect_convert equirect_convert.cpp)
+target_link_libraries(wme_equirect_convert PRIVATE
+    wme::wme_perception
+    opencv_imgcodecs
+    opencv_imgproc)
+set_target_properties(wme_equirect_convert PROPERTIES FOLDER "wme/tools")
+wme_stage_runtime_dlls(wme_equirect_convert)
+
+
 # 벤치마크 뷰어 (실행 파일). 왼쪽 = 고전 기술자 파이프라인, 오른쪽 = WME.
 # highgui 외에 새 의존성을 들이지 않는다. 지표는 results/bench/viewer.tsv 에서
 # 읽고 여기서 다시 계산하지 않는다 - bench_viewer.cpp 머리말 참조.

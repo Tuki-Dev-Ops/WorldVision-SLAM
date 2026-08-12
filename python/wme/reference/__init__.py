@@ -4,6 +4,16 @@ from .assignment import INFEASIBLE, solve_assignment
 from .confidence import Beliefs, ConfidenceConfig, ConfidenceEngine, to_logodds, to_probability
 from .constellation import ConstellationIndex, Config as ConstellationConfig, Match, Node, Place
 from .environment import PRESETS, Adaptation, Evidence, derive_adaptation
+from .equirect import (
+    PinholeView,
+    build_maps,
+    derive_intrinsics,
+    direction_from_equirect,
+    equirect_from_direction,
+    max_vertical_disparity_px,
+    rectifiable_yaw_limit_deg,
+    view_rotation,
+)
 from .geometry import (
     SE3,
     kabsch,
@@ -34,4 +44,9 @@ __all__ = [
     "ConstellationIndex", "ConstellationConfig", "Node", "Place", "Match",
     "ConfidenceEngine", "ConfidenceConfig", "Beliefs", "to_logodds", "to_probability",
     "Evidence", "Adaptation", "derive_adaptation", "PRESETS",
+    # 등장방형 -> 원근. render() 는 cv2 를 쓰므로 여기서 재노출하지 않는다 -
+    # 이 패키지를 import 하는 것만으로 cv2 를 요구하게 만들지 않기 위해서다.
+    "PinholeView", "derive_intrinsics", "view_rotation", "build_maps",
+    "direction_from_equirect", "equirect_from_direction",
+    "max_vertical_disparity_px", "rectifiable_yaw_limit_deg",
 ]

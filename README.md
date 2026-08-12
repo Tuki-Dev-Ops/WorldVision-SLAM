@@ -118,10 +118,11 @@ WorldVision-SLAM/
 │
 ├── src/                      구현 (19 파일, 4.3 kLOC / 헤더 포함 6.7 kLOC)
 │
-├── tools/                    실행 가능한 실험 바이너리 (13)
+├── tools/                    실행 가능한 실험 바이너리 (14)
 │   ├── tum_odometry.cpp      WME 오도메트리
 │   ├── tum_baseline.cpp      ORB+PnP 대조군 ← "안 쓴다"고 선언한 바로 그것
 │   ├── kitti_convert.cpp     KITTI → TUM 배치 + StereoSGBM 깊이
+│   ├── equirect_convert.cpp  360° 등장방형 → 원근 뷰 TUM 배치 (내부파라미터 유도)
 │   ├── tum_loopclose.cpp     대칭 루프 클로저 (ORB vs TCG)
 │   ├── tum_degrade.cpp       실측 깊이 기반 산란 열화
 │   ├── tum_fusion.cpp        3계층 융합 실행
@@ -136,7 +137,8 @@ WorldVision-SLAM/
 │   ├── wme/
 │   │   ├── reference/        ★ C++ 과 대조되는 numpy 오라클
 │   │   │                       assignment, confidence, constellation,
-│   │   │                       environment, environment_cues, geometry, tokens
+│   │   │                       environment, environment_cues, equirect,
+│   │   │                       geometry, tokens
 │   │   ├── localization/     ecda.py — DirectAligner 의 오라클
 │   │   ├── geometry/         spa.py, planes.py
 │   │   ├── eval/             ATE / RPE / Umeyama, TUM 로더  ← 채점 전담
@@ -209,6 +211,43 @@ build/win/tools/wme_kitti_convert data/kitti/dataset 00 data/kitti_00 --stride 2
 | 현재 변환·평가된 시퀀스 | 00, 04, 05, 07 |
 | 해상도 / 초점거리 / 베이스라인 | 1241×376 / 718.86 px / 0.537 m |
 | 유효 깊이 비율 (SGBM) | 67 – 74 % |
+
+### 360° 등장방형 — 잘라내지 않으면 조용히 틀린다
+
+파이프라인 전체가 **핀홀**을 가정한다. 360° 카메라의 등장방형 영상은 화소 좌표가 (경도, 위도)라 그 가정을 만족하지 않는다. 그런데 그대로 넣어도 **아무것도 실패하지 않는다** — 특징점은 잡히고 궤적도 나온다. 틀린 궤적이 나온다. 그래서 원근 뷰로 잘라내는 단계를 앞에 둔다.
+
+내부파라미터는 상수로 박지 않고 뷰 파라미터에서 **유도**한다. 영상이 화소 인덱스 −0.5 … *W*−0.5, 즉 폭 *W* 화소를 덮으므로
+
+```
+cx = (W-1)/2        fx = (W/2) / tan(hfov/2)        (fy 도 같은 논리, 기본은 정사각 화소)
+```
+
+```bash
+# 단안: rgb 전용 배치가 나온다 (RGB-D 러너는 못 먹는다 — 도구가 크게 알린다)
+build/win/tools/wme_equirect_convert --in <360폴더> --out data/pano_front \
+    --yaw 0 --pitch 0 --hfov 90 --width 640 --height 480
+
+# 360 스테레오 리그: 깊이까지 만든다. yaw 는 0 또는 180 도 근방만 가능하다
+build/win/tools/wme_equirect_convert --in <좌> --right <우> --baseline 0.30 \
+    --out data/pano_stereo --yaw 0 --hfov 90 --width 640 --height 480
+```
+
+검증은 합성 등장방형(정답 3D 좌표를 아는 장면을 해석적으로 투영)으로 한다 — 실데이터에는 비교할 진리값이 없어 애초에 답이 안 나온다.
+
+```bash
+python python/tools/equirect_validate.py --e2e   # 결과: results/equirect/validate.json
+```
+
+| 항목 | 값 |
+|---|---|
+| C++ ↔ numpy 오라클 (`wme/reference/equirect.py`) | 최대 화소차 1 LSB, >1 인 화소 0 % |
+| 체커보드 재투영 RMS (내보낸 K 로 예측) | **0.078 px** (최대 0.23 px) |
+| 같은 장면을 핀홀로 직접 렌더한 대조군 | 0.095 px — 워프가 더한 몫은 검출기 잡음에 묻힌다 |
+| `calibrateCamera` 로 회수한 fx / cx | 0.29 % / 0.27 px (대조군 0.31 % / 0.32 px) |
+| 360 스테레오 깊이 (B = 0.30 m) | 유효 92.4 %, 상대오차 중앙 0.36 %, 편향 −0.005 m |
+| 스테레오로 쓸 수 있는 yaw 범위 | **±1.19°** (B 0.30 m, 최근접 3 m, H 480 에서 유도) |
+
+> 마지막 줄이 이 경로의 진짜 제약이다. 단안 360 한 장에는 깊이가 없고, 리그를 써도 베이스라인과 나란한 방향에서는 시차가 깊이 정보를 잃는다. 자세한 유도는 `tools/equirect_convert.cpp` 의 `checkRectified()`.
 
 ---
 
