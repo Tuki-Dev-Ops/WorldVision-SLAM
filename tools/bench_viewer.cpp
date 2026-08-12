@@ -1107,6 +1107,10 @@ inline long long g_lab_cols = 0;     // 이번에 손댄 칸의 수
 // 클래스가 화소(분할)에서 온 것인지 기하(구조 텐서)에서 온 것인지 섞여 있으면
 // "건물이 63 % 다" 를 두고 누구를 고쳐야 할지 알 수 없다. 둘을 갈라 세고,
 // 둘 다 답한 칸에서는 서로 얼마나 맞는지도 센다 - 그것이 곧 상호 검증이다.
+// 노면 격자의 높이 문턱을 몇 점이 통과하는가. kitti_04 에서 도로가 502 m2
+// (폭 1.3 m) 로만 잡히길래 어디서 걸리는지 보려고 둔다.
+inline long long g_road_offered = 0, g_road_taken = 0, g_road_near = 0;
+inline double g_road_rel_sum = 0.0;
 inline long long g_by_seg = 0, g_by_geom = 0;
 inline long long g_both = 0, g_both_agree = 0;
 inline long long g_seg_cls[kStuffN] = {0, 0, 0, 0, 0, 0, 0};
@@ -4966,6 +4970,15 @@ inline bool exportSceneJson(const fs::path& path,
             f << "]}";
         }
         f << "\n  ]\n}\n";
+        if (g_road_offered > 0) {
+            std::cout << "  노면 격자: 제시 " << g_road_offered << ", 통과 "
+                      << g_road_taken << " ("
+                      << (100 * g_road_taken / g_road_offered) << " %), 2 m 안 "
+                      << (100 * g_road_near / g_road_offered) << " %, 평균 어긋남 "
+                      << std::fixed << std::setprecision(2)
+                      << (g_road_rel_sum / static_cast<double>(g_road_offered))
+                      << " m" << std::endl;
+        }
         // 무엇이 클래스를 정했는가. 고칠 데를 찾으려면 먼저 갈라야 한다.
         {
             const long long tot = g_by_seg + g_by_geom;
@@ -6081,12 +6094,47 @@ int main(int argc, char** argv) {
                     {
                         const float e0 = static_cast<float>(ego_hh);
                         const float rinv = 1.0f / kRoadCell;
+                        // **노면 높이를 가정하지 말고 잰다.**
+                        //
+                        // 자차 아래 1.65 m 를 노면으로 박아 두었는데, kitti_04
+                        // 에서 실제 노면은 그보다 평균 2.66 m 위였다. 그래서
+                        // 제시된 점의 12 % 만 문턱을 통과했고 도로가 502 m2
+                        // (폭 1.3 m) 로만 잡혔다 - 396 m 짜리 직선 도로인데.
+                        //
+                        // 카메라 높이는 고정이어도 자차 포즈의 높이가 그렇지
+                        // 않다. 오르막에서 어긋나고, 그 어긋남이 바로 이 값이다.
+                        // 이번 프레임 점들의 **중앙값** 으로 바닥을 잡으면
+                        // 가정이 사라진다 - 중앙값이라 차나 벽에 흔들리지 않는다.
+                        float floor_rel = (s.dataset == "kitti") ? -1.65f : -0.8f;
+                        {
+                            std::vector<float> lows;
+                            lows.reserve(pts.size() / 4 + 1);
+                            for (const auto& p : pts) {
+                                const float r = p.p.dot(up_f) - e0;
+                                // 넓게 잡아 모은다. 좁게 잡으면 처음의 잘못된
+                                // 가정 근처만 보게 되어 어긋남을 못 고친다.
+                                if (r > floor_rel - 4.0f && r < floor_rel + 6.0f) {
+                                    lows.push_back(r);
+                                }
+                            }
+                            if (lows.size() > 200) {
+                                // 아래쪽 20 % 지점. 중앙값을 쓰면 차량과 연석이
+                                // 섞여 바닥이 조금 들린다.
+                                const std::size_t q = lows.size() / 5;
+                                std::nth_element(lows.begin(), lows.begin() + q,
+                                                 lows.end());
+                                floor_rel = lows[q];
+                            }
+                        }
                         for (const auto& p : pts) {
                             const float rel = p.p.dot(up_f) - e0;
                             // 자차 발밑 높이 ± 40 cm 가 노면이다. 연석과 차량
                             // 밑동은 여기서 빠져 부피 지도에 남는다.
-                            const float floor_rel = (s.dataset == "kitti") ? -1.65f : -0.8f;
+                            ++g_road_offered;
+                            g_road_rel_sum += rel - floor_rel;
+                            if (std::abs(rel - floor_rel) < 2.0f) ++g_road_near;
                             if (std::abs(rel - floor_rel) > 0.40f) continue;
+                            ++g_road_taken;
                             const std::int64_t rk = roadKey(p.p, road_a, road_b, rinv);
                             const bool rc_new = (road[k].find(rk) == road[k].end());
                             auto& rc = road[k][rk];
