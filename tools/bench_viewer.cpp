@@ -4501,10 +4501,26 @@ inline bool exportCloud(const fs::path& path,
     std::ofstream f(path, std::ios::binary);
     if (!f) return false;
 
-    // 상한을 넘으면 고르게 솎는다. 앞부분만 잘라 내면 지나온 길이 통째로
-    // 사라져 지도가 반토막 난다.
+    // **종류마다 다른 밀도로 낸다.**
+    //
+    // Kitware 의 LiDAR SLAM 은 특징을 모서리 / 평면 / 덩이로 나누고 지도
+    // 해상도를 따로 준다 - 모서리 20~30 cm, 평면 30~60 cm. 이유가 분명하다:
+    // 벽 한 장은 점이 몇 개만 있어도 벽이지만, 가로등 기둥이나 연석은 몇 개만
+    // 남으면 사라진다. 같은 해상도를 모두에게 주면 평면에 점을 낭비하면서
+    // 가는 것을 잃는다.
+    //
+    // 여기서도 같은 삼분법을 이미 쓰고 있다 - 구조 텐서의 선형성 / 평면성 /
+    // 산란도가 곧 모서리 / 평면 / 덩이다. 그러니 내보낼 때 그 라벨로 밀도를
+    // 갈라 주면 된다: 가는 것은 전부, 평평한 것은 솎아서.
+    //
+    // 복셀을 더 잘게 만드는 것과 다르다. 잘게 만들면 벽의 점만 폭증한다.
     const std::size_t n_all = cells.size();
-    const std::size_t step = (n_all > cap) ? (n_all / cap + 1) : 1;
+    // 지면 · 건물 · 담장 · 나무 · 기둥 · 지형 · 미상
+    int keep_of[kStuffN] = {2, 2, 3, 1, 1, 1, 1};
+    // 상한을 넘으면 전체를 한 번 더 솎는다. 앞부분만 잘라 내면 지나온 길이
+    // 통째로 사라져 지도가 반토막 난다.
+    const std::size_t step = (n_all > cap * 2) ? (n_all / (cap * 2) + 1) : 1;
+    std::size_t drop_flat = 0;
 
     std::vector<float> pos;
     std::vector<std::uint8_t> attr;
@@ -4521,6 +4537,14 @@ inline bool exportCloud(const fs::path& path,
         // 파랗고 지붕은 붉게 나오는 그 색이 곧 높이다.
         const auto [ci, cj] = g.ij(v.p);
         const auto it = cols.find(GroundGrid::key(ci, cj));
+        const int cls_i = (it != cols.end())
+            ? static_cast<int>(it->second.cls) : 0;
+        // 평평한 것은 솎는다. 해시 순회 순서는 공간과 무관하므로 카운터
+        // 하나로 걸러도 특정 구역만 비지 않는다.
+        const int kp = keep_of[cls_i < kStuffN ? cls_i : 0];
+        if (kp > 1) {
+            if ((drop_flat++ % static_cast<std::size_t>(kp)) != 0) continue;
+        }
         const float ground = (it != cols.end()) ? it->second.ground
                                                 : v.p.dot(g.up);
         const float rel = v.p.dot(g.up) - ground;
@@ -4537,8 +4561,7 @@ inline bool exportCloud(const fs::path& path,
         attr.push_back(v.intensity);
         // 클래스는 그 기둥의 라벨이다. 점마다 다시 판정하지 않는다 -
         // 같은 기둥의 점들이 서로 다른 색이면 그것은 잡음이다.
-        attr.push_back(static_cast<std::uint8_t>(
-            (it != cols.end()) ? static_cast<int>(it->second.cls) : 0));
+        attr.push_back(static_cast<std::uint8_t>(cls_i));
         ++kept;
     }
 
@@ -4552,8 +4575,9 @@ inline bool exportCloud(const fs::path& path,
         f.write(reinterpret_cast<const char*>(&pos[j * 4]), 16);
         f.write(reinterpret_cast<const char*>(&attr[j * 2]), 2);
     }
-    std::cout << "  점군: " << kept << " 점 (" << n_all << " 복셀에서 1/"
-              << step << "), " << (kept * 18 + 24) / 1024 << " KB" << std::endl;
+    std::cout << "  점군: " << kept << " 점 (" << n_all << " 복셀에서, "
+              << "평면 1/2~1/3 솎음), " << (kept * 18 + 24) / 1024 << " KB"
+              << std::endl;
     (void)ga; (void)gb;
     return static_cast<bool>(f);
 }
