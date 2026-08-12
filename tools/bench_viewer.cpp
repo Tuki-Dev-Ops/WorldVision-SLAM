@@ -863,6 +863,8 @@ struct Column {
     // 지면과 안 이어진 칸이 이웃 수에서 빠져 밀집도가 낮아지고, 8 이라는
     // 문턱이 그만큼 헐거워진다 - 실제로 기둥이 39 에서 110 으로 늘었다.
     std::int8_t top_raw{-1};
+    // 분할이 약하게 낸 의견. 기하 판정과 견주려고만 쓴다.
+    std::int8_t seg_hint{-1};
     // 1 차 훑기에서 이 칸의 높이 목록이 어디에 담겼는가. 지도에 합쳐질
     // 때는 쓰이지 않는 임시 값이다.
     int hidx{-1};
@@ -1100,6 +1102,16 @@ inline double g_lab_ms[6] = {0, 0, 0, 0, 0, 0};
 inline long long g_lab_tensor = 0;   // 구조 텐서까지 간 칸의 수
 inline long long g_lab_cols = 0;     // 이번에 손댄 칸의 수
 
+// **무엇이 무엇을 정했는가.**
+//
+// 클래스가 화소(분할)에서 온 것인지 기하(구조 텐서)에서 온 것인지 섞여 있으면
+// "건물이 63 % 다" 를 두고 누구를 고쳐야 할지 알 수 없다. 둘을 갈라 세고,
+// 둘 다 답한 칸에서는 서로 얼마나 맞는지도 센다 - 그것이 곧 상호 검증이다.
+inline long long g_by_seg = 0, g_by_geom = 0;
+inline long long g_both = 0, g_both_agree = 0;
+inline long long g_seg_cls[kStuffN] = {0, 0, 0, 0, 0, 0, 0};
+inline long long g_geom_cls[kStuffN] = {0, 0, 0, 0, 0, 0, 0};
+
 inline void labelScene(const std::unordered_map<std::int64_t, Splat>& cells,
                        const Eigen::Vector3d& up_d, float cell, float voxel,
                        const Eigen::Vector3d& ego, float work_radius,
@@ -1280,6 +1292,8 @@ inline void labelScene(const std::unordered_map<std::int64_t, Splat>& cells,
     // 쓰지 않을 것이면 전부 버려지는 계산이다. 분할 라벨이 충분히 모인 칸은
     // 기하를 물을 이유가 없고, 그런 칸이 지금은 대다수다.
     long long tensor_n = 0;
+    g_by_seg = g_by_geom = g_both = g_both_agree = 0;
+    for (int ci = 0; ci < kStuffN; ++ci) { g_seg_cls[ci] = 0; g_geom_cls[ci] = 0; }
     for (auto& [k, c] : fresh) {
         {
             int best = -1, bn = 0, tot = 0;
@@ -1289,8 +1303,13 @@ inline void labelScene(const std::unordered_map<std::int64_t, Splat>& cells,
             }
             if (best > 0 && bn >= 3 && bn * 2 > tot) {
                 c.cls = static_cast<Stuff>(best);
+                ++g_by_seg;
+                ++g_seg_cls[best];
                 continue;
             }
+            // 분할이 답하지 못한 칸이다. 기하로 간다 - 다만 분할이 약하게나마
+            // 의견이 있으면 나중에 견주려고 적어 둔다.
+            c.seg_hint = static_cast<std::int8_t>((best > 0 && bn >= 1) ? best : -1);
         }
         ++tensor_n;
         int n = 0;
@@ -1351,6 +1370,12 @@ inline void labelScene(const std::unordered_map<std::int64_t, Splat>& cells,
         }
         // 여기까지 온 칸은 화소가 답하지 못한 칸이다. 기하로 판정한다.
         c.cls = classifyColumn(c);
+        ++g_by_geom;
+        ++g_geom_cls[static_cast<int>(c.cls)];
+        if (c.seg_hint > 0) {
+            ++g_both;
+            if (static_cast<int>(c.cls) == c.seg_hint) ++g_both_agree;
+        }
     }
 
     lap(3);
@@ -4913,6 +4938,35 @@ inline bool exportSceneJson(const fs::path& path,
             f << "]}";
         }
         f << "\n  ]\n}\n";
+        // 무엇이 클래스를 정했는가. 고칠 데를 찾으려면 먼저 갈라야 한다.
+        {
+            const long long tot = g_by_seg + g_by_geom;
+            if (tot > 0) {
+                std::cout << "  판정 근거: 화소 " << g_by_seg << " ("
+                          << (100 * g_by_seg / tot) << " %), 기하 " << g_by_geom
+                          << " (" << (100 * g_by_geom / tot) << " %)";
+                if (g_both > 0) {
+                    std::cout << ", 둘 다 답한 " << g_both << " 칸 중 일치 "
+                              << (100 * g_both_agree / g_both) << " %";
+                }
+                std::cout << std::endl;
+                std::cout << "    화소가 부른 것: ";
+                for (int ci = 1; ci < kStuffN; ++ci) {
+                    if (g_seg_cls[ci]) {
+                        std::cout << stuffName(static_cast<Stuff>(ci)) << " "
+                                  << g_seg_cls[ci] << "  ";
+                    }
+                }
+                std::cout << std::endl << "    기하가 부른 것: ";
+                for (int ci = 1; ci < kStuffN; ++ci) {
+                    if (g_geom_cls[ci]) {
+                        std::cout << stuffName(static_cast<Stuff>(ci)) << " "
+                                  << g_geom_cls[ci] << "  ";
+                    }
+                }
+                std::cout << std::endl;
+            }
+        }
         std::cout << "  차선(예측): " << lanes.size() << " 개, 점 " << npts;
         if (!std::isnan(score)) {
             std::cout << ", 선 위 밝기 / 노면 평균 = " << std::fixed
