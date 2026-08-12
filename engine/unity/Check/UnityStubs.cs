@@ -128,7 +128,7 @@ namespace UnityEngine
         public static bool GetKey(KeyCode k) { return false; }
         public static float GetAxisRaw(string n) { return 0f; }
     }
-    public enum KeyCode { Escape, F, H, Q, R, Space, LeftShift, RightShift, LeftControl,
+    public enum KeyCode { Escape, C, F, H, L, Q, R, T, Space, LeftShift, RightShift, LeftControl,
                           Alpha1, Alpha2, Alpha3, Alpha4, LeftArrow, RightArrow,
                           LeftBracket, RightBracket }
     public enum CursorLockMode { None, Locked, Confined }

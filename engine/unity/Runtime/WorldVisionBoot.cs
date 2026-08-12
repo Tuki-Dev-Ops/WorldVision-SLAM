@@ -278,6 +278,69 @@ namespace WorldVision
         // 보았다. 쪼개면 절두체 컬링도 같이 얻는다.
         public int cloudPoints;
 
+        // 색을 무엇으로 칠할 것인가.
+        //
+        // 하나로 고정하면 안 된다. 높이 색은 구조를 보여 주고, 밝기 색은
+        // 차선과 표지를 보여 주며, 클래스 색은 분류가 맞았는지를 보여 준다 -
+        // 셋은 서로 다른 질문에 답하므로 바꿔 볼 수 있어야 한다.
+        public enum Paint { Height, Intensity, Class }
+        public Paint paint = Paint.Height;
+
+        // 다시 칠하려면 원래 값이 있어야 한다. 색만 들고 있으면 되돌릴 수 없다.
+        readonly List<Mesh> cloudMeshes = new List<Mesh>();
+        readonly List<float[]> cloudRel = new List<float[]>();
+        readonly List<byte[]> cloudInten = new List<byte[]>();
+        readonly List<byte[]> cloudCls = new List<byte[]>();
+
+        public void Repaint(Paint p)
+        {
+            paint = p;
+            for (int c = 0; c < cloudMeshes.Count; ++c)
+            {
+                var rel = cloudRel[c];
+                var inten = cloudInten[c];
+                var cls = cloudCls[c];
+                var cols = new Color32[rel.Length];
+                for (int i = 0; i < rel.Length; ++i)
+                    cols[i] = Shade(p, rel[i], inten[i], cls[i]);
+                cloudMeshes[c].colors32 = cols;
+            }
+            log.Add("paint", p == Paint.Height ? "색: 지면 위 높이"
+                : p == Paint.Intensity ? "색: 관측 밝기" : "색: 분류",
+                LogKind.Info);
+        }
+
+        public static Color32 Shade(Paint p, float rel, byte inten, byte cls)
+        {
+            if (p == Paint.Height) return Turbo(rel, inten);
+            if (p == Paint.Intensity)
+            {
+                // 밝기만. 차선과 표지가 이때 가장 잘 보인다.
+                float g = Mathf.Clamp01(inten / 255f);
+                g = Mathf.Pow(g, 0.65f);
+                return new Color32((byte)(g * 245f), (byte)(g * 250f),
+                                   (byte)(g * 255f), 255);
+            }
+            // 분류. 뷰어가 화면에서 쓰는 색과 같게 둔다 - 다르면 두 화면을
+            // 나란히 놓고 비교할 수가 없다.
+            float k = 0.55f + 0.60f * (inten / 255f);
+            Color b2;
+            switch (cls)
+            {
+                case 1:  b2 = new Color(0.42f, 0.42f, 0.44f); break;  // 지면
+                case 2:  b2 = new Color(0.55f, 0.68f, 0.86f); break;  // 건물
+                case 3:  b2 = new Color(0.80f, 0.72f, 0.45f); break;  // 담장
+                case 4:  b2 = new Color(0.34f, 0.80f, 0.38f); break;  // 나무
+                case 5:  b2 = new Color(0.95f, 0.55f, 0.85f); break;  // 기둥
+                case 6:  b2 = new Color(0.55f, 0.80f, 0.35f); break;  // 잔디
+                default: b2 = new Color(0.45f, 0.45f, 0.50f); break;  // 미상
+            }
+            return new Color32(
+                (byte)Mathf.Clamp(b2.r * k * 255f, 0f, 255f),
+                (byte)Mathf.Clamp(b2.g * k * 255f, 0f, 255f),
+                (byte)Mathf.Clamp(b2.b * k * 255f, 0f, 255f), 255);
+        }
+
         void BuildCloud(string path)
         {
             if (!File.Exists(path))
@@ -315,11 +378,15 @@ namespace WorldVision
             var cols = new Color32[kChunk];
             var idx = new int[kChunk];
             int made = 0;
+            int[] clsCount = new int[8];
 
             for (int c = 0; c < chunks; ++c)
             {
                 int from = c * kChunk;
                 int n = Mathf.Min(kChunk, count - from);
+                var relBuf = new float[n];
+                var intenBuf = new byte[n];
+                var clsBuf = new byte[n];
                 for (int i = 0; i < n; ++i)
                 {
                     int o = 24 + (from + i) * rec;
@@ -328,9 +395,12 @@ namespace WorldVision
                     float z = BitConverter.ToSingle(raw, o + 8);
                     float rel = BitConverter.ToSingle(raw, o + 12);
                     byte inten = raw[o + 16];
+                    byte cls = raw[o + 17];
                     verts[i] = new Vector3(x, y, -z) + org;
-                    cols[i] = Turbo(rel, inten);
+                    cols[i] = Shade(paint, rel, inten, cls);
                     idx[i] = i;
+                    relBuf[i] = rel; intenBuf[i] = inten; clsBuf[i] = cls;
+                    if (cls < 8) clsCount[cls]++;
                 }
                 var mesh = new Mesh();
                 mesh.name = "cloud" + c;
@@ -358,10 +428,18 @@ namespace WorldVision
                     UnityEngine.Rendering.ShadowCastingMode.Off;
                 mr.receiveShadows = false;
                 made += n;
+                cloudMeshes.Add(mesh);
+                cloudRel.Add(relBuf);
+                cloudInten.Add(intenBuf);
+                cloudCls.Add(clsBuf);
             }
             cloudPoints = made;
             log.Add("cloud", string.Format("점군 {0:n0} 점, 덩이 {1}",
                 made, chunks), LogKind.Ok);
+            log.Add("cloud", string.Format(
+                "분류: 지면 {0:n0} · 건물 {1:n0} · 나무 {2:n0} · 잔디 {3:n0} · 미상 {4:n0}",
+                clsCount[1], clsCount[2], clsCount[4], clsCount[6], clsCount[0]),
+                LogKind.Info);
         }
 
         // ------------------------------------------------------------------

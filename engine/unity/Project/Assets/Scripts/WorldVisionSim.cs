@@ -162,6 +162,10 @@ namespace WorldVision
             if (Input.GetKeyDown(KeyCode.H)) help = !help;
             if (Input.GetKeyDown(KeyCode.L)) showLabels = !showLabels;
             if (Input.GetKeyDown(KeyCode.T)) showTerminal = !showTerminal;
+            if (Input.GetKeyDown(KeyCode.C) && boot != null)
+            {
+                boot.Repaint((Boot.Paint)(((int)boot.paint + 1) % 3));
+            }
             if (Input.GetKeyDown(KeyCode.R)) s = 0f;
             if (Input.GetKeyDown(KeyCode.Q)) Application.Quit();
             if (Input.GetKey(KeyCode.LeftBracket))
@@ -472,7 +476,21 @@ namespace WorldVision
                 {
                     GUI.Label(new Rect(16, y, W, 18),
                         string.Format("점군 {0:n0} 점", boot.cloudPoints), stDim);
-                    y += 20f;
+                    y += 18f;
+                    GUI.Label(new Rect(16, y, W, 18), "C  색: " +
+                        (boot.paint == Boot.Paint.Height ? "지면 위 높이"
+                         : boot.paint == Boot.Paint.Intensity ? "관측 밝기"
+                         : "분류"), st);
+                    y += 22f;
+                    // 색이 무엇을 뜻하는지 눈금으로 보인다. 색만 있고 자가
+                    // 없으면 "파란 쪽이 낮다" 는 것 말고는 읽을 수 없다.
+                    Ramp(new Rect(16, y, W - 32, 8));
+                    y += 10f;
+                    GUI.Label(new Rect(16, y, W, 16),
+                        boot.paint == Boot.Paint.Height ? "0 m                                12 m"
+                        : boot.paint == Boot.Paint.Intensity ? "어둠                                  밝음"
+                        : "지면 · 건물 · 나무 · 잔디 · 기둥", stDim);
+                    y += 22f;
                 }
             }
 
@@ -491,7 +509,7 @@ namespace WorldVision
             GUI.Label(new Rect(16, y, W, 20),
                 "Space 재생/정지   ← → 위치   [ ] 속도", stDim); y += 18f;
             GUI.Label(new Rect(16, y, W, 20),
-                "L 라벨   T 터미널   R 처음   H 표시   Q 종료", stDim);
+                "L 라벨   T 터미널   C 색   R 처음   H 표시   Q 종료", stDim);
 
             if (showTerminal)
                 Term(new Rect(W, H - kTermH, Screen.width - W - kCamW, kTermH));
@@ -527,6 +545,34 @@ namespace WorldVision
                 GUI.color = g0;
                 GUI.Label(new Rect(bx, by + 4f, 120f, 20f), "50 m", stDim);
             }
+        }
+
+        // 색 눈금.
+        void Ramp(Rect r)
+        {
+            if (boot == null) return;
+            int n = 48;
+            var g = GUI.color;
+            for (int i = 0; i < n; ++i)
+            {
+                float t = i / (float)(n - 1);
+                Color32 c;
+                if (boot.paint == Boot.Paint.Height)
+                    c = Boot.Shade(Boot.Paint.Height, t * 12f, 200, 0);
+                else if (boot.paint == Boot.Paint.Intensity)
+                    c = Boot.Shade(Boot.Paint.Intensity, 0f, (byte)(t * 255f), 0);
+                else
+                {
+                    byte[] order = { 1, 2, 4, 6, 5 };
+                    c = Boot.Shade(Boot.Paint.Class, 0f, 220,
+                                   order[Mathf.Min(order.Length - 1,
+                                         (int)(t * order.Length))]);
+                }
+                GUI.color = c;
+                GUI.DrawTexture(new Rect(r.x + r.width * i / n, r.y,
+                                         r.width / n + 1f, r.height), barTex);
+            }
+            GUI.color = g;
         }
 
         void Row(ref float y, Color c, string name, int n, float area, string unit)
