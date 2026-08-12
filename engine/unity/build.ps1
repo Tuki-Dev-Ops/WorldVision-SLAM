@@ -122,5 +122,24 @@ $n = (Get-ChildItem $dataDir -Filter "*.wvpc" | Measure-Object).Count
 $mb = [int](((Get-ChildItem $dataDir -Recurse -File | Measure-Object -Property Length -Sum).Sum) / 1MB)
 Write-Output "데이터: 시퀀스 $n 개, $mb MB  ($dataDir)"
 
-Write-Output "빌드 완료: $exe"
-if ($Run) { Start-Process -FilePath $exe }
+# **실제로 실행되는지 확인한다.**
+#
+# 이 빌드는 가끔 성공했다고 하고서 실행하면 "level0 is corrupted" 로 죽는다.
+# 원인을 아직 못 찾았다 - 셰이더를 항상포함 목록에 넣던 것, StreamingAssets 를
+# 파일 API 로 갈아엎던 것, 출력 폴더와 Library 잔재를 차례로 고쳤고 그때마다
+# 한동안 괜찮다가 다시 나온다.
+#
+# 원인을 모른다고 해서 깨진 결과물을 통과시킬 이유는 없다. 띄워 보고,
+# 안 뜨면 다시 짓는다. 세 번 다 실패하면 그때는 실패로 끝낸다 - 조용히
+# 넘어가는 것이 제일 나쁘다.
+$ok = $false
+$p = Start-Process -FilePath $exe -PassThru
+Start-Sleep -Seconds 20
+if (-not $p.HasExited) { $ok = $true; $p | Stop-Process -Force }
+if ($ok) {
+    Write-Output "빌드 완료 (실행 확인): $exe"
+    if ($Run) { Start-Process -FilePath $exe }
+} else {
+    Write-Output "빌드는 됐는데 실행되지 않는다. 다시 시도한다."
+    exit 2
+}
