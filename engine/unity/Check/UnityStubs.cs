@@ -32,6 +32,9 @@ namespace UnityEngine
         public static float Dot(Vector3 a, Vector3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
         public static float Distance(Vector3 a, Vector3 b) { return (a - b).magnitude; }
         public static Vector3 Lerp(Vector3 a, Vector3 b, float t) { return a; }
+        public static Vector3 Cross(Vector3 a, Vector3 b)
+        { return new Vector3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x); }
+        public static Vector3 operator *(float s, Vector3 a) { return a * s; }
         public float magnitude { get { return (float)Math.Sqrt(sqrMagnitude); } }
         public static Vector3 operator +(Vector3 a, Vector3 b) { return new Vector3(a.x + b.x, a.y + b.y, a.z + b.z); }
         public static Vector3 operator *(Vector3 a, float s) { return new Vector3(a.x * s, a.y * s, a.z * s); }
@@ -52,7 +55,11 @@ namespace UnityEngine
         public static int Clamp(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
         public static float Clamp01(float v) { return Clamp(v, 0f, 1f); }
         public static float Max(float a, float b) { return a > b ? a : b; }
+        public static int Max(int a, int b) { return a > b ? a : b; }
         public static float Min(float a, float b) { return a < b ? a : b; }
+        public static float Cos(float v) { return (float)Math.Cos(v); }
+        public static float Sin(float v) { return (float)Math.Sin(v); }
+        public const float PI = 3.14159265f;
         public static float Sqrt(float v) { return (float)Math.Sqrt(v); }
         public static float Abs(float v) { return Math.Abs(v); }
         public static float Lerp(float a, float b, float t) { return a + (b - a) * t; }
@@ -76,6 +83,8 @@ namespace UnityEngine
     {
         public byte r, g, b, a;
         public Color32(byte r, byte g, byte b, byte a) { this.r = r; this.g = g; this.b = b; this.a = a; }
+        public static implicit operator Color(Color32 c)
+        { return new Color(c.r / 255f, c.g / 255f, c.b / 255f, c.a / 255f); }
     }
 
     public struct Vector2
@@ -127,8 +136,10 @@ namespace UnityEngine
         public static bool GetKeyDown(KeyCode k) { return false; }
         public static bool GetKey(KeyCode k) { return false; }
         public static float GetAxisRaw(string n) { return 0f; }
+        public static Vector2 mouseScrollDelta { get { return new Vector2(0, 0); } }
+        public static Vector3 mousePosition { get { return Vector3.zero; } }
     }
-    public enum KeyCode { Escape, C, F, H, L, Q, R, T, Space, LeftShift, RightShift, LeftControl,
+    public enum KeyCode { Escape, C, F, H, L, Q, R, T, X, Space, LeftShift, RightShift, LeftControl,
                           F1, F2, F3, F4, F5, F6, F7,
                           Alpha1, Alpha2, Alpha3, Alpha4, LeftArrow, RightArrow,
                           LeftBracket, RightBracket }
@@ -138,16 +149,36 @@ namespace UnityEngine
         public static CursorLockMode lockState;
         public static bool visible;
     }
-    public static class Time { public static float deltaTime, unscaledDeltaTime; }
+    public static class Time { public static float deltaTime, unscaledDeltaTime, time, realtimeSinceStartup; }
     public static class GUI
     {
         public static GUISkin skin;
         public static Color color;
         public static void Label(Rect r, string s, GUIStyle st) { }
         public static void DrawTexture(Rect r, Texture t) { }
+        public static void DrawTexture(Rect r, Texture t, ScaleMode m) { }
+        public static Vector2 BeginScrollView(Rect pos, Vector2 scroll, Rect view, bool h, bool v) { return scroll; }
+        public static void EndScrollView() { }
     }
     public static class Screen { public static int width, height; }
+    public static class GL
+    {
+        public const int LINES = 1;
+        public static void PushMatrix() { }
+        public static void PopMatrix() { }
+        public static void MultMatrix(Matrix4x4 m) { }
+        public static void Begin(int mode) { }
+        public static void End() { }
+        public static void Color(Color c) { }
+        public static void Vertex(Vector3 v) { }
+    }
+    public struct Matrix4x4 { public static Matrix4x4 identity { get { return default(Matrix4x4); } } }
+    public enum ScaleMode { StretchToFill, ScaleAndCrop, ScaleToFit }
+    public enum TextClipping { Overflow, Clip }
+    public enum TextAnchor { UpperLeft, UpperCenter, UpperRight, MiddleLeft, MiddleCenter, MiddleRight }
+    public class RectOffset { public RectOffset(int l, int r, int t, int b) { } }
     public class GUISkin { public GUIStyle label = new GUIStyle(); }
+    public class Font : Object { }
     public class GUIStyleState { public Color textColor; }
     public class GUIStyle
     {
@@ -155,6 +186,11 @@ namespace UnityEngine
         public GUIStyle(GUIStyle o) { }
         public int fontSize;
         public GUIStyleState normal = new GUIStyleState();
+        public TextClipping clipping;
+        public TextAnchor alignment;
+        public bool wordWrap;
+        public RectOffset padding;
+        public Font font;
     }
     public class AudioListener : Component { }
 
@@ -166,6 +202,7 @@ namespace UnityEngine
         public bool orthographic;
         public RenderTexture targetTexture;
         public void Render() { }
+        public Vector3 WorldToScreenPoint(Vector3 p) { return Vector3.zero; }
     }
 
     public class RenderTexture : Object
@@ -186,6 +223,7 @@ namespace UnityEngine
         public Color32[] GetPixels32() { return new Color32[0]; }
         public void SetPixels32(Color32[] c) { }
         public void Apply() { }
+        public void Apply(bool mip, bool noLongerReadable) { }
         public byte[] EncodeToPNG() { return new byte[0]; }
     }
 
@@ -196,12 +234,16 @@ namespace UnityEngine
         public void SetVertices(System.Collections.Generic.List<Vector3> v) { }
         public void SetColors(System.Collections.Generic.List<Color> c) { }
         public void SetUVs(int ch, System.Collections.Generic.List<Vector2> uv) { }
-        public Vector3[] vertices { get { return new Vector3[0]; } }
+        public Vector3[] vertices { get; set; }
+        public Color32[] colors32 { get; set; }
+        public void SetIndices(int[] idx, MeshTopology t, int sub) { }
+        public void RecalculateBounds() { }
         public void SetTriangles(System.Collections.Generic.List<int> t, int sub) { }
         public void RecalculateNormals() { }
         public Bounds bounds;
     }
 
+    public enum MeshTopology { Triangles, Quads, Lines, LineStrip, Points }
     public class MeshFilter : Component { public Mesh sharedMesh; }
     public class MeshRenderer : Renderer { }
     public class MeshCollider : Component { public Mesh sharedMesh; }
@@ -209,9 +251,12 @@ namespace UnityEngine
     public class SphereCollider : Component { }
     public class CapsuleCollider : Component { }
 
+    public enum HideFlags { None, HideAndDontSave }
     public class Object
     {
         public string name;
+        public HideFlags hideFlags;
+        public static void Destroy(Object o) { }
         public static T[] FindObjectsByType<T>(FindObjectsSortMode m) { return new T[0]; }
         public static T FindFirstObjectByType<T>() where T : Object { return null; }
         public static void DestroyImmediate(Object o) { }
@@ -225,12 +270,17 @@ namespace UnityEngine
         public bool HasProperty(string n) { return true; }
         public bool enableInstancing;
         public void SetFloat(string n, float v) { }
+        public void SetInt(string n, int v) { }
+        public void SetPass(int p) { }
+        public int renderQueue;
     }
-    public class Texture : Object { }
+    public class Texture : Object { public int width, height; }
     public enum TextureWrapMode { Repeat, Clamp }
     public enum FilterMode { Point, Bilinear, Trilinear }
     public class Renderer : Component
     {
+        public Rendering.ShadowCastingMode shadowCastingMode;
+        public bool receiveShadows;
         public Material sharedMaterial;
         public Material[] sharedMaterials;
         public Bounds bounds;
@@ -281,6 +331,7 @@ namespace UnityEngine
     public static class Application
     {
         public static string dataPath { get { return "."; } }
+        public static string streamingAssetsPath { get { return "."; } }
         public static void Quit() { }
     }
 
@@ -293,6 +344,9 @@ namespace UnityEngine
 namespace UnityEngine.Rendering
 {
     public enum IndexFormat { UInt16, UInt32 }
+    public enum ShadowCastingMode { Off, On, TwoSided, ShadowsOnly }
+    public enum BlendMode { Zero, One, SrcAlpha, OneMinusSrcAlpha }
+    public enum CullMode { Off, Front, Back }
 }
 
 namespace UnityEditor
@@ -308,6 +362,19 @@ namespace UnityEditor
         public static void RegisterCreatedObjectUndo(UnityEngine.Object o, string s) { }
     }
     public static class Selection { public static GameObject activeGameObject; }
+    public class SerializedProperty
+    {
+        public int arraySize;
+        public UnityEngine.Object objectReferenceValue;
+        public SerializedProperty GetArrayElementAtIndex(int i) { return this; }
+        public void InsertArrayElementAtIndex(int i) { }
+    }
+    public class SerializedObject
+    {
+        public SerializedObject(UnityEngine.Object o) { }
+        public SerializedProperty FindProperty(string p) { return null; }
+        public void ApplyModifiedProperties() { }
+    }
     public enum ImportAssetOptions { Default, ForceUpdate }
     public enum TextureImporterType { Default, NormalMap, Sprite }
     public class AssetImporter

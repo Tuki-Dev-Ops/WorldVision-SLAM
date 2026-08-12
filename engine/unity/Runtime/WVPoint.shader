@@ -20,13 +20,19 @@ Shader "WorldVision/Point"
         _Size ("점 크기 (m)", Range(0.02, 0.6)) = 0.11
         _MinPx ("최소 크기 (px)", Range(1, 4)) = 1.4
         _MaxPx ("최대 크기 (px)", Range(2, 24)) = 6
+        // 투과 보기용. 런타임에 바꾼다 - 더하기 혼합에 깊이 쓰기를 끄면
+        // 앞뒤가 겹쳐 보인다.
+        [HideInInspector] _SrcBlend ("", Float) = 1
+        [HideInInspector] _DstBlend ("", Float) = 0
+        [HideInInspector] _ZWrite ("", Float) = 1
     }
 
     SubShader
     {
         Tags { "RenderType" = "Opaque" "Queue" = "Geometry" }
         Cull Off
-        ZWrite On
+        Blend [_SrcBlend] [_DstBlend]
+        ZWrite [_ZWrite]
         Lighting Off
 
         Pass

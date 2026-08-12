@@ -98,6 +98,15 @@ namespace WorldVision
 
         Texture2D panelTex, barTex;
         Bounds world;
+        Vector2 panelScroll;
+        float panelH = 1f;      // 그리면서 잰 왼쪽 패널의 내용 높이
+
+        // 항공뷰 배율. 1 이면 장면 전체, 작을수록 가까이.
+        //
+        // 전체를 한 화면에 담는 것과 한 블록을 들여다보는 것은 다른 일이다.
+        // 전체만 보이면 549 m 가 손바닥만 하게 들어와 아무 것도 못 읽는다.
+        float aerialZoom = 1f;
+        bool xray;
 
         // 화면 배치
         // ---------
@@ -162,6 +171,15 @@ namespace WorldVision
             if (Input.GetKeyDown(KeyCode.H)) help = !help;
             if (Input.GetKeyDown(KeyCode.L)) showLabels = !showLabels;
             if (Input.GetKeyDown(KeyCode.T)) showTerminal = !showTerminal;
+            if (Input.GetKeyDown(KeyCode.X) && boot != null)
+            {
+                // X-ray. 점을 더하기로 섞고 깊이를 쓰지 않으면 앞뒤가 겹쳐
+                // 보인다 - 건물 안의 기둥, 나무 뒤의 담장처럼 가려진 것이
+                // 드러난다. 실제로 투과한 것이 아니라 **겹쳐 보이게** 한
+                // 것이므로, 무엇이 앞인지는 이 모드에서 알 수 없다.
+                xray = !xray;
+                boot.SetXray(xray);
+            }
             if (Input.GetKeyDown(KeyCode.C) && boot != null)
             {
                 boot.Repaint((Boot.Paint)(((int)boot.paint + 1) % 3));
@@ -175,6 +193,21 @@ namespace WorldVision
                     if (Input.GetKeyDown(KeyCode.F1 + c))
                         boot.ShowClass(c, !boot.classOn[c]);
                 }
+            }
+            // 패널 위에서 휠을 굴리면 스크롤. 3D 위에서는 속도로 쓴다.
+            float wheel = Input.mouseScrollDelta.y;
+            if (Mathf.Abs(wheel) > 0.01f)
+            {
+                if (Input.mousePosition.x < kPanelW)
+                    panelScroll.y = Mathf.Clamp(panelScroll.y - wheel * 40f,
+                                                0f, Mathf.Max(0f, panelH - Screen.height));
+                else if (view == View.Aerial)
+                    // 항공뷰에서 휠은 줌이다. 지도를 보는 창에서 휠이 줌이
+                    // 아니면 어디서 줌을 하겠는가.
+                    aerialZoom = Mathf.Clamp(aerialZoom * (1f - wheel * 0.12f),
+                                             0.04f, 1.6f);
+                else
+                    speed = Mathf.Clamp(speed + wheel * 2f, 1f, 40f);
             }
             if (Input.GetKeyDown(KeyCode.R)) s = 0f;
             if (Input.GetKeyDown(KeyCode.Q)) Application.Quit();
@@ -303,12 +336,20 @@ namespace WorldVision
                     cam.fieldOfView = 55f;
                     break;
                 case View.Aerial:
+                {
+                    // 가까이 볼 때는 자차를 따라간다. 전체를 볼 때는 장면
+                    // 한가운데를 본다 - 줌을 당겼는데 화면이 안 움직이면
+                    // 어디를 보고 있는지 알 수 없다.
+                    float full = Mathf.Max(world.size.x, world.size.z) * 0.55f;
+                    float size = Mathf.Max(6f, full * aerialZoom);
+                    float t = Mathf.Clamp01((aerialZoom - 0.08f) / 0.5f);
+                    Vector3 c2 = Vector3.Lerp(car.position, world.center, t);
                     cam.transform.position = new Vector3(
-                        world.center.x, world.max.y + 80f, world.center.z);
+                        c2.x, world.max.y + 80f, c2.z);
                     cam.transform.rotation = Quaternion.Euler(90f, 0f, 0f);
-                    cam.orthographicSize =
-                        Mathf.Max(world.size.x, world.size.z) * 0.55f;
+                    cam.orthographicSize = size;
                     break;
+                }
             }
         }
 
@@ -481,6 +522,21 @@ namespace WorldVision
             GUI.DrawTexture(new Rect(W - 1f, 0f, 1f, H), barTex);
             GUI.color = gEdge;
 
+            // **넘치면 스크롤한다.**
+            //
+            // 창을 낮게 잡거나 클래스가 늘면 아래쪽 "조작" 이 화면 밖으로
+            // 밀린다. 항목을 줄이는 것은 답이 아니다 - 조작키는 늘 필요하고,
+            // 클래스 수는 데이터가 정한다. 내용 높이를 재서 넘칠 때만
+            // 스크롤 막대를 둔다.
+            bool over = panelH > H;
+            float innerW = over ? W - 16f : W;
+            if (over)
+            {
+                panelScroll = GUI.BeginScrollView(
+                    new Rect(0f, 0f, W, H), panelScroll,
+                    new Rect(0f, 0f, innerW, panelH), false, true);
+            }
+
             float y = 18f;
             GUI.Label(new Rect(kPadX, y, W - kPadX * 2f, 26f),
                       "WORLDVISION—SLAM", st);
@@ -595,7 +651,9 @@ namespace WorldVision
             Head(ref y, "보기");
             ViewRow(ref y, View.Driver, "1    운전석");
             ViewRow(ref y, View.Chase, "2    추적");
-            ViewRow(ref y, View.Aerial, "3    항공");
+            ViewRow(ref y, View.Aerial, view == View.Aerial && cam != null
+                ? string.Format("3    항공   폭 {0:n0} m", cam.orthographicSize * 2f)
+                : "3    항공");
             ViewRow(ref y, View.Free, "4    자유 · WASD 마우스");
 
             Head(ref y, "조작");
@@ -606,7 +664,15 @@ namespace WorldVision
             GUI.Label(new Rect(kPadX, y, W - kPadX * 2f, kRow),
                 "L 라벨      T 터미널      C 색", stDim); y += kRow;
             GUI.Label(new Rect(kPadX, y, W - kPadX * 2f, kRow),
+                "X 투과 보기" + (xray ? "  켜짐" : "") + "      휠  항공 줌",
+                stDim); y += kRow;
+            GUI.Label(new Rect(kPadX, y, W - kPadX * 2f, kRow),
                 "R 처음      H 표시      Q 종료", stDim); y += kRow;
+
+            // 다음 프레임의 스크롤 여부를 정할 높이. 그리면서 잰다 - 항목이
+            // 데이터에 따라 늘고 줄기 때문에 미리 계산할 수가 없다.
+            panelH = y + 16f;
+            if (over) GUI.EndScrollView();
 
             if (showTerminal)
                 Term(new Rect(W, H - kTermH, Screen.width - W - kCamW, kTermH));

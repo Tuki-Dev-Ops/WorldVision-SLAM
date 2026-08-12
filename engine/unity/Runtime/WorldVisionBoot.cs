@@ -317,6 +317,30 @@ namespace WorldVision
                 on ? "표시" : "숨김"), LogKind.Info);
         }
 
+        // 투과 보기.
+        //
+        // 점을 더하기로 섞고 깊이를 쓰지 않으면 앞의 면이 뒤를 가리지 않아
+        // 구조가 겹쳐 보인다 - 건물 안의 기둥, 나무 뒤의 담장이 드러난다.
+        // **실제로 투과한 것이 아니다.** 가려진 것을 새로 관측한 것이 아니라
+        // 이미 지도에 있던 점을 겹쳐 보이게 한 것뿐이고, 그래서 이 모드에서는
+        // 무엇이 앞인지 알 수 없다.
+        Material pointMat;
+
+        public void SetXray(bool on)
+        {
+            if (pointMat == null) return;
+            pointMat.SetInt("_SrcBlend", (int)(on
+                ? UnityEngine.Rendering.BlendMode.One
+                : UnityEngine.Rendering.BlendMode.One));
+            pointMat.SetInt("_DstBlend", (int)(on
+                ? UnityEngine.Rendering.BlendMode.One
+                : UnityEngine.Rendering.BlendMode.Zero));
+            pointMat.SetInt("_ZWrite", on ? 0 : 1);
+            pointMat.renderQueue = on ? 3000 : 2000;
+            log.Add("view", on ? "투과 보기 켜짐 (겹쳐 보이게 한 것이지 투과가 아니다)"
+                               : "투과 보기 꺼짐", LogKind.Info);
+        }
+
         public void Repaint(Paint p)
         {
             paint = p;
@@ -395,6 +419,7 @@ namespace WorldVision
             var sh = Shader.Find("WorldVision/Point");
             var mat = new Material(sh != null ? sh : Shader.Find("Unlit/Color"));
             mat.name = "wv_point";
+            pointMat = mat;
 
             var parent = new GameObject("PointCloud").transform;
             const int kChunk = 60000;

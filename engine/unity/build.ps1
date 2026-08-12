@@ -39,10 +39,16 @@ Remove-Item (Join-Path $proj "Assets\WorldVisionScene.unity") -Force -ErrorActio
 Remove-Item (Join-Path $proj "Assets\WorldVisionScene.unity.meta") -Force -ErrorAction SilentlyContinue
 Remove-Item (Join-Path $proj "Assets\WorldVisionSim.unity") -Force -ErrorAction SilentlyContinue
 Remove-Item (Join-Path $proj "Assets\WorldVisionSim.unity.meta") -Force -ErrorAction SilentlyContinue
-# Library 의 빌드 캐시도 함께 버린다. 남겨 두면 지운 에셋을 가리키는 항목이
-# 살아남아, 빌드는 성공하는데 실행할 때 level0 을 못 읽는 일이 생긴다.
-Remove-Item (Join-Path $proj "Library\BuildPlayerData") -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item (Join-Path $proj "Library\Bee") -Recurse -Force -ErrorAction SilentlyContinue
+# **Library 를 통째로 버린다.**
+#
+# BuildPlayerData 와 Bee 만 지워 봤는데 부족했다 - 셰이더를 고친 다음 빌드가
+# 다시 "level0 is corrupted" 로 죽었다. 어느 캐시가 남아서 그런지 하나씩
+# 좁히는 것보다, 이 프로젝트에서는 전부 버리는 편이 싸다: 에셋이라고는
+# 스크립트 몇 개와 셰이더 하나뿐이고 (StreamingAssets 는 임포트 대상이
+# 아니라 복사 대상이다) 재임포트가 몇십 초다.
+#
+# 빌드가 가끔 실행되지 않는 것보다 매번 조금 느린 편이 낫다.
+Remove-Item (Join-Path $proj "Library") -Recurse -Force -ErrorAction SilentlyContinue
 
 # 프로젝트를 열고 있는 Unity 가 남아 있으면 잠금 때문에 배치 모드가 아예
 # 시작하지 않는다 - 로그 파일조차 안 생겨서 원인이 잘 안 보인다.
