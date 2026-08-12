@@ -161,7 +161,8 @@ WorldVision-SLAM/
 │   ├── 03-roadmap.md
 │   ├── 04-unified-objective.md
 │   ├── 05-research-program.md
-│   └── 06-results.md         ★ 모든 실측 결과와 실패 기록
+│   ├── 06-results.md         ★ 모든 실측 결과와 실패 기록
+│   └── 07-adverse-weather.md 실제 악천후 데이터 진입 조건과 변환기 설계
 │
 ├── results/bench/index.html  ★ 좌: 기존 모델 / 우: WME  비교 뷰어
 ├── cmake/                    의존성·경고 정책
