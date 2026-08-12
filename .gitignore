@@ -68,3 +68,4 @@ engine/unity/Project/Assets/WorldVisionScene.unity*
 engine/unity/Project/Assets/StreamingAssets/
 engine/unity/Project/Assets/StreamingAssets.meta
 results/scene/*.wvpc
+results/cam/

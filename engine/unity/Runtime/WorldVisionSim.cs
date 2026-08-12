@@ -128,6 +128,18 @@ namespace WorldVision
             {
                 if (route == null) route = boot.route;
                 if (stats == null) stats = boot.stats;
+                // 시퀀스를 갈아 끼우면 경로 길이가 달라진다. 새로 재지
+                // 않으면 진행 막대가 엉뚱한 값을 가리킨다.
+                boot.onLoaded += () =>
+                {
+                    route = boot.route;
+                    stats = boot.stats;
+                    routeLen = Mathf.Max(1f, route.Length);
+                    s = 0f;
+                    world = WorldBounds();
+                    aerialZoom = 1f;
+                    seenNear.Clear();
+                };
             }
             if (route != null) routeLen = Mathf.Max(1f, route.Length);
             panelTex = Solid(new Color(0.045f, 0.055f, 0.075f, 0.94f));
@@ -674,6 +686,8 @@ namespace WorldVision
             panelH = y + 16f;
             if (over) GUI.EndScrollView();
 
+            Sequences();
+
             if (showTerminal)
                 Term(new Rect(W, H - kTermH, Screen.width - W - kCamW, kTermH));
 
@@ -740,6 +754,45 @@ namespace WorldVision
 
         // 값을 오른쪽에 맞춘다. 왼쪽 정렬하면 자리수가 다른 숫자가 들쭉
         // 날쭉해서 세로로 훑을 수가 없다.
+        // 오른쪽 위 시퀀스 전환.
+        //
+        // 한 장면만 보면 지금 보이는 것이 이 방법의 성질인지 그 골목의
+        // 성질인지 알 수 없다. 갈아 끼워 봐야 갈린다 - 나무가 많은 길,
+        // 넓은 도로, 좁은 주택가에서 같은 코드가 어떻게 달라지는가.
+        void Sequences()
+        {
+            if (boot == null || boot.available.Count < 2) return;
+            const float w = 178f;
+            float rows = boot.available.Count;
+            var r = new Rect(Screen.width - w - 12f, 12f, w,
+                             28f + rows * (kRow + 4f) + 8f);
+            Box(r);
+            Outline(r, new Color(0.20f, 0.28f, 0.38f, 0.8f));
+            GUI.Label(new Rect(r.x + 12f, r.y + 6f, w - 24f, kHeadRow),
+                      "시퀀스", stHead);
+            float y = r.y + 30f;
+            foreach (var name in boot.available)
+            {
+                bool on = boot.sceneName == name;
+                var rr = new Rect(r.x + 10f, y, w - 20f, kRow + 2f);
+                if (on)
+                {
+                    var g = GUI.color;
+                    GUI.color = new Color(0.42f, 0.86f, 0.80f, 0.18f);
+                    GUI.DrawTexture(rr, barTex);
+                    GUI.color = g;
+                }
+                if (GUI.Button(rr, GUIContent.none, GUIStyle.none) && !on)
+                {
+                    boot.Load(name);
+                }
+                if (on) Swatch(rr.x + 6f, y + 1f, new Color(0.42f, 0.86f, 0.80f));
+                GUI.Label(new Rect(rr.x + 26f, y + 1f, w - 40f, kRow),
+                          name, on ? st : stDim);
+                y += kRow + 4f;
+            }
+        }
+
         void Row(ref float y, Color c, string name, int n, float area, string unit)
         {
             Swatch(kPadX, y, c);

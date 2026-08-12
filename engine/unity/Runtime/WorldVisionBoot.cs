@@ -42,27 +42,82 @@ namespace WorldVision
             public int seen;
         }
 
+        // 담겨 온 시퀀스 목록. 화면에서 갈아 끼울 수 있어야 한다 - 한 장면만
+        // 보면 그것이 이 방법의 성질인지 그 골목의 성질인지 알 수 없다.
+        [NonSerialized] public List<string> available = new List<string>();
+        GameObject cloudRoot;
+
         void Awake()
         {
             log = gameObject.AddComponent<Log>();
             stats = gameObject.AddComponent<Stats>();
             route = gameObject.AddComponent<Route>();
 
-            string dir = Application.streamingAssetsPath;
+            string dir = DataDir();
             log.Add("boot", "WorldVision-SLAM 실행", LogKind.Info);
             log.Add("boot", "데이터: " + dir, LogKind.Info);
 
-            string json = Path.Combine(dir, sceneName + ".json");
+            if (Directory.Exists(dir))
+            {
+                foreach (var f in Directory.GetFiles(dir, "*.json"))
+                    available.Add(Path.GetFileNameWithoutExtension(f));
+                available.Sort();
+            }
+            log.Add("boot", string.Format("시퀀스 {0} 개", available.Count),
+                    available.Count > 0 ? LogKind.Ok : LogKind.Error);
+            Load(sceneName);
+        }
+
+        // **데이터는 빌드 밖에 둔다.**
+        //
+        // StreamingAssets 에 넣으면 빌드에 함께 포장되는데, 네 시퀀스를 담아
+        // 158 MB 가 되자 실행이 안 됐다 (두 개 121 MB 는 됐다). 한계를 정확히
+        // 좁히는 것보다 빼는 편이 낫다 - 실행 파일 옆 폴더에서 읽으면 크기
+        // 제한이 없고, 데이터만 갈아 끼울 때 다시 빌드하지 않아도 된다.
+        //
+        // 없으면 StreamingAssets 로 되돌아간다. 에디터에서 재생할 때가 그렇다.
+        public static string DataDir()
+        {
+            string exeSide = Path.Combine(
+                Path.GetDirectoryName(Application.dataPath) ?? ".", "wvdata");
+            if (Directory.Exists(exeSide)) return exeSide;
+            return Application.streamingAssetsPath;
+        }
+
+        // 장면을 갈아 끼운다.
+        //
+        // 씬을 다시 여는 대신 지도만 새로 짓는다 - 카메라와 자차와 화면은
+        // 그대로 두어야 보던 자리에서 이어진다.
+        public void Load(string name)
+        {
+            string dir = DataDir();
+            string json = Path.Combine(dir, name + ".json");
             if (!File.Exists(json))
             {
                 log.Add("boot", "장면 파일이 없다: " + json, LogKind.Error);
                 return;
             }
+            sceneName = name;
+
+            if (cloudRoot != null) Destroy(cloudRoot);
+            cloudMeshes.Clear(); cloudRel.Clear();
+            cloudInten.Clear(); cloudCls.Clear();
+            for (int c = 0; c < kClassN; ++c) { byClass[c] = null; classCount[c] = 0; }
+            detections.Clear();
+            lanes.Clear();
+            camFiles = null;
+            camCache.Clear();
+            camOrder.Clear();
+
+            log.Add("boot", "불러오는 중: " + name, LogKind.Info);
             string text = File.ReadAllText(json);
             BuildFromJson(text);
-            BuildCloud(Path.Combine(dir, sceneName + ".wvpc"));
+            BuildCloud(Path.Combine(dir, name + ".wvpc"));
             log.Add("boot", "지도 준비 완료", LogKind.Ok);
+            if (onLoaded != null) onLoaded();
         }
+
+        public System.Action onLoaded;
 
         // ------------------------------------------------------------------
         // 숫자 읽기
@@ -421,7 +476,8 @@ namespace WorldVision
             mat.name = "wv_point";
             pointMat = mat;
 
-            var parent = new GameObject("PointCloud").transform;
+            cloudRoot = new GameObject("PointCloud");
+            var parent = cloudRoot.transform;
             const int kChunk = 60000;
 
             // 먼저 클래스별로 색인을 모은다. 점 하나를 두 번 읽지 않으려고
@@ -542,7 +598,8 @@ namespace WorldVision
         {
             if (camFiles == null)
             {
-                string d = Path.Combine(Application.streamingAssetsPath, "cam");
+                string d = Path.Combine(Path.Combine(DataDir(), "cam"), sceneName);
+                if (!Directory.Exists(d)) d = Path.Combine(DataDir(), "cam");
                 camFiles = Directory.Exists(d) ? Directory.GetFiles(d, "*.jpg") : new string[0];
                 Array.Sort(camFiles);
                 log.Add("cam", camFiles.Length > 0

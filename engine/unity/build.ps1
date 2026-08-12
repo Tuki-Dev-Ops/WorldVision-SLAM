@@ -98,5 +98,29 @@ if (-not (Test-Path (Join-Path $outPath "WorldVision_Data\level0"))) {
     Write-Error "빌드에 씬이 없다 (level0 없음). 로그: $log"
     exit 1
 }
+# **데이터는 실행 파일 옆에 둔다.**
+#
+# StreamingAssets 에 넣으면 빌드에 포장되는데, 네 시퀀스를 담아 158 MB 가
+# 되자 실행이 안 됐다 (두 개 121 MB 는 됐다). 옆에 두면 크기 제한이 없고,
+# 데이터만 갈아 끼울 때 다시 빌드할 필요도 없다.
+$dataDir = Join-Path $outPath "wvdata"
+New-Item -ItemType Directory -Force $dataDir | Out-Null
+$sceneSrc = Split-Path -Parent $scenePath
+Get-ChildItem $sceneSrc -Filter "*.json" | ForEach-Object {
+    $pc = Join-Path $sceneSrc ($_.BaseName + ".wvpc")
+    # 점군이 없는 장면은 싣지 않는다 - 목록에는 뜨는데 열면 빈 편이 더 나쁘다.
+    if (Test-Path $pc) {
+        Copy-Item $_.FullName $dataDir -Force
+        Copy-Item $pc $dataDir -Force
+    }
+}
+$camSrc = Join-Path $repo "results\cam"
+if (Test-Path $camSrc) {
+    Copy-Item $camSrc (Join-Path $dataDir "cam") -Recurse -Force
+}
+$n = (Get-ChildItem $dataDir -Filter "*.wvpc" | Measure-Object).Count
+$mb = [int](((Get-ChildItem $dataDir -Recurse -File | Measure-Object -Property Length -Sum).Sum) / 1MB)
+Write-Output "데이터: 시퀀스 $n 개, $mb MB  ($dataDir)"
+
 Write-Output "빌드 완료: $exe"
 if ($Run) { Start-Process -FilePath $exe }

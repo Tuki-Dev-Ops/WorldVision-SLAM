@@ -157,6 +157,7 @@ namespace UnityEngine
         public static void Label(Rect r, string s, GUIStyle st) { }
         public static void DrawTexture(Rect r, Texture t) { }
         public static void DrawTexture(Rect r, Texture t, ScaleMode m) { }
+        public static bool Button(Rect r, GUIContent c, GUIStyle s) { return false; }
         public static Vector2 BeginScrollView(Rect pos, Vector2 scroll, Rect view, bool h, bool v) { return scroll; }
         public static void EndScrollView() { }
     }
@@ -178,10 +179,12 @@ namespace UnityEngine
     public enum TextAnchor { UpperLeft, UpperCenter, UpperRight, MiddleLeft, MiddleCenter, MiddleRight }
     public class RectOffset { public RectOffset(int l, int r, int t, int b) { } }
     public class GUISkin { public GUIStyle label = new GUIStyle(); }
+    public class GUIContent { public static GUIContent none = new GUIContent(); }
     public class Font : Object { }
     public class GUIStyleState { public Color textColor; }
     public class GUIStyle
     {
+        public static GUIStyle none = new GUIStyle();
         public GUIStyle() { }
         public GUIStyle(GUIStyle o) { }
         public int fontSize;

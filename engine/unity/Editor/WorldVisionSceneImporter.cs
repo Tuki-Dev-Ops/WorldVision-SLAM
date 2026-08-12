@@ -490,14 +490,15 @@ namespace WorldVision
 
             // 데이터를 StreamingAssets 로. 여기 있는 것은 직렬화되지 않고
             // 파일 그대로 복사되므로 씬 크기와 무관하다.
-            string sa = "Assets/StreamingAssets";
-            Directory.CreateDirectory(sa);
+            // **데이터는 여기서 옮기지 않는다.**
+            //
+            // 예전에는 장면 파일을 Assets/StreamingAssets 로 복사해 빌드에
+            // 포장했다. 두 가지가 나빴다. 시퀀스를 여럿 담으니 빌드가 커져
+            // 실행되지 않았고, 파일 API 로 그 폴더를 갈아엎은 직후의
+            // AssetDatabase.Refresh 가 방금 저장한 씬을 흔들어 - 씬 없는
+            // 빌드가 나왔다. 데이터는 build.ps1 이 실행 파일 옆 wvdata 에
+            // 넣고, 런타임이 거기서 읽는다.
             string baseName = Path.GetFileNameWithoutExtension(scene);
-            string srcDir = Path.GetDirectoryName(Path.GetFullPath(scene));
-            File.Copy(scene, Path.Combine(sa, baseName + ".json"), true);
-            string pc = Path.Combine(srcDir, baseName + ".wvpc");
-            if (File.Exists(pc)) File.Copy(pc, Path.Combine(sa, baseName + ".wvpc"), true);
-            else Debug.LogWarning("WorldVision: 점군이 없다 - " + pc);
 
             var root = new GameObject("WorldVision");
             var boot = root.AddComponent<Boot>();
@@ -568,7 +569,30 @@ namespace WorldVision
             PlayerSettings.fullScreenMode = FullScreenMode.Windowed;
             PlayerSettings.resizableWindow = true;
             PlayerSettings.runInBackground = true;
-            IncludeShader("WorldVision/Point");
+            // **셰이더는 씬에서 참조되게 한다.**
+            //
+            // 예전에는 그래픽 설정의 "항상 포함" 목록에 넣었는데, 그것은
+            // 빌드 직전에 ProjectSettings 를 고치는 일이다. 씬 저장과
+            // 에셋 저장이 그 사이에서 엉키면서 실행되지 않는 빌드가 나왔다.
+            // 눈에 안 띄는 작은 메시 하나가 그 재질을 들고 있으면, 셰이더는
+            // 평범한 의존성으로 따라 들어간다.
+            {
+                var keep = new GameObject("ShaderKeepAlive");
+                keep.transform.SetParent(root.transform, false);
+                keep.transform.localScale = new Vector3(0.001f, 0.001f, 0.001f);
+                var mf = keep.AddComponent<MeshFilter>();
+                var m = new Mesh();
+                m.name = "keepalive";
+                m.SetVertices(new List<Vector3> { Vector3.zero });
+                m.SetIndices(new[] { 0 }, MeshTopology.Points, 0);
+                mf.sharedMesh = m;
+                var sh = Shader.Find("WorldVision/Point");
+                if (sh == null) Debug.LogWarning("WorldVision: 점 셰이더 없음");
+                keep.AddComponent<MeshRenderer>().sharedMaterial =
+                    Persist(new Material(sh != null ? sh : Shader.Find("Unlit/Color"))
+                            { name = "wv_point_keep" }, "wv_point_keep");
+                Persist(m, "SM_keepalive");
+            }
 
             const string scenePath = "Assets/WorldVisionSim.unity";
             EditorSceneManager.SaveScene(EditorSceneManager.GetActiveScene(), scenePath);
