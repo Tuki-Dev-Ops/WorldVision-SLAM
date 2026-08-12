@@ -4970,6 +4970,25 @@ inline bool exportSceneJson(const fs::path& path,
             f << "]}";
         }
         f << "\n  ]\n}\n";
+        // 격자에 실제로 몇 칸이 찼고 무엇으로 불리는가.
+        {
+            long long n_cell = 0, n_hit1 = 0;
+            long long by[4] = {0, 0, 0, 0}, no_seg = 0;
+            for (const auto& [k2, rc] : road) {
+                if (rc.hits == 0) continue;
+                ++n_cell;
+                if (rc.hits == 1) ++n_hit1;
+                if (rc.seg <= 18) ++by[static_cast<int>(surfaceFromCityscapes(rc.seg))];
+                else ++no_seg;
+            }
+            if (n_cell > 0) {
+                std::cout << "  노면 칸: " << n_cell << " 개 (0.1 m), 한 번만 본 칸 "
+                          << (100 * n_hit1 / n_cell) << " %"
+                          << " | 도로 " << by[0] << " 인도 " << by[1]
+                          << " 잔디 " << by[2] << " 기타 " << by[3]
+                          << " 라벨없음 " << no_seg << std::endl;
+            }
+        }
         if (g_road_offered > 0) {
             std::cout << "  노면 격자: 제시 " << g_road_offered << ", 통과 "
                       << g_road_taken << " ("
