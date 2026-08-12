@@ -22,8 +22,21 @@ New-Item -ItemType Directory -Force (Join-Path $proj "Assets\Editor")  | Out-Nul
 New-Item -ItemType Directory -Force (Join-Path $proj "Assets\Scripts") | Out-Null
 Copy-Item (Join-Path $repo "engine\unity\Editor\WorldVisionSceneImporter.cs") `
           (Join-Path $proj "Assets\Editor\") -Force
-Copy-Item (Join-Path $repo "engine\unity\Runtime\WorldVisionPlayer.cs") `
+Copy-Item (Join-Path $repo "engine\unity\Runtime\*.cs") `
           (Join-Path $proj "Assets\Scripts\") -Force
+Copy-Item (Join-Path $repo "engine\unity\Runtime\*.shader") `
+          (Join-Path $proj "Assets\Scripts\") -Force
+
+# **생성물은 매번 지우고 시작한다.**
+#
+# 임포터가 만드는 메시와 재질은 에셋이고, 그것을 지웠다 같은 경로에 다시
+# 만들면 이전 씬이 들고 있던 참조가 어긋난다. 빌드는 성공하는데 실행하면
+# "level0 is corrupted / Position out of bounds" 로 죽었다 - 그것도 매번이
+# 아니라 가끔이라 더 나빴다.
+Remove-Item (Join-Path $proj "Assets\WorldVision") -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item (Join-Path $proj "Assets\WorldVision.meta") -Force -ErrorAction SilentlyContinue
+Remove-Item (Join-Path $proj "Assets\WorldVisionScene.unity") -Force -ErrorAction SilentlyContinue
+Remove-Item (Join-Path $proj "Assets\WorldVisionScene.unity.meta") -Force -ErrorAction SilentlyContinue
 
 # 프로젝트를 열고 있는 Unity 가 남아 있으면 잠금 때문에 배치 모드가 아예
 # 시작하지 않는다 - 로그 파일조차 안 생겨서 원인이 잘 안 보인다.
@@ -35,7 +48,7 @@ $scenePath = (Resolve-Path (Join-Path $repo $Scene)).Path
 $outPath = Join-Path $repo $Out
 
 & $Editor -batchmode -quit -projectPath $proj `
-    -executeMethod WorldVision.SceneImporter.BuildPlayerFromCommandLine `
+    -executeMethod WorldVision.SceneImporter.BuildSimFromCommandLine `
     -wvScene $scenePath -wvOut $outPath -logFile $log
 
 # 배치 모드는 셰이더 컴파일이 남은 채로 제어를 돌려주기도 한다.

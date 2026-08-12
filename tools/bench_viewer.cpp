@@ -4475,6 +4475,87 @@ inline std::vector<LaneLine> predictLanes(
     return out;
 }
 
+// ---------------------------------------------------------------------------
+// 점군 — 지도를 점 그대로 내보낸다
+// ---------------------------------------------------------------------------
+// 상자와 사각형으로 세운 장면은 **해석** 이다. 집을 직육면체로 바꾸는 순간
+// 창틀도 담장도 계단도 사라지고, 잘못 맞춘 상자는 없는 벽을 만든다.
+//
+// 점군은 해석하기 전의 것이다. LiDAR 지도가 그렇게 보이는 이유가 그것이고,
+// 실제로 그 그림이 더 많은 것을 보여 준다 - 나뭇가지, 연석, 주차된 차의
+// 윤곽, 벽면의 요철이 전부 남아 있다. 둘은 경쟁하지 않는다: 점군이 무엇을
+// 봤는가이고, 상자가 그것을 무엇으로 읽었는가다.
+//
+// 형식은 납작한 이진 파일이다. JSON 으로 40 만 점을 내면 20 MB 가 넘고
+// 파싱만 몇 초가 걸린다.
+//
+//   "WVPC" | uint32 version | uint32 count | float32 origin[3]
+//   count x { float32 x,y,z (원점 기준) | float32 지면위높이 | uint8 밝기 | uint8 클래스 }
+inline bool exportCloud(const fs::path& path,
+                        const std::unordered_map<std::int64_t, Splat>& cells,
+                        const std::unordered_map<std::int64_t, Column>& cols,
+                        const Eigen::Vector3d& up_d, float cell,
+                        const Eigen::Vector3f& ga, const Eigen::Vector3f& gb,
+                        std::size_t cap = 900000) {
+    const GroundGrid g(up_d.cast<float>(), cell);
+    std::ofstream f(path, std::ios::binary);
+    if (!f) return false;
+
+    // 상한을 넘으면 고르게 솎는다. 앞부분만 잘라 내면 지나온 길이 통째로
+    // 사라져 지도가 반토막 난다.
+    const std::size_t n_all = cells.size();
+    const std::size_t step = (n_all > cap) ? (n_all / cap + 1) : 1;
+
+    std::vector<float> pos;
+    std::vector<std::uint8_t> attr;
+    pos.reserve((n_all / step + 1) * 4);
+    attr.reserve((n_all / step + 1) * 2);
+
+    Eigen::Vector3f org = Eigen::Vector3f::Zero();
+    bool have_org = false;
+    std::size_t i = 0, kept = 0;
+    for (const auto& [k, v] : cells) {
+        if (step > 1 && (i++ % step) != 0) continue;
+        if (!have_org) { org = v.p; have_org = true; }
+        // 지면 위 높이. LiDAR 지도가 색을 입히는 축이 이것이다 - 노면은
+        // 파랗고 지붕은 붉게 나오는 그 색이 곧 높이다.
+        const auto [ci, cj] = g.ij(v.p);
+        const auto it = cols.find(GroundGrid::key(ci, cj));
+        const float ground = (it != cols.end()) ? it->second.ground
+                                                : v.p.dot(g.up);
+        const float rel = v.p.dot(g.up) - ground;
+        // 내보내기 좌표계 (오른손 +y up) 로 옮긴 뒤 원점을 뺀다. 원점을
+        // 빼는 이유는 float 정밀도다 - 수 km 를 달린 뒤 좌표가 커지면
+        // 0.3 m 복셀이 뭉개진다.
+        const Eigen::Vector3f w(v.p.dot(g.a) - org.dot(g.a),
+                                v.p.dot(g.up) - org.dot(g.up),
+                                v.p.dot(g.b) - org.dot(g.b));
+        pos.push_back(w.x()); pos.push_back(w.y()); pos.push_back(w.z());
+        pos.push_back(rel);
+        attr.push_back(v.intensity);
+        // 클래스는 그 기둥의 라벨이다. 점마다 다시 판정하지 않는다 -
+        // 같은 기둥의 점들이 서로 다른 색이면 그것은 잡음이다.
+        attr.push_back(static_cast<std::uint8_t>(
+            (it != cols.end()) ? static_cast<int>(it->second.cls) : 0));
+        ++kept;
+    }
+
+    const Eigen::Vector3f org_w(org.dot(g.a), org.dot(g.up), org.dot(g.b));
+    const std::uint32_t ver = 1, cnt = static_cast<std::uint32_t>(kept);
+    f.write("WVPC", 4);
+    f.write(reinterpret_cast<const char*>(&ver), 4);
+    f.write(reinterpret_cast<const char*>(&cnt), 4);
+    f.write(reinterpret_cast<const char*>(org_w.data()), 12);
+    for (std::size_t j = 0; j < kept; ++j) {
+        f.write(reinterpret_cast<const char*>(&pos[j * 4]), 16);
+        f.write(reinterpret_cast<const char*>(&attr[j * 2]), 2);
+    }
+    std::cout << "  점군: " << kept << " 점 (" << n_all << " 복셀에서 1/"
+              << step << "), " << (kept * 18 + 24) / 1024 << " KB" << std::endl;
+    (void)ga; (void)gb;
+    return static_cast<bool>(f);
+}
+
 inline bool exportSceneJson(const fs::path& path,
                             const std::unordered_map<std::int64_t, HouseBin>& houses,
                             const std::unordered_map<std::int64_t, Column>& cols,
@@ -4696,6 +4777,35 @@ inline bool exportSceneJson(const fs::path& path,
                 img.at<std::uint8_t>(static_cast<int>(qj - j0),
                                      static_cast<int>(qi - i0)) = rc.intensity;
             }
+            // **빈 칸을 메운다.**
+            //
+            // 관측은 성기다. 그대로 구우면 검은 화소가 섞여 나오는데, 엔진이
+            // 그것을 노면 albedo 로 쓰면 타일마다 검은 얼룩이 앉고 밉맵이
+            // 섞이면서 타일 경계마다 이음새가 보인다. 실제로 격자무늬로
+            // 나왔다.
+            //
+            // 이웃의 평균으로 채운다. 없는 값을 지어내는 것이 아니라 옆 칸의
+            // 값을 빌리는 것이고, 세 번만 돌리므로 관측에서 30 cm 이상
+            // 떨어진 자리는 여전히 비어 있다.
+            {
+                cv::Mat filled = img.clone();
+                for (int pass = 0; pass < 3; ++pass) {
+                    cv::Mat mask = (filled == 0);
+                    cv::Mat blur;
+                    cv::Mat nz = (filled > 0);
+                    cv::Mat f32, w32;
+                    filled.convertTo(f32, CV_32F);
+                    nz.convertTo(w32, CV_32F, 1.0 / 255.0);
+                    cv::blur(f32, f32, cv::Size(3, 3));
+                    cv::blur(w32, w32, cv::Size(3, 3));
+                    cv::Mat avg;
+                    cv::divide(f32, cv::max(w32, 1e-3f), avg);
+                    cv::Mat avg8;
+                    avg.convertTo(avg8, CV_8U);
+                    avg8.copyTo(filled, mask & (w32 > 0.1f));
+                }
+                img = filled;
+            }
             fs::path png = path;
             png.replace_extension();
             png += "_road.png";
@@ -4718,6 +4828,33 @@ inline bool exportSceneJson(const fs::path& path,
         } else {
             f << "  \"road_map\": null,\n";
         }
+    }
+
+    // --- 자차 궤적 ---
+    //
+    // **엔진에서 자동으로 달리게 하려면 달릴 자리가 있어야 한다.** 그 자리를
+    // 지어낼 이유가 없다 - 이 시퀀스에서 차가 실제로 지나간 자리가 이미
+    // 있고, 그것이 곧 정답 주행이다. 속도까지 그 간격에 들어 있다.
+    //
+    // 2 m 마다 뽑는다. 프레임 간격은 속도에 따라 0.2 m 에서 2 m 까지
+    // 흔들려서, 그대로 내면 정지 구간에 점이 수백 개 몰린다.
+    {
+        f << "  \"trajectory\": [";
+        Eigen::Vector3f last = Eigen::Vector3f::Constant(1e9f);
+        bool tfirst = true;
+        int n_traj = 0;
+        for (const auto& p : traj) {
+            const Eigen::Vector3f w = W(p.cast<float>());
+            if (!tfirst && (w - last).norm() < 2.0f) continue;
+            if (!tfirst) f << ", ";
+            tfirst = false;
+            last = w;
+            ++n_traj;
+            f << "[" << w.x() << ", " << w.y() << ", " << w.z() << "]";
+        }
+        f << "],\n";
+        std::cout << "  궤적: " << n_traj << " 점 (2 m 간격, "
+                  << traj.size() << " 포즈에서)" << std::endl;
     }
 
     // --- 차선 ---
@@ -7113,6 +7250,13 @@ int main(int argc, char** argv) {
                                     orb.world_up, ccell3, ego_pos,
                                     frame + 1, s.name, ego_traj)) {
                     std::cout << "장면 서술: " << scene_json << std::endl;
+                    // 점군은 같은 이름에 확장자만 바꾼다. 엔진이 짝을 찾는다.
+                    fs::path cloud_path = scene_json;
+                    cloud_path.replace_extension(".wvpc");
+                    if (!exportCloud(cloud_path, acc[1].cells, stuff[1],
+                                     orb.world_up, ccell3, road_a, road_b)) {
+                        std::cerr << "점군 저장 실패: " << cloud_path << std::endl;
+                    }
                 } else {
                     std::cerr << "장면 서술 저장 실패: " << scene_json << std::endl;
                 }

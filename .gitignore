@@ -63,3 +63,8 @@ engine/unity/Project/UserSettings/
 engine/unity/Project/obj/
 # 임포터가 만든 씬. 장면 JSON 에서 다시 만들 수 있다.
 engine/unity/Project/Assets/WorldVisionScene.unity*
+
+# Unity StreamingAssets 는 빌드 산출물이다 (점군 14 MB, 카메라 프레임 4 MB)
+engine/unity/Project/Assets/StreamingAssets/
+engine/unity/Project/Assets/StreamingAssets.meta
+results/scene/*.wvpc

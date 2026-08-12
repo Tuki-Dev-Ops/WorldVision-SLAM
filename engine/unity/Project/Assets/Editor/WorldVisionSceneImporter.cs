@@ -112,6 +112,43 @@ namespace WorldVision
             return Quaternion.LookRotation(f.normalized, Vector3.up);
         }
 
+        // 생성한 메시와 재질은 **에셋으로 저장한다.**
+        //
+        // 처음에는 씬에 그대로 직렬화했는데, 타일이 만 이천에서 이만 육천으로
+        // 늘자 빌드된 실행 파일이 "level0 is corrupted / Position out of
+        // bounds" 로 죽었다. 씬 파일 하나에 메시 수십만 정점을 밀어 넣은
+        // 결과다. 에셋으로 빼면 각자 제 파일로 직렬화되고 빌드도 가벼워진다.
+        const string kAssetDir = "Assets/WorldVision";
+
+        // **폴더는 AssetDatabase 를 통해 만들어야 한다.**
+        //
+        // Directory.CreateDirectory 로 만든 폴더는 디스크에는 있지만
+        // 데이터베이스가 모르므로 CreateAsset 이 조용히 실패한다. 그러면
+        // 메시가 에셋이 안 되고 씬에 그대로 직렬화되어, 빌드는 성공하는데
+        // 실행할 때 "level0 is corrupted" 로 죽는다. 두 번 그렇게 잃었다.
+        static void EnsureAssetDir()
+        {
+            if (!AssetDatabase.IsValidFolder(kAssetDir))
+            {
+                AssetDatabase.CreateFolder("Assets", "WorldVision");
+            }
+        }
+
+        static T Persist<T>(T obj, string name) where T : UnityEngine.Object
+        {
+            if (obj == null) return null;
+            EnsureAssetDir();
+            string path = kAssetDir + "/" + name + ".asset";
+            AssetDatabase.DeleteAsset(path);
+            AssetDatabase.CreateAsset(obj, path);
+            // 조용히 실패하면 안 된다. 여기서 안 잡히면 실행할 때 잡힌다.
+            if (AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(path) == null)
+            {
+                Debug.LogError("WorldVision: 에셋을 못 만들었다 - " + path);
+            }
+            return obj;
+        }
+
         static Material MakeMaterial(string name, Color c)
         {
             // 렌더 파이프라인마다 표준 셰이더 이름이 다르다. URP/HDRP 를
@@ -122,7 +159,9 @@ namespace WorldVision
                      ?? Shader.Find("Standard");
             var m = new Material(sh) { name = name };
             m.color = c;
-            return m;
+            // 같은 재질을 쓰는 상자가 수백 개다. 인스턴싱을 켜면 드로콜이
+            // 그만큼 묶인다 - 내장 GPU 에서 이 차이가 크다.
+            return Persist(m, name);
         }
 
         static GameObject Box(Transform parent, string name, Vector3 pos,
@@ -394,6 +433,174 @@ namespace WorldVision
             eye.tag = "MainCamera";
 
             body.AddComponent<Player>();
+
+            // **자동 주행.** 달릴 자리는 지어내지 않는다 - 궤적이 곧 정답
+            // 주행이고, 그 위를 도는 것만으로도 노면이 이어져 있는지 차선이
+            // 코너에서 끊기는지가 드러난다.
+            var carGo = new GameObject("EgoCar");
+            var bodyBox = GameObject.CreatePrimitive(PrimitiveType.Cube);
+            bodyBox.name = "Body";
+            bodyBox.transform.SetParent(carGo.transform, false);
+            bodyBox.transform.localPosition = new Vector3(0f, 0.72f, 0f);
+            bodyBox.transform.localScale = new Vector3(1.78f, 0.72f, 4.30f);
+            var matEgo = MakeMaterial("wv_ego", new Color(0.86f, 0.32f, 0.20f));
+            bodyBox.GetComponent<Renderer>().sharedMaterial = matEgo;
+            UnityEngine.Object.DestroyImmediate(bodyBox.GetComponent<BoxCollider>());
+            var cab = GameObject.CreatePrimitive(PrimitiveType.Cube);
+            cab.name = "Cabin";
+            cab.transform.SetParent(carGo.transform, false);
+            cab.transform.localPosition = new Vector3(0f, 1.30f, -0.25f);
+            cab.transform.localScale = new Vector3(1.58f, 0.62f, 2.10f);
+            cab.GetComponent<Renderer>().sharedMaterial =
+                MakeMaterial("wv_ego_glass", new Color(0.16f, 0.22f, 0.28f));
+            UnityEngine.Object.DestroyImmediate(cab.GetComponent<BoxCollider>());
+
+            var dir = new GameObject("Director").AddComponent<Director>();
+            dir.route = UnityEngine.Object.FindFirstObjectByType<Route>();
+            dir.stats = UnityEngine.Object.FindFirstObjectByType<Stats>();
+            dir.cam = cam;
+            dir.car = carGo.transform;
+            dir.free = body.GetComponent<Player>();
+        }
+
+        // 런타임에 짓는 실행 파일을 만든다.
+        //
+        //   Unity.exe -batchmode -quit -projectPath <프로젝트>
+        //             -executeMethod WorldVision.SceneImporter.BuildSimFromCommandLine
+        //             -wvScene <장면.json> -wvOut <출력폴더>
+        //
+        // 씬에는 카메라와 빛과 부트 오브젝트만 넣는다. 지도는 실행할 때
+        // StreamingAssets 에서 읽어 짓는다 - 씬에 다 넣었더니 큰 장면에서
+        // 빌드가 실행 중에 죽었고, 그 원인을 좁히는 데 오래 걸렸다.
+        public static void BuildSimFromCommandLine()
+        {
+            string scene = null, outDir = null;
+            string[] args = Environment.GetCommandLineArgs();
+            for (int i = 0; i + 1 < args.Length; ++i)
+            {
+                if (args[i] == "-wvScene") scene = args[i + 1];
+                else if (args[i] == "-wvOut") outDir = args[i + 1];
+            }
+            if (string.IsNullOrEmpty(scene) || string.IsNullOrEmpty(outDir))
+            {
+                Debug.LogError("WorldVision: -wvScene 과 -wvOut 이 필요하다");
+                EditorApplication.Exit(2);
+                return;
+            }
+
+            // 데이터를 StreamingAssets 로. 여기 있는 것은 직렬화되지 않고
+            // 파일 그대로 복사되므로 씬 크기와 무관하다.
+            string sa = "Assets/StreamingAssets";
+            Directory.CreateDirectory(sa);
+            string baseName = Path.GetFileNameWithoutExtension(scene);
+            string srcDir = Path.GetDirectoryName(Path.GetFullPath(scene));
+            File.Copy(scene, Path.Combine(sa, baseName + ".json"), true);
+            string pc = Path.Combine(srcDir, baseName + ".wvpc");
+            if (File.Exists(pc)) File.Copy(pc, Path.Combine(sa, baseName + ".wvpc"), true);
+            else Debug.LogWarning("WorldVision: 점군이 없다 - " + pc);
+
+            var root = new GameObject("WorldVision");
+            var boot = root.AddComponent<Boot>();
+            boot.sceneName = baseName;
+
+            var sun = new GameObject("Sun").AddComponent<Light>();
+            sun.type = LightType.Directional;
+            sun.intensity = 0.9f;
+            sun.color = new Color(1f, 0.97f, 0.92f);
+            sun.shadows = LightShadows.None;
+            sun.transform.rotation = Quaternion.Euler(50f, -35f, 0f);
+            RenderSettings.ambientLight = new Color(0.42f, 0.46f, 0.55f);
+            RenderSettings.fog = false;
+
+            var body = new GameObject("Player");
+            body.transform.position = new Vector3(0f, 3f, 0f);
+            var cc = body.AddComponent<CharacterController>();
+            cc.height = 1.75f; cc.radius = 0.35f;
+            cc.center = new Vector3(0f, 0.875f, 0f);
+            cc.slopeLimit = 55f; cc.stepOffset = 0.45f;
+
+            var eye = new GameObject("Eye");
+            eye.transform.SetParent(body.transform, false);
+            eye.transform.localPosition = new Vector3(0f, 1.62f, 0f);
+            var cam = eye.AddComponent<Camera>();
+            cam.clearFlags = CameraClearFlags.SolidColor;
+            cam.backgroundColor = new Color(0.02f, 0.025f, 0.035f);
+            cam.nearClipPlane = 0.12f;
+            cam.farClipPlane = 600f;
+            cam.fieldOfView = 60f;
+            eye.tag = "MainCamera";
+            body.AddComponent<Player>();
+
+            var carGo = new GameObject("EgoCar");
+            var bodyBox = GameObject.CreatePrimitive(PrimitiveType.Cube);
+            bodyBox.name = "Body";
+            bodyBox.transform.SetParent(carGo.transform, false);
+            bodyBox.transform.localPosition = new Vector3(0f, 0.72f, 0f);
+            bodyBox.transform.localScale = new Vector3(1.78f, 0.72f, 4.30f);
+            bodyBox.GetComponent<Renderer>().sharedMaterial =
+                MakeMaterial("wv_ego", new Color(0.90f, 0.90f, 0.92f));
+            UnityEngine.Object.DestroyImmediate(bodyBox.GetComponent<BoxCollider>());
+            var cabin = GameObject.CreatePrimitive(PrimitiveType.Cube);
+            cabin.name = "Cabin";
+            cabin.transform.SetParent(carGo.transform, false);
+            cabin.transform.localPosition = new Vector3(0f, 1.30f, -0.25f);
+            cabin.transform.localScale = new Vector3(1.58f, 0.62f, 2.10f);
+            cabin.GetComponent<Renderer>().sharedMaterial =
+                MakeMaterial("wv_ego_glass", new Color(0.20f, 0.26f, 0.34f));
+            UnityEngine.Object.DestroyImmediate(cabin.GetComponent<BoxCollider>());
+
+            var dir = root.AddComponent<Director>();
+            dir.boot = boot;
+            dir.cam = cam;
+            dir.car = carGo.transform;
+            dir.free = body.GetComponent<Player>();
+
+            PlayerSettings.companyName = "WorldVision";
+            PlayerSettings.productName = "WorldVision-SLAM";
+            PlayerSettings.defaultScreenWidth = 1600;
+            PlayerSettings.defaultScreenHeight = 900;
+            PlayerSettings.fullScreenMode = FullScreenMode.Windowed;
+            PlayerSettings.resizableWindow = true;
+            PlayerSettings.runInBackground = true;
+            IncludeShader("WorldVision/Point");
+
+            const string scenePath = "Assets/WorldVisionSim.unity";
+            EditorSceneManager.SaveScene(EditorSceneManager.GetActiveScene(), scenePath);
+            EditorBuildSettings.scenes = new[] {
+                new EditorBuildSettingsScene(scenePath, true) };
+
+            Directory.CreateDirectory(outDir);
+            var opt = new BuildPlayerOptions {
+                scenes = new[] { scenePath },
+                locationPathName = Path.Combine(outDir, "WorldVision.exe"),
+                target = BuildTarget.StandaloneWindows64,
+                options = BuildOptions.None,
+            };
+            var report = BuildPipeline.BuildPlayer(opt);
+            var sum = report.summary;
+            Debug.Log(string.Format("WorldVision: 빌드 {0}  {1} 바이트  {2}",
+                sum.result, sum.totalSize, opt.locationPathName));
+            EditorApplication.Exit(sum.result == BuildResult.Succeeded ? 0 : 1);
+        }
+
+        // 점군 셰이더는 씬에서 참조되지 않으므로 빌드에서 빠진다. 그래픽
+        // 설정의 "항상 포함" 목록에 넣어야 실행할 때 Shader.Find 가 찾는다.
+        static void IncludeShader(string name)
+        {
+            var sh = Shader.Find(name);
+            if (sh == null) { Debug.LogWarning("WorldVision: 셰이더 없음 " + name); return; }
+            var gs = AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(
+                "ProjectSettings/GraphicsSettings.asset");
+            if (gs == null) return;
+            var so = new SerializedObject(gs);
+            var arr = so.FindProperty("m_AlwaysIncludedShaders");
+            if (arr == null) return;
+            for (int i = 0; i < arr.arraySize; ++i)
+                if (arr.GetArrayElementAtIndex(i).objectReferenceValue == sh) return;
+            arr.InsertArrayElementAtIndex(arr.arraySize);
+            arr.GetArrayElementAtIndex(arr.arraySize - 1).objectReferenceValue = sh;
+            so.ApplyModifiedProperties();
+            AssetDatabase.SaveAssets();
         }
 
         [MenuItem("WorldVision/Import Scene (JSON)")]
@@ -505,6 +712,39 @@ namespace WorldVision
             return m;
         }
 
+        // 자차 궤적. 엔진에서 자동으로 달릴 자리다.
+        static List<Vector3> ReadTrajectory(string text)
+        {
+            var outp = new List<Vector3>();
+            int at = text.IndexOf("\"trajectory\"");
+            if (at < 0) return outp;
+            int open = text.IndexOf('[', at);
+            int close = text.IndexOf("]]", open);
+            if (open < 0 || close < 0) return outp;
+            int i = open + 1;
+            var n = new float[3];
+            while (i < close + 1)
+            {
+                int a = text.IndexOf('[', i);
+                if (a < 0 || a > close) break;
+                int b = text.IndexOf(']', a);
+                if (b < 0) break;
+                string[] pp = text.Substring(a + 1, b - a - 1).Split(',');
+                if (pp.Length >= 3)
+                {
+                    bool ok = true;
+                    for (int c = 0; c < 3; ++c)
+                        ok &= float.TryParse(pp[c].Trim(),
+                                System.Globalization.NumberStyles.Float,
+                                System.Globalization.CultureInfo.InvariantCulture,
+                                out n[c]);
+                    if (ok) outp.Add(new Vector3(n[0], n[1], -n[2]));
+                }
+                i = b + 1;
+            }
+            return outp;
+        }
+
         // 차선. **예측한 것이므로 관측한 노면 텍스처와 섞지 않는다.**
         //
         // 구운 밝기 지도는 측정이고 이쪽은 도로 구조에서 세운 모형이다. 따로
@@ -609,6 +849,8 @@ namespace WorldVision
                 mesh.SetVertices(verts);
                 mesh.SetTriangles(tris, 0);
                 mesh.RecalculateNormals();
+                mesh.name = "SM_Lane" + L;
+                Persist(mesh, mesh.name);
                 go.AddComponent<MeshFilter>().sharedMesh = mesh;
                 go.AddComponent<MeshRenderer>().sharedMaterial = mats[center ? 1 : 0];
                 go.isStatic = true;
@@ -621,6 +863,10 @@ namespace WorldVision
         // 종류 안에서는 타일마다 GameObject 를 두지 않는다. 수천 개가 되어
         // 씬만 무거워지고, 어차피 이어진 한 장의 바닥이다.
         static readonly string[] kSurfName = { "Road", "Sidewalk", "Grass", "Ground" };
+        static int _surfTris;
+        // 충돌체를 붙일지. 큰 장면에서 빌드가 깨지는 원인을 좁히려고 둔 스위치.
+        static bool kSurfCollider =
+            System.Environment.GetEnvironmentVariable("WV_NO_COLLIDER") != "1";
 
         static void BuildSurfaces(Transform parent, List<SurfaceTile> tiles,
                                   float cell, RoadMap rm, Texture2D roadTex,
@@ -655,51 +901,73 @@ namespace WorldVision
             float spanU = Mathf.Max(1e-3f, rm.width * rm.cell);
             float spanV = Mathf.Max(1e-3f, rm.height * rm.cell);
 
+            // **65,000 정점을 넘기지 않게 쪼갠다.**
+            //
+            // 도로 하나가 17,957 타일이라 71,828 정점이 되고, 그러면 인덱스가
+            // UInt32 로 넘어간다. 그렇게 만든 빌드가 실행할 때 "level0 is
+            // corrupted / Position out of bounds" 로 죽었다 - 작은 장면
+            // (36,836 정점, UInt16) 은 멀쩡히 떴으므로 경계가 거기다.
+            //
+            // 쪼개는 편이 어차피 낫다. 메시 하나가 길 전체를 덮으면 절두체
+            // 컬링이 통째로 통과시켜, 뒤돌아 서 있어도 도로 전부를 그린다.
+            _surfTris = 0;
+            const int kMaxTiles = 15000;   // x4 = 60,000 정점
             for (int c = 0; c < 4; ++c)
             {
-                var verts = new List<Vector3>();
-                var uvs = new List<Vector2>();
-                var tris = new List<int>();
-                foreach (var t in tiles)
+                var mine = tiles.FindAll(t => t.cls == c);
+                if (mine.Count == 0) continue;
+                var mat = mats[c];
+                int chunks = (mine.Count + kMaxTiles - 1) / kMaxTiles;
+                for (int ch = 0; ch < chunks; ++ch)
                 {
-                    if (t.cls != c) continue;
-                    int b = verts.Count;
-                    verts.Add(t.p + new Vector3(-h, 0, -h));
-                    verts.Add(t.p + new Vector3( h, 0, -h));
-                    verts.Add(t.p + new Vector3( h, 0,  h));
-                    verts.Add(t.p + new Vector3(-h, 0,  h));
-                    for (int k = 0; k < 4; ++k)
+                    int from = ch * kMaxTiles;
+                    int to = Mathf.Min(mine.Count, from + kMaxTiles);
+                    var verts = new List<Vector3>((to - from) * 4);
+                    var uvs = new List<Vector2>((to - from) * 4);
+                    var cols = new List<Color>((to - from) * 4);
+                    var tris = new List<int>((to - from) * 6);
+                    for (int i = from; i < to; ++i)
                     {
-                        // **UV 는 월드 좌표에서 뽑는다.** 타일마다 0..1 을 주면
-                        // 차선 한 줄이 타일마다 끊겨 점선이 된다. 구워 온
-                        // 지도는 하나의 큰 그림이므로 그 위의 자리를 그대로
-                        // 가리켜야 무늬가 이어진다.
-                        Vector3 d = verts[b + k] - rm.origin;
-                        uvs.Add(rm.valid
-                            ? new Vector2(Vector3.Dot(d, rm.axisU) / spanU,
-                                          Vector3.Dot(d, rm.axisV) / spanV)
-                            : new Vector2(0.5f, 0.5f));
+                        var t = mine[i];
+                        int b = verts.Count;
+                        verts.Add(t.p + new Vector3(-h, 0, -h));
+                        verts.Add(t.p + new Vector3( h, 0, -h));
+                        verts.Add(t.p + new Vector3( h, 0,  h));
+                        verts.Add(t.p + new Vector3(-h, 0,  h));
+                        // 밝기를 정점 색으로 싣는다. 포장면은 셰이더가 이것을
+                        // 읽고, 잔디는 밝기가 뜻이 없으므로 무시한다.
+                        float g = 0.10f + 0.90f * t.v * t.v;
+                        var col = new Color(g, g, g * 1.02f);
+                        for (int k = 0; k < 4; ++k)
+                        {
+                            cols.Add(col);
+                            Vector3 d = verts[b + k] - rm.origin;
+                            uvs.Add(rm.valid
+                                ? new Vector2(Vector3.Dot(d, rm.axisU) / spanU,
+                                              Vector3.Dot(d, rm.axisV) / spanV)
+                                : new Vector2(0.5f, 0.5f));
+                        }
+                        tris.Add(b); tris.Add(b + 3); tris.Add(b + 2);
+                        tris.Add(b); tris.Add(b + 2); tris.Add(b + 1);
                     }
-                    tris.Add(b); tris.Add(b + 3); tris.Add(b + 2);
-                    tris.Add(b); tris.Add(b + 2); tris.Add(b + 1);
-                }
-                if (verts.Count == 0) continue;
 
-                var go = new GameObject(kSurfName[c]);
-                go.transform.SetParent(parent, false);
-                var mesh = new Mesh();
-                mesh.indexFormat = verts.Count > 65000
-                    ? UnityEngine.Rendering.IndexFormat.UInt32
-                    : UnityEngine.Rendering.IndexFormat.UInt16;
-                mesh.SetVertices(verts);
-                mesh.SetUVs(0, uvs);
-                mesh.SetTriangles(tris, 0);
-                mesh.RecalculateNormals();
-                go.AddComponent<MeshFilter>().sharedMesh = mesh;
-                go.AddComponent<MeshRenderer>().sharedMaterial = mats[c];
-                // 딛고 설 수 있어야 바닥이다.
-                go.AddComponent<MeshCollider>().sharedMesh = mesh;
-                go.isStatic = true;
+                    var go = new GameObject(chunks > 1
+                        ? kSurfName[c] + " " + ch : kSurfName[c]);
+                    go.transform.SetParent(parent, false);
+                    var mesh = new Mesh();
+                    mesh.name = "SM_" + kSurfName[c] + (chunks > 1 ? ch.ToString() : "");
+                    mesh.SetVertices(verts);
+                    mesh.SetUVs(0, uvs);
+                    mesh.SetColors(cols);
+                    mesh.SetTriangles(tris, 0);
+                    mesh.RecalculateNormals();
+                    Persist(mesh, mesh.name);
+                    go.AddComponent<MeshFilter>().sharedMesh = mesh;
+                    go.AddComponent<MeshRenderer>().sharedMaterial = mat;
+                    if (kSurfCollider) go.AddComponent<MeshCollider>().sharedMesh = mesh;
+                    go.isStatic = true;
+                    _surfTris += tris.Count / 3;
+                }
             }
         }
 
@@ -713,9 +981,8 @@ namespace WorldVision
             if (!rm.valid || string.IsNullOrEmpty(rm.image)) return null;
             string src = Path.Combine(jsonDir, rm.image);
             if (!File.Exists(src)) { Debug.LogWarning("WorldVision: 노면 지도 없음 " + src); return null; }
-            const string dstDir = "Assets/WorldVision";
-            Directory.CreateDirectory(dstDir);
-            string dst = dstDir + "/road.png";
+            EnsureAssetDir();
+            string dst = kAssetDir + "/road.png";
 
             // **그대로 복사하면 검은 바닥이 된다.**
             //
@@ -753,8 +1020,19 @@ namespace WorldVision
                 imp.textureType = TextureImporterType.Default;
                 imp.wrapMode = TextureWrapMode.Clamp;   // 밖으로 새면 길이 반복된다
                 imp.filterMode = FilterMode.Bilinear;
-                imp.mipmapEnabled = true;
-                imp.maxTextureSize = 4096;              // 2472 px 를 줄이지 않는다
+                // **밉맵과 POT 보정을 끈다.**
+                //
+                // 이 그림은 2225x3998 처럼 2 의 거듭제곱이 아니다. 그대로 두면
+                // 임포터가 POT 로 늘리고 밉맵까지 만드는데, 그렇게 나온 빌드가
+                // 실행할 때 "level0 is corrupted / Position out of bounds" 로
+                // 죽었다. PNG 를 치우면 멀쩡히 떴으므로 원인은 여기다.
+                //
+                // 밉맵은 어차피 필요 없다. 노면은 늘 비스듬히 가까이서 보므로
+                // 축소본이 쓰일 일이 거의 없고, 밉맵이 섞이면 차선이 흐려진다.
+                imp.npotScale = TextureImporterNPOTScale.None;
+                imp.mipmapEnabled = false;
+                imp.maxTextureSize = 2048;
+                imp.textureCompression = TextureImporterCompression.Compressed;
                 imp.SaveAndReimport();
             }
             return AssetDatabase.LoadAssetAtPath<Texture2D>(dst);
@@ -791,7 +1069,17 @@ namespace WorldVision
             float surfCell;
             var surfTiles = ReadSurfaces(text, out surfCell);
             var roadMap = ReadRoadMap(text);
-            var roadTex = LoadRoadTexture(roadMap, Path.GetDirectoryName(path));
+            // **노면 텍스처는 쓰지 않는다.**
+            //
+            // 구운 PNG 를 에셋으로 들이면 빌드는 성공하는데 실행할 때
+            // "level0 is corrupted" 로 죽었다. PNG 를 치우면 멀쩡히 떴으므로
+            // 원인은 그 임포트다 (2225x3998 은 2 의 거듭제곱이 아니다).
+            // NPOT 보정과 밉맵을 꺼도 큰 장면에서는 여전히 죽었다.
+            //
+            // 그리고 이제 노면의 밝기는 점군이 나른다 - LiDAR 지도처럼
+            // 점마다 색을 싣는 쪽이 원래 보여 주려던 것에 더 가깝다. PNG 는
+            // 계속 내보낸다. 데이터이고, 언리얼 쪽은 그것을 쓴다.
+            Texture2D roadTex = null;
             var gRoad = new GameObject("Surfaces").transform;
             gRoad.SetParent(root.transform, false);
             BuildSurfaces(gRoad, surfTiles, surfCell, roadMap, roadTex,
@@ -802,6 +1090,30 @@ namespace WorldVision
             var gLane = new GameObject("Lanes").transform;
             gLane.SetParent(root.transform, false);
             BuildLanes(gLane, lanes, laneKinds, laneWidths);
+
+            // 달릴 자리와 셀 숫자를 씬에 실어 둔다. 빌드된 실행 파일에는
+            // JSON 이 없으므로, 런타임이 알아야 할 것은 여기서 넘겨야 한다.
+            var routeGo = new GameObject("Route");
+            routeGo.transform.SetParent(root.transform, false);
+            var route = routeGo.AddComponent<Route>();
+            route.points = ReadTrajectory(text).ToArray();
+
+            var stat = routeGo.AddComponent<Stats>();
+            stat.sequence = s.sequence;
+            stat.frame = s.frame;
+            stat.buildings = (s.buildings ?? new Building[0]).Length;
+            stat.trees = (s.trees ?? new Tree[0]).Length;
+            stat.poles = (s.poles ?? new Pole[0]).Length;
+            stat.vehicles = (s.vehicles ?? new Vehicle[0]).Length;
+            stat.lanes = lanes.Count;
+            stat.surfaceCell = surfCell;
+            stat.tRoad = surfTiles.FindAll(t => t.cls == 0).Count;
+            stat.tSidewalk = surfTiles.FindAll(t => t.cls == 1).Count;
+            stat.tGrass = surfTiles.FindAll(t => t.cls == 2).Count;
+            stat.tOther = surfTiles.FindAll(t => t.cls == 3).Count;
+            stat.roadMap = roadTex != null
+                ? roadMap.width + "x" + roadMap.height + " px @ " + roadMap.cell + " m"
+                : "";
 
             var gBuild = new GameObject("Buildings").transform;
             gBuild.SetParent(root.transform, false);
@@ -897,6 +1209,7 @@ namespace WorldVision
                 surfTiles.FindAll(t => t.cls == 3).Count,
                 roadTex != null ? roadMap.width + "x" + roadMap.height : "없음",
                 lanes.Count));
+            AssetDatabase.SaveAssets();
             Selection.activeGameObject = root;
             return true;
         }

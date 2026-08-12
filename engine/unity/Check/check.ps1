@@ -15,6 +15,7 @@ try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch { }
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $importer = Join-Path $here "..\Editor\WorldVisionSceneImporter.cs"
 $player = Join-Path $here "..\Runtime\WorldVisionPlayer.cs"
+$sim = Join-Path $here "..\Runtime\WorldVisionSim.cs"
 $stubs = Join-Path $here "UnityStubs.cs"
 
 # Roslyn 은 Visual Studio 나 Build Tools 와 함께 온다. 없으면 .NET Framework
@@ -30,7 +31,7 @@ if (-not $csc) {
 }
 
 $out = Join-Path $env:TEMP "wv_unity_check.dll"
-& $csc /nologo /target:library /warn:4 /out:$out $stubs $importer $player
+& $csc /nologo /target:library /warn:4 /out:$out $stubs $importer $player $sim
 if ($LASTEXITCODE -ne 0) {
     Write-Error "임포터가 컴파일되지 않는다."
 }

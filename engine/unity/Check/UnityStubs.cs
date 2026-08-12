@@ -30,6 +30,9 @@ namespace UnityEngine
         public static Vector3 operator -(Vector3 a, Vector3 b) { return new Vector3(a.x - b.x, a.y - b.y, a.z - b.z); }
         public static Vector3 operator -(Vector3 a) { return new Vector3(-a.x, -a.y, -a.z); }
         public static float Dot(Vector3 a, Vector3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+        public static float Distance(Vector3 a, Vector3 b) { return (a - b).magnitude; }
+        public static Vector3 Lerp(Vector3 a, Vector3 b, float t) { return a; }
+        public float magnitude { get { return (float)Math.Sqrt(sqrMagnitude); } }
         public static Vector3 operator +(Vector3 a, Vector3 b) { return new Vector3(a.x + b.x, a.y + b.y, a.z + b.z); }
         public static Vector3 operator *(Vector3 a, float s) { return new Vector3(a.x * s, a.y * s, a.z * s); }
     }
@@ -51,6 +54,8 @@ namespace UnityEngine
         public static float Max(float a, float b) { return a > b ? a : b; }
         public static float Min(float a, float b) { return a < b ? a : b; }
         public static float Sqrt(float v) { return (float)Math.Sqrt(v); }
+        public static float Abs(float v) { return Math.Abs(v); }
+        public static float Lerp(float a, float b, float t) { return a + (b - a) * t; }
         public static int Min(int a, int b) { return a < b ? a : b; }
         public static float Pow(float a, float b) { return (float)Math.Pow(a, b); }
         public static int RoundToInt(float v) { return (int)Math.Round(v); }
@@ -61,6 +66,8 @@ namespace UnityEngine
         public Bounds(Vector3 c, Vector3 s) { center = c; size = s; }
         public Vector3 center, size;
         public Vector3 extents { get { return size * 0.5f; } }
+        public Vector3 max { get { return center + extents; } }
+        public Vector3 min { get { return center - extents; } }
         public void Encapsulate(Vector3 p) { }
         public void Encapsulate(Bounds b) { }
     }
@@ -79,7 +86,9 @@ namespace UnityEngine
 
     public struct Rect
     {
-        public Rect(float x, float y, float w, float h) { }
+        public Rect(float x, float y, float w, float h)
+        { this.x = x; this.y = y; width = w; height = h; }
+        public float x, y, width, height;
     }
 
     public enum LightType { Directional, Point, Spot }
@@ -111,7 +120,7 @@ namespace UnityEngine
         public bool enabled, isGrounded;
         public void Move(Vector3 d) { }
     }
-    public class MonoBehaviour : Component { }
+    public class MonoBehaviour : Component { public bool enabled; }
     public class RequireComponent : Attribute { public RequireComponent(Type t) { } }
     public static class Input
     {
@@ -119,19 +128,24 @@ namespace UnityEngine
         public static bool GetKey(KeyCode k) { return false; }
         public static float GetAxisRaw(string n) { return 0f; }
     }
-    public enum KeyCode { Escape, F, H, Q, Space, LeftShift, RightShift, LeftControl }
+    public enum KeyCode { Escape, F, H, Q, R, Space, LeftShift, RightShift, LeftControl,
+                          Alpha1, Alpha2, Alpha3, Alpha4, LeftArrow, RightArrow,
+                          LeftBracket, RightBracket }
     public enum CursorLockMode { None, Locked, Confined }
     public static class Cursor
     {
         public static CursorLockMode lockState;
         public static bool visible;
     }
-    public static class Time { public static float deltaTime; }
+    public static class Time { public static float deltaTime, unscaledDeltaTime; }
     public static class GUI
     {
         public static GUISkin skin;
+        public static Color color;
         public static void Label(Rect r, string s, GUIStyle st) { }
+        public static void DrawTexture(Rect r, Texture t) { }
     }
+    public static class Screen { public static int width, height; }
     public class GUISkin { public GUIStyle label = new GUIStyle(); }
     public class GUIStyleState { public Color textColor; }
     public class GUIStyle
@@ -164,6 +178,8 @@ namespace UnityEngine
     public class Texture2D : Texture
     {
         public Texture2D(int w, int h, TextureFormat f, bool mip) { }
+        public Texture2D(int w, int h) { }
+        public void SetPixel(int x, int y, Color c) { }
         public void ReadPixels(Rect r, int x, int y) { }
         public bool LoadImage(byte[] data) { return true; }
         public Color32[] GetPixels32() { return new Color32[0]; }
@@ -196,6 +212,7 @@ namespace UnityEngine
     {
         public string name;
         public static T[] FindObjectsByType<T>(FindObjectsSortMode m) { return new T[0]; }
+        public static T FindFirstObjectByType<T>() where T : Object { return null; }
         public static void DestroyImmediate(Object o) { }
     }
     public class Shader : Object { public static Shader Find(string n) { return null; } }
@@ -205,18 +222,26 @@ namespace UnityEngine
         public Color color;
         public Texture mainTexture;
         public bool HasProperty(string n) { return true; }
+        public bool enableInstancing;
         public void SetFloat(string n, float v) { }
     }
     public class Texture : Object { }
     public enum TextureWrapMode { Repeat, Clamp }
     public enum FilterMode { Point, Bilinear, Trilinear }
-    public class Renderer : Component { public Material sharedMaterial; public Material[] sharedMaterials; public Bounds bounds; }
+    public class Renderer : Component
+    {
+        public Material sharedMaterial;
+        public Material[] sharedMaterials;
+        public Bounds bounds;
+        public bool enabled;
+    }
     public class Component : Object
     {
         public Transform transform;
         public GameObject gameObject;
         public T GetComponent<T>() where T : Component, new() { return new T(); }
         public T GetComponentInChildren<T>() where T : Component, new() { return new T(); }
+        public T[] GetComponentsInChildren<T>() where T : Component, new() { return new T[0]; }
     }
 
     public class Transform : Component
@@ -225,6 +250,7 @@ namespace UnityEngine
         public Quaternion rotation;
         public Vector3 localPosition, eulerAngles, right, forward;
         public Quaternion localRotation;
+        public void SetParent(Transform p, bool worldPositionStays, bool dummy) { }
         public void SetParent(Transform p, bool worldPositionStays) { }
     }
 
@@ -288,8 +314,12 @@ namespace UnityEditor
         public static AssetImporter GetAtPath(string p) { return null; }
         public void SaveAndReimport() { }
     }
+    public enum TextureImporterNPOTScale { None, ToNearest, ToLarger, ToSmaller }
+    public enum TextureImporterCompression { Uncompressed, Compressed, CompressedHQ }
     public class TextureImporter : AssetImporter
     {
+        public TextureImporterNPOTScale npotScale;
+        public TextureImporterCompression textureCompression;
         public TextureImporterType textureType;
         public TextureWrapMode wrapMode;
         public FilterMode filterMode;
@@ -299,6 +329,11 @@ namespace UnityEditor
     public static class AssetDatabase
     {
         public static void ImportAsset(string p, ImportAssetOptions o) { }
+        public static void CreateAsset(UnityEngine.Object o, string p) { }
+        public static bool IsValidFolder(string p) { return true; }
+        public static string CreateFolder(string parent, string name) { return ""; }
+        public static bool DeleteAsset(string p) { return true; }
+        public static void SaveAssets() { }
         public static T LoadAssetAtPath<T>(string p) where T : UnityEngine.Object { return null; }
     }
     public static class EditorApplication { public static void Exit(int code) { } }
