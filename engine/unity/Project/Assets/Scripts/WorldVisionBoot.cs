@@ -292,6 +292,31 @@ namespace WorldVision
         readonly List<byte[]> cloudInten = new List<byte[]>();
         readonly List<byte[]> cloudCls = new List<byte[]>();
 
+        // **클래스마다 메시를 따로 만든다.**
+        //
+        // 켜고 끄려면 그래야 한다. 한 덩이에 섞어 두면 특정 클래스만 숨기는
+        // 방법이 없다 - 색을 투명하게 해도 불투명 셰이더라 그대로 보이고,
+        // 인덱스를 다시 만들면 83 만 점을 매번 다시 올려야 한다.
+        //
+        // 무엇을 숨길 수 있어야 하는가는 분명하다: 건물을 끄면 그 뒤의 길이
+        // 보이고, 지면을 끄면 구조물만 남는다. 분류가 맞았는지도 그렇게 봐야
+        // 드러난다 - 나무만 켜 놓고 그것이 정말 나무 자리인지 보는 식이다.
+        public const int kClassN = 7;
+        public static readonly string[] kClassName = {
+            "미상", "지면", "건물", "담장", "나무", "기둥", "잔디" };
+        public readonly List<Renderer>[] byClass = new List<Renderer>[kClassN];
+        public readonly int[] classCount = new int[kClassN];
+        public readonly bool[] classOn = new bool[kClassN];
+
+        public void ShowClass(int c, bool on)
+        {
+            if (c < 0 || c >= kClassN || byClass[c] == null) return;
+            classOn[c] = on;
+            foreach (var r in byClass[c]) if (r != null) r.enabled = on;
+            log.Add("view", string.Format("{0} {1}", kClassName[c],
+                on ? "표시" : "숨김"), LogKind.Info);
+        }
+
         public void Repaint(Paint p)
         {
             paint = p;
@@ -373,73 +398,107 @@ namespace WorldVision
 
             var parent = new GameObject("PointCloud").transform;
             const int kChunk = 60000;
-            int chunks = (count + kChunk - 1) / kChunk;
-            var verts = new Vector3[kChunk];
-            var cols = new Color32[kChunk];
-            var idx = new int[kChunk];
-            int made = 0;
-            int[] clsCount = new int[8];
 
-            for (int c = 0; c < chunks; ++c)
+            // 먼저 클래스별로 색인을 모은다. 점 하나를 두 번 읽지 않으려고
+            // 위치와 속성도 이때 함께 뽑아 둔다.
+            var idxOf = new List<int>[kClassN];
+            for (int c = 0; c < kClassN; ++c) { idxOf[c] = new List<int>(); classOn[c] = true; }
+            var pos = new Vector3[count];
+            var rel = new float[count];
+            var inten = new byte[count];
+            var cls = new byte[count];
+            for (int i = 0; i < count; ++i)
             {
-                int from = c * kChunk;
-                int n = Mathf.Min(kChunk, count - from);
-                var relBuf = new float[n];
-                var intenBuf = new byte[n];
-                var clsBuf = new byte[n];
-                for (int i = 0; i < n; ++i)
+                int o = 24 + i * rec;
+                pos[i] = new Vector3(BitConverter.ToSingle(raw, o),
+                                     BitConverter.ToSingle(raw, o + 4),
+                                     -BitConverter.ToSingle(raw, o + 8)) + org;
+                rel[i] = BitConverter.ToSingle(raw, o + 12);
+                inten[i] = raw[o + 16];
+                byte c2 = raw[o + 17];
+                if (c2 >= kClassN) c2 = 0;
+                cls[i] = c2;
+                idxOf[c2].Add(i);
+                classCount[c2]++;
+            }
+
+            int made = 0, meshes = 0;
+            for (int c = 0; c < kClassN; ++c)
+            {
+                byClass[c] = new List<Renderer>();
+                var list = idxOf[c];
+                if (list.Count == 0) continue;
+                int chunks = (list.Count + kChunk - 1) / kChunk;
+                for (int ch = 0; ch < chunks; ++ch)
                 {
-                    int o = 24 + (from + i) * rec;
-                    float x = BitConverter.ToSingle(raw, o);
-                    float y = BitConverter.ToSingle(raw, o + 4);
-                    float z = BitConverter.ToSingle(raw, o + 8);
-                    float rel = BitConverter.ToSingle(raw, o + 12);
-                    byte inten = raw[o + 16];
-                    byte cls = raw[o + 17];
-                    verts[i] = new Vector3(x, y, -z) + org;
-                    cols[i] = Shade(paint, rel, inten, cls);
-                    idx[i] = i;
-                    relBuf[i] = rel; intenBuf[i] = inten; clsBuf[i] = cls;
-                    if (cls < 8) clsCount[cls]++;
-                }
-                var mesh = new Mesh();
-                mesh.name = "cloud" + c;
-                if (n < kChunk)
-                {
-                    var v2 = new Vector3[n]; Array.Copy(verts, v2, n);
-                    var c2 = new Color32[n]; Array.Copy(cols, c2, n);
-                    var i2 = new int[n]; Array.Copy(idx, i2, n);
-                    mesh.vertices = v2; mesh.colors32 = c2;
-                    mesh.SetIndices(i2, MeshTopology.Points, 0);
-                }
-                else
-                {
-                    mesh.vertices = verts; mesh.colors32 = cols;
+                    int from = ch * kChunk;
+                    int n = Mathf.Min(kChunk, list.Count - from);
+                    var verts = new Vector3[n];
+                    var cols = new Color32[n];
+                    var idx = new int[n];
+                    var relBuf = new float[n];
+                    var intenBuf = new byte[n];
+                    var clsBuf = new byte[n];
+                    for (int i = 0; i < n; ++i)
+                    {
+                        int src = list[from + i];
+                        verts[i] = pos[src];
+                        relBuf[i] = rel[src];
+                        intenBuf[i] = inten[src];
+                        clsBuf[i] = cls[src];
+                        cols[i] = Shade(paint, rel[src], inten[src], cls[src]);
+                        idx[i] = i;
+                    }
+                    var mesh = new Mesh();
+                    mesh.name = "cloud_" + kClassName[c] + ch;
+                    mesh.vertices = verts;
+                    mesh.colors32 = cols;
                     mesh.SetIndices(idx, MeshTopology.Points, 0);
+                    // 점은 경계를 스스로 못 정한다 - 재계산해야 컬링이 맞는다.
+                    mesh.RecalculateBounds();
+                    var go = new GameObject(kClassName[c] + " " + ch);
+                    go.transform.SetParent(parent, false);
+                    go.AddComponent<MeshFilter>().sharedMesh = mesh;
+                    var mr = go.AddComponent<MeshRenderer>();
+                    mr.sharedMaterial = mat;
+                    mr.shadowCastingMode =
+                        UnityEngine.Rendering.ShadowCastingMode.Off;
+                    mr.receiveShadows = false;
+                    byClass[c].Add(mr);
+                    cloudMeshes.Add(mesh);
+                    cloudRel.Add(relBuf);
+                    cloudInten.Add(intenBuf);
+                    cloudCls.Add(clsBuf);
+                    made += n;
+                    meshes++;
                 }
-                // 점은 경계를 스스로 못 정한다 - 재계산해야 컬링이 맞는다.
-                mesh.RecalculateBounds();
-                var go = new GameObject("chunk" + c);
-                go.transform.SetParent(parent, false);
-                go.AddComponent<MeshFilter>().sharedMesh = mesh;
-                var mr = go.AddComponent<MeshRenderer>();
-                mr.sharedMaterial = mat;
-                mr.shadowCastingMode =
-                    UnityEngine.Rendering.ShadowCastingMode.Off;
-                mr.receiveShadows = false;
-                made += n;
-                cloudMeshes.Add(mesh);
-                cloudRel.Add(relBuf);
-                cloudInten.Add(intenBuf);
-                cloudCls.Add(clsBuf);
             }
             cloudPoints = made;
-            log.Add("cloud", string.Format("점군 {0:n0} 점, 덩이 {1}",
-                made, chunks), LogKind.Ok);
+            log.Add("cloud", string.Format("점군 {0:n0} 점, 메시 {1}",
+                made, meshes), LogKind.Ok);
             log.Add("cloud", string.Format(
-                "분류: 지면 {0:n0} · 건물 {1:n0} · 나무 {2:n0} · 잔디 {3:n0} · 미상 {4:n0}",
-                clsCount[1], clsCount[2], clsCount[4], clsCount[6], clsCount[0]),
-                LogKind.Info);
+                "지면 {0:n0} · 건물 {1:n0} · 나무 {2:n0} · 잔디 {3:n0} · 담장 {4:n0} · 미상 {5:n0}",
+                classCount[1], classCount[2], classCount[4], classCount[6],
+                classCount[3], classCount[0]), LogKind.Info);
+        }
+
+        // 높이 색. LiDAR 지도의 그 색이다 - 노면이 파랗고 지붕이 붉다.
+        //
+        // 밝기를 곱해 둔다. 높이만 쓰면 같은 높이의 아스팔트와 흰 페인트가
+        // 같은 색이 되어 차선이 사라진다.
+        public static Color32 Turbo(float h, byte inten)
+        {
+            float t = Mathf.Clamp01(h / 12f);
+            float r, g, b;
+            if (t < 0.25f) { float u = t / 0.25f; r = 0.10f; g = 0.20f + 0.60f * u; b = 0.85f + 0.10f * u; }
+            else if (t < 0.5f) { float u = (t - 0.25f) / 0.25f; r = 0.10f + 0.10f * u; g = 0.80f + 0.15f * u; b = 0.95f - 0.75f * u; }
+            else if (t < 0.75f) { float u = (t - 0.5f) / 0.25f; r = 0.20f + 0.70f * u; g = 0.95f - 0.20f * u; b = 0.20f - 0.15f * u; }
+            else { float u = (t - 0.75f) / 0.25f; r = 0.90f + 0.08f * u; g = 0.75f - 0.60f * u; b = 0.05f; }
+            float k = 0.55f + 0.75f * (inten / 255f);
+            return new Color32(
+                (byte)Mathf.Clamp(r * k * 255f, 0f, 255f),
+                (byte)Mathf.Clamp(g * k * 255f, 0f, 255f),
+                (byte)Mathf.Clamp(b * k * 255f, 0f, 255f), 255);
         }
 
         // ------------------------------------------------------------------
@@ -489,24 +548,6 @@ namespace WorldVision
             return tex;
         }
 
-        // 높이 색. LiDAR 지도의 그 색이다 - 노면이 파랗고 지붕이 붉다.
-        //
-        // 밝기를 곱해 둔다. 높이만 쓰면 같은 높이의 아스팔트와 흰 페인트가
-        // 같은 색이 되어 차선이 사라진다.
-        public static Color32 Turbo(float h, byte inten)
-        {
-            float t = Mathf.Clamp01(h / 12f);
-            float r, g, b;
-            if (t < 0.25f) { float u = t / 0.25f; r = 0.10f; g = 0.20f + 0.60f * u; b = 0.85f + 0.10f * u; }
-            else if (t < 0.5f) { float u = (t - 0.25f) / 0.25f; r = 0.10f + 0.10f * u; g = 0.80f + 0.15f * u; b = 0.95f - 0.75f * u; }
-            else if (t < 0.75f) { float u = (t - 0.5f) / 0.25f; r = 0.20f + 0.70f * u; g = 0.95f - 0.20f * u; b = 0.20f - 0.15f * u; }
-            else { float u = (t - 0.75f) / 0.25f; r = 0.90f + 0.08f * u; g = 0.75f - 0.60f * u; b = 0.05f; }
-            float k = 0.55f + 0.75f * (inten / 255f);
-            return new Color32(
-                (byte)Mathf.Clamp(r * k * 255f, 0f, 255f),
-                (byte)Mathf.Clamp(g * k * 255f, 0f, 255f),
-                (byte)Mathf.Clamp(b * k * 255f, 0f, 255f), 255);
-        }
     }
 
     public enum LogKind { Info, Ok, Warn, Error, Detect }

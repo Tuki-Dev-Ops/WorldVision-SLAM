@@ -129,6 +129,7 @@ namespace UnityEngine
         public static float GetAxisRaw(string n) { return 0f; }
     }
     public enum KeyCode { Escape, C, F, H, L, Q, R, T, Space, LeftShift, RightShift, LeftControl,
+                          F1, F2, F3, F4, F5, F6, F7,
                           Alpha1, Alpha2, Alpha3, Alpha4, LeftArrow, RightArrow,
                           LeftBracket, RightBracket }
     public enum CursorLockMode { None, Locked, Confined }

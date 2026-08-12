@@ -166,6 +166,16 @@ namespace WorldVision
             {
                 boot.Repaint((Boot.Paint)(((int)boot.paint + 1) % 3));
             }
+            // 클래스 켜고 끄기. 건물을 끄면 그 뒤의 길이 보이고, 지면을 끄면
+            // 구조물만 남는다 - 분류가 맞았는지는 그렇게 봐야 드러난다.
+            if (boot != null)
+            {
+                for (int c = 0; c < Boot.kClassN; ++c)
+                {
+                    if (Input.GetKeyDown(KeyCode.F1 + c))
+                        boot.ShowClass(c, !boot.classOn[c]);
+                }
+            }
             if (Input.GetKeyDown(KeyCode.R)) s = 0f;
             if (Input.GetKeyDown(KeyCode.Q)) Application.Quit();
             if (Input.GetKey(KeyCode.LeftBracket))
@@ -492,6 +502,28 @@ namespace WorldVision
                         : "지면 · 건물 · 나무 · 잔디 · 기둥", stDim);
                     y += 22f;
                 }
+            }
+
+            // 클래스 표시/숨김. 레퍼런스의 눈 아이콘과 같은 자리다.
+            if (boot != null && boot.byClass[0] != null)
+            {
+                GUI.Label(new Rect(16, y, W, 16), "점군 표시  (F1~F7)", stHead);
+                y += 18f;
+                for (int c = 0; c < Boot.kClassN; ++c)
+                {
+                    if (boot.classCount[c] == 0) continue;
+                    bool on = boot.classOn[c];
+                    Swatch(18f, y, on
+                        ? (Color)Boot.Shade(Boot.Paint.Class, 0f, 230, (byte)c)
+                        : new Color(0.18f, 0.20f, 0.24f));
+                    var stc = on ? st : stDim;
+                    GUI.Label(new Rect(36, y, 120, 18),
+                        "F" + (c + 1) + "  " + Boot.kClassName[c], stc);
+                    GUI.Label(new Rect(170, y, 130, 18),
+                        string.Format("{0:n0}", boot.classCount[c]), stc);
+                    y += 18f;
+                }
+                y += 6f;
             }
 
             GUI.Label(new Rect(16, y, W, 16), "성능", stHead); y += 18f;
