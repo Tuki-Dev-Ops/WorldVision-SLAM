@@ -44,7 +44,7 @@
 //                        [--interp cubic] [--stride 1] [--max-frames 0]
 //                        [--fps 10] [--times <파일>]
 //                        [--right <오른쪽 등장방형>] [--baseline <m>]
-//                        [--min-depth 4.0]
+//                        [--baseline-yaw 0] [--min-depth 4.0]
 
 #include "wme/perception/StereoDepth.hpp"
 
@@ -262,6 +262,24 @@ bool assignStamps(std::vector<Frame>& frames, const fs::path& in,
 
 // 360 스테레오 리그에서 이 뷰가 정렬(rectified) 스테레오인가.
 //
+// **베이스라인이 파노라마의 어느 방위를 향하는지는 데이터가 정한다.**
+//
+// 아래 유도는 원래 그것을 X 축(방위 0 도)이라고 **가정** 하고 있었다. 그런데
+// 그 가정은 리그마다 다르고, 틀리면 이 검사가 정확히 거꾸로 답한다 - 실측:
+// TartanAir V2 의 lcam/rcam 등장방형 쌍은 베이스라인이 90 도 어긋나 있어서
+// 쓸 수 있는 뷰가 yaw 90/270 이고 못 쓰는 뷰가 yaw 0/180 인데, 가정을 박아
+// 둔 코드는 **yaw 0 을 통과시키고 yaw 90 을 거부했다.** 시키는 대로 하면
+// 시차가 깊이를 아예 담지 않는 뷰에서 SGBM 을 돌려 놓고 성공을 보고한다.
+// 조용한 그럴듯한 오답이고, 이 저장소가 결함으로 규정한 바로 그것이다.
+//
+// 그래서 방위를 --baseline-yaw 로 받는다. 기본값은 0 도(옛 가정)지만 이제는
+// 가정이 화면에 찍히므로, 틀린 리그를 쓰면 답이 조용히 틀리는 대신 눈에 띈다.
+// 모르면 재는 방법은 아래 유도가 그대로 알려 준다 - dv 가 0 이 되는 yaw 를
+// 찾으면 그것이 베이스라인 방위다.
+//
+// 베이스라인이 방위 a 를 향하면 t = B (cos a, 0, sin a) 이고, 아래 유도의
+// yaw 는 (yaw - a) 로 바뀐다. a = 0 이면 원래 식과 같다.
+//
 // 베이스라인이 파노라마 X 축, t = (B, 0, 0) 이라 하자. 카메라계로 옮기면
 //   t_cam = R^T t = ( B cos(yaw), B sin(pitch) sin(yaw), B cos(pitch) sin(yaw) )
 // 정적 점의 두 영상 사이 이동은 t_cam = (tx, ty, tz) 에 대해
@@ -280,8 +298,9 @@ bool assignStamps(std::vector<Frame>& frames, const fs::path& in,
 constexpr double kMaxVerticalDisparityPx = 0.5;
 
 bool checkRectified(const PinholeView& v, double baseline_m, double min_depth_m,
-                    double& dv_max_px) {
-    const double s = std::abs(std::sin(deg2rad(v.yaw_deg)));
+                    double baseline_yaw_deg, double& dv_max_px) {
+    const double rel = v.yaw_deg - baseline_yaw_deg;
+    const double s = std::abs(std::sin(deg2rad(rel)));
     const double sp = std::abs(std::sin(deg2rad(v.pitch_deg)));
     const double cp = std::abs(std::cos(deg2rad(v.pitch_deg)));
     dv_max_px = (baseline_m * s / min_depth_m) * (v.fy * sp + (v.height / 2.0) * cp);
@@ -315,6 +334,10 @@ int main(int argc, char** argv) {
     // KITTI 도로 장면의 최근접 거리를 기본으로 쓴다 (kitti_convert.cpp 와 같은
     // 근거). 이 값이 시차 탐색 범위와 위 정렬 판정을 동시에 정한다.
     double min_depth = 4.0;
+    // 베이스라인이 향하는 파노라마 방위(도). 기본 0 은 옛 가정이고, 리그마다
+    // 다르다 - checkRectified 주석에 왜 이것이 조용한 오답을 만들었는지 있다.
+    double baseline_yaw = 0.0;
+    bool   baseline_yaw_given = false;
 
     // 인자는 전부 --키 값 쌍이다. 홀수면 마지막 하나가 짝 없이 남았다는 뜻이고,
     // i+1 < argc 조건은 그것을 조용히 버린다 - 오타난 플래그가 기본값으로
@@ -341,6 +364,8 @@ int main(int argc, char** argv) {
         else if (k == "--max-frames")  max_frames = std::atoi(val.c_str());
         else if (k == "--fps")         fps = std::atof(val.c_str());
         else if (k == "--baseline")    baseline = std::atof(val.c_str());
+        else if (k == "--baseline-yaw") { baseline_yaw = std::atof(val.c_str());
+                                          baseline_yaw_given = true; }
         else if (k == "--min-depth")   min_depth = std::atof(val.c_str());
         else {
             // 모르는 옵션을 조용히 무시하면 오타가 기본값으로 굴러간다.
@@ -354,7 +379,8 @@ int main(int argc, char** argv) {
             "          [--yaw 0] [--pitch 0] [--hfov 90]\n"
             "          [--width 1024] [--height 768] [--interp cubic]\n"
             "          [--stride 1] [--max-frames 0] [--fps 10] [--times <파일>]\n"
-            "          [--right <오른쪽 등장방형>] [--baseline <m>] [--min-depth 4.0]\n"
+            "          [--right <오른쪽 등장방형>] [--baseline <m>] [--baseline-yaw 0]\n"
+            "          [--min-depth 4.0]\n"
             "\n"
             "  --right/--baseline 을 주면 360 스테레오 리그로 보고 깊이를 만든다.\n"
             "  주지 않으면 rgb 전용 배치가 나오고, 그것은 RGB-D 러너가 못 먹는다.\n";
@@ -438,21 +464,34 @@ int main(int argc, char** argv) {
     constexpr double kDepthScale = 256.0;   // 80 m * 256 = 20480 < 65535
 
     if (stereo) {
-        if (!checkRectified(view, baseline, min_depth, dv_max)) {
+        // **가정을 조용히 두지 않는다.** 이 한 줄이 없어서 다른 리그에서
+        // 정확히 거꾸로 판정한 적이 있다 (checkRectified 주석 참조).
+        std::cout << "스테레오: 베이스라인 방위를 " << baseline_yaw
+                  << " 도로 가정한다"
+                  << (baseline_yaw_given ? " (--baseline-yaw 로 지정됨)"
+                                         : " (기본값 - 리그가 다르면 --baseline-yaw 로 알려라)")
+                  << ". dv = 0 인 뷰는 yaw " << baseline_yaw << " 와 "
+                  << (baseline_yaw + 180.0) << " 도다.\n";
+        if (!checkRectified(view, baseline, min_depth, baseline_yaw, dv_max)) {
             std::cerr << "\n이 뷰는 정렬 스테레오가 아니다.\n"
                       << "  yaw " << yaw << "도, pitch " << pitch << "도, B "
                       << baseline << " m, 최근접 " << min_depth << " m 에서\n"
                       << "  세로 시차가 최대 " << dv_max << " px (허용 "
                       << kMaxVerticalDisparityPx << " px).\n"
-                      << "  베이스라인이 파노라마 X 축일 때 dv = 0 인 것은 yaw 가\n"
-                      << "  0 또는 180 도인 뷰뿐이다 (소스의 checkRectified 유도 참조).\n"
-                      << "  yaw 90 도에서는 베이스라인이 광축과 나란해져 시차가\n"
-                      << "  깊이 정보를 아예 잃는다. 깊이 없이 쓰려면 --right 를 빼라.\n";
+                      << "  베이스라인 방위가 " << baseline_yaw
+                      << " 도일 때 dv = 0 인 것은 yaw 가 " << baseline_yaw
+                      << " 또는 " << (baseline_yaw + 180.0) << " 도인 뷰뿐이다\n"
+                      << "  (소스의 checkRectified 유도 참조). 그 방위에서 90 도\n"
+                      << "  떨어진 뷰에서는 베이스라인이 광축과 나란해져 시차가\n"
+                      << "  깊이 정보를 아예 잃는다.\n"
+                      << "  **리그의 베이스라인 방위가 " << baseline_yaw
+                      << " 도가 아니라면 --baseline-yaw 로 알려라** - 그러지 않으면\n"
+                      << "  이 검사가 거꾸로 답한다. 깊이 없이 쓰려면 --right 를 빼라.\n";
             return 1;
         }
-        // t_cam,x = B cos(yaw). 이것이 음수면 --right 로 준 쪽이 실제로는
-        // 왼쪽이다 (yaw 180 도 뷰). SGBM 은 기준 영상이 왼쪽이어야 하므로 바꾼다.
-        const double tx = baseline * std::cos(deg2rad(yaw));
+        // t_cam,x = B cos(yaw - a). 이것이 음수면 --right 로 준 쪽이 실제로는
+        // 왼쪽이다. SGBM 은 기준 영상이 왼쪽이어야 하므로 바꾼다.
+        const double tx = baseline * std::cos(deg2rad(yaw - baseline_yaw));
         swap_lr = tx < 0.0;
         eff_baseline = std::abs(tx);
 
