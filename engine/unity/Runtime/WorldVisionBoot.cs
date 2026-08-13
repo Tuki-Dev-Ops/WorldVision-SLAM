@@ -102,6 +102,8 @@ namespace WorldVision
             if (cloudRoot != null) Destroy(cloudRoot);
             cloudMeshes.Clear(); cloudRel.Clear();
             cloudInten.Clear(); cloudCls.Clear();
+            groundOf.Clear();
+            egoLiftOk = false; egoLiftShaky = false;
             for (int c = 0; c < kClassN; ++c) { byClass[c] = null; classCount[c] = 0; }
             detections.Clear();
             lanes.Clear();
@@ -113,6 +115,7 @@ namespace WorldVision
             string text = File.ReadAllText(json);
             BuildFromJson(text);
             BuildCloud(Path.Combine(dir, name + ".wvpc"));
+            MeasureEgoLift();
             log.Add("boot", "지도 준비 완료", LogKind.Ok);
             if (onLoaded != null) onLoaded();
         }
@@ -356,9 +359,23 @@ namespace WorldVision
         // 무엇을 숨길 수 있어야 하는가는 분명하다: 건물을 끄면 그 뒤의 길이
         // 보이고, 지면을 끄면 구조물만 남는다. 분류가 맞았는지도 그렇게 봐야
         // 드러난다 - 나무만 켜 놓고 그것이 정말 나무 자리인지 보는 식이다.
+        // **6 번은 "잔디" 가 아니라 "지형" 이다.**
+        //
+        // 왼쪽 "인식한 것" 의 잔디는 노면 격자를 0.5 m 타일로 묶어 그 타일의
+        // 화소 표가 terrain 이거나 vegetation 일 때 세는 **넓이** 다. 여기
+        // 6 번은 점 하나에 붙은 **구조 클래스** 이고 terrain 하나뿐이다.
+        // 다른 격자에서 나온 다른 양인데 이름이 같으면, 화면에서 "잔디
+        // 676 m²" 와 "잔디 0 점" 이 나란히 서서 서로를 반박하는 것처럼
+        // 보인다. 실제로 반박하지 않는다 - 세는 것이 다르다.
+        //
+        // 그리고 이 뷰어가 받는 산출물에서 6 번은 **늘 0 이다.** 내보내는
+        // 쪽이 점의 클래스를 정하는 규칙이 그렇다: 지면 위 0.35 m 아래는
+        // 무조건 1 번이고, 그 위에서 열이 지면이나 지형이라고 하면 그 점은
+        // 미상으로 간다. 6 번이 나올 자리가 없다. 네 시퀀스 전부에서 0 인
+        // 것을 확인했다.
         public const int kClassN = 7;
         public static readonly string[] kClassName = {
-            "미상", "지면", "건물", "담장", "나무", "기둥", "잔디" };
+            "미상", "지면", "건물", "담장", "나무", "기둥", "지형" };
         public readonly List<Renderer>[] byClass = new List<Renderer>[kClassN];
         public readonly int[] classCount = new int[kClassN];
         public readonly bool[] classOn = new bool[kClassN];
@@ -436,7 +453,7 @@ namespace WorldVision
                 case 3:  b2 = new Color(0.80f, 0.72f, 0.45f); break;  // 담장
                 case 4:  b2 = new Color(0.34f, 0.80f, 0.38f); break;  // 나무
                 case 5:  b2 = new Color(0.95f, 0.55f, 0.85f); break;  // 기둥
-                case 6:  b2 = new Color(0.55f, 0.80f, 0.35f); break;  // 잔디
+                case 6:  b2 = new Color(0.55f, 0.80f, 0.35f); break;  // 지형
                 default: b2 = new Color(0.45f, 0.45f, 0.50f); break;  // 미상
             }
             return new Color32(
@@ -558,9 +575,182 @@ namespace WorldVision
             log.Add("cloud", string.Format("점군 {0:n0} 점, 메시 {1}",
                 made, meshes), LogKind.Ok);
             log.Add("cloud", string.Format(
-                "지면 {0:n0} · 건물 {1:n0} · 나무 {2:n0} · 잔디 {3:n0} · 담장 {4:n0} · 미상 {5:n0}",
+                "지면 {0:n0} · 건물 {1:n0} · 나무 {2:n0} · 지형 {3:n0} · 담장 {4:n0} · 미상 {5:n0}",
                 classCount[1], classCount[2], classCount[4], classCount[6],
                 classCount[3], classCount[0]), LogKind.Info);
+            // **미상이 지면보다 많으면 그 말을 해 둔다.**
+            //
+            // 미상은 하나의 클래스가 아니라 "판정할 근거가 없었다" 이다.
+            // 그것이 최대 클래스가 되었다면 지도가 무엇을 봤는지가 아니라
+            // 무엇을 못 읽었는지를 보여 주고 있는 것이고, 화면에서는 회색
+            // 점 무더기로만 보여 저절로 드러나지 않는다.
+            if (made > 0 && classCount[0] > classCount[1])
+            {
+                log.Add("cloud", string.Format(
+                    "미상 {0:n0} 점이 지면 {1:n0} 점보다 많다 - 전체의 {2:0.0} %",
+                    classCount[0], classCount[1], 100f * classCount[0] / made),
+                    LogKind.Warn);
+            }
+            BuildGround(pos, rel, count);
+        }
+
+        // ------------------------------------------------------------------
+        // 자차가 지면 위 몇 m 에 있는가
+        // ------------------------------------------------------------------
+        // **궤적과 지도가 같은 지면을 가리키는지 재는 자다.**
+        //
+        // 자차는 궤적 위에 그대로 놓인다 (Director.Drive - 달릴 자리를 지어
+        // 내지 않으므로 그것이 맞다). 지면은 그것과 따로, 점군이 점마다
+        // 들고 온 "지면 위 높이" 에서 나온다. 둘은 같은 포즈로 지어졌으니
+        // 그 차이는 **카메라 장착 높이 하나** 여야 하고, 카메라는 차에
+        // 볼트로 붙어 있으므로 시퀀스 내내 변하지 않아야 한다.
+        //
+        // 변하면 둘 중 하나가 틀린 것이다. 그리고 화면에서 그것은 "자차가
+        // 땅에 박혀 있다" 로 보인다 - 숫자가 없으면 느낌으로만 남는다.
+
+        // 궤적 둘레 몇 칸까지 볼 것인가. 열 격자가 1 m 이므로 ±2 면 5x5 m 다.
+        const int kGroundR = 2;
+
+        // 1 m 칸 -> 그 칸의 지면 높이. **자차가 지나갈 자리 둘레만** 담는다.
+        // 지도 전체를 담을 이유가 없다 - 자차는 늘 궤적 위에 있다.
+        readonly Dictionary<long, float> groundOf = new Dictionary<long, float>();
+        readonly List<float> nearBuf = new List<float>();
+
+        // 지면 대비 자차 높이. 불러올 때 한 번 재 둔다.
+        public float egoLift, egoLiftLo, egoLiftHi;
+        public bool egoLiftOk;      // 잴 수 있었는가
+        public bool egoLiftShaky;   // 쟀는데 시퀀스 안에서 흔들리는가
+
+        static long CellKey(int i, int j)
+        {
+            // 위 32 비트에 i, 아래 32 비트에 j. 범위가 겹치지 않으므로
+            // 서로 다른 칸이 같은 키가 되지 않는다.
+            return ((long)i << 32) ^ (uint)j;
+        }
+
+        // 가운데 값. 홀짝을 가르지 않는다 - 여기서 필요한 것은 이상치에
+        // 끌려가지 않는 대표값이지 정확한 중앙값이 아니다.
+        static float Mid(List<float> v)
+        {
+            v.Sort();
+            return v[v.Count / 2];
+        }
+
+        // 궤적이 지나는 칸의 지면 높이를 모은다.
+        //
+        // 점마다 지면 위 높이(rel)를 들고 오므로 y - rel 이 그 점이 속한
+        // 열의 지면이다. 한 칸 안에서 그 값은 사실상 하나지만 (실측: 칸의
+        // 90 % 에서 폭이 0.000 m) 칸 경계에 두 열이 걸리는 자리가 있으므로
+        // 중앙값을 쓴다 - 평균은 벽 하나가 걸린 칸에서 끌려간다.
+        void BuildGround(Vector3[] pos, float[] rel, int count)
+        {
+            groundOf.Clear();
+            if (route == null || route.points == null ||
+                route.points.Length == 0) return;
+
+            var want = new HashSet<long>();
+            foreach (var p in route.points)
+            {
+                int ci = Mathf.FloorToInt(p.x), cj = Mathf.FloorToInt(p.z);
+                for (int di = -kGroundR; di <= kGroundR; ++di)
+                    for (int dj = -kGroundR; dj <= kGroundR; ++dj)
+                        want.Add(CellKey(ci + di, cj + dj));
+            }
+
+            var acc = new Dictionary<long, List<float>>();
+            for (int i = 0; i < count; ++i)
+            {
+                long k = CellKey(Mathf.FloorToInt(pos[i].x),
+                                 Mathf.FloorToInt(pos[i].z));
+                if (!want.Contains(k)) continue;
+                List<float> v;
+                if (!acc.TryGetValue(k, out v))
+                {
+                    v = new List<float>();
+                    acc[k] = v;
+                }
+                v.Add(pos[i].y - rel[i]);
+            }
+            foreach (var kv in acc) groundOf[kv.Key] = Mid(kv.Value);
+        }
+
+        // 이 자리의 지도 지면 높이. 칸이 비면 둘레까지 넓혀 본다 - 관측이
+        // 성겨 생긴 구멍에서 지면이 없다고 하면 잴 수 있는 자리가 없다.
+        public bool GroundAt(Vector3 p, out float y)
+        {
+            y = 0f;
+            if (groundOf.Count == 0) return false;
+            int ci = Mathf.FloorToInt(p.x), cj = Mathf.FloorToInt(p.z);
+            nearBuf.Clear();
+            for (int di = -kGroundR; di <= kGroundR; ++di)
+            {
+                for (int dj = -kGroundR; dj <= kGroundR; ++dj)
+                {
+                    float g;
+                    if (groundOf.TryGetValue(CellKey(ci + di, cj + dj), out g))
+                        nearBuf.Add(g);
+                }
+            }
+            if (nearBuf.Count == 0) return false;
+            y = Mid(nearBuf);
+            return true;
+        }
+
+        void MeasureEgoLift()
+        {
+            egoLiftOk = false;
+            egoLiftShaky = false;
+            if (route == null || route.points == null) return;
+
+            var h = new List<float>();
+            foreach (var p in route.points)
+            {
+                float g;
+                if (GroundAt(p, out g)) h.Add(p.y - g);
+            }
+            // 여덟 자리도 못 재면 분포라고 할 것이 없다.
+            if (h.Count < 8)
+            {
+                log.Add("ego", string.Format(
+                    "자차 높이를 재지 못했다 - 궤적 {0} 점 중 지면을 잡은 것이 {1}",
+                    route.points.Length, h.Count), LogKind.Warn);
+                return;
+            }
+            h.Sort();
+            egoLiftLo = h[h.Count * 10 / 100];
+            egoLift   = h[h.Count / 2];
+            egoLiftHi = h[h.Count * 90 / 100];
+            egoLiftOk = true;
+
+            // **폭이 값보다 크면 시끄러워야 한다.**
+            //
+            // 카메라 장착 높이는 시퀀스 하나에 하나뿐이므로 이 값은 평평해야
+            // 한다. 오늘 산출물 실측:
+            //
+            //                p50    p10~p90 폭
+            //     kitti_00   1.73      0.21
+            //     kitti_05   1.70      0.15
+            //     kitti_07   1.73      0.16
+            //     kitti_04   2.67      4.79
+            //
+            // 세 시퀀스는 폭이 값의 1 할 남짓인데 kitti_04 는 값의 1.8 배다.
+            // 문턱을 따로 고르지 않는다 - 두 수는 같은 시퀀스에서 나온 것이고,
+            // **폭이 값보다 크다** 는 것은 곧 자차가 어디서는 지면 아래에
+            // 있고 어디서는 두 배 위에 있다는 뜻이다. 그때 이 숫자는 카메라
+            // 높이가 아니라 궤적과 지도의 어긋남이다.
+            float span = egoLiftHi - egoLiftLo;
+            egoLiftShaky = span > egoLift;
+            log.Add("ego", string.Format(
+                "자차 높이 (지도 지면 위) {0:0.00} m   p10~p90 {1:0.00}~{2:0.00} m   폭 {3:0.00} m   {4} 점",
+                egoLift, egoLiftLo, egoLiftHi, span, h.Count),
+                egoLiftShaky ? LogKind.Error : LogKind.Ok);
+            if (egoLiftShaky)
+            {
+                log.Add("ego", string.Format(
+                    "폭 {0:0.00} m 가 높이 {1:0.00} m 보다 크다 - 궤적과 지도가 "
+                    + "같은 지면을 가리키지 않는다. 구간에 따라 자차가 노면에 "
+                    + "박히거나 뜬다.", span, egoLift), LogKind.Error);
+            }
         }
 
         // 높이 색. LiDAR 지도의 그 색이다 - 노면이 파랗고 지붕이 붉다.

@@ -14,14 +14,21 @@ $ErrorActionPreference = "Stop"
 try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch { }
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $importer = Join-Path $here "..\Editor\WorldVisionSceneImporter.cs"
-$player = Join-Path $here "..\Runtime\WorldVisionPlayer.cs"
-$sim = Join-Path $here "..\Runtime\WorldVisionSim.cs"
-# Route 와 Stats 는 제 파일로 갈라 두었다. .cs 하나에 MonoBehaviour 가 둘
-# 이상이면 그중 하나만 MonoScript 를 갖고, 나머지는 씬에 끊긴 참조로
-# 직렬화된다 - WorldVisionRoute.cs 의 주석 참조.
-$route = Join-Path $here "..\Runtime\WorldVisionRoute.cs"
-$stats = Join-Path $here "..\Runtime\WorldVisionStats.cs"
 $stubs = Join-Path $here "UnityStubs.cs"
+
+# **Runtime 을 통째로 넣는다.**
+#
+# 여기가 여섯 파일 중 넷만 골라 넣고 있었다. Boot 와 Log 가 빠져 있었는데
+# Sim 이 그 둘을 쓰므로, 이 검사는 통과하기는커녕 **오늘까지 계속 실패하고
+# 있었다** - 'Boot 형식을 찾을 수 없습니다'. 검사가 늘 빨간불이면 아무도
+# 그 빨간불을 읽지 않는다.
+#
+# 골라 넣을 이유가 애초에 없다. 파일이 늘면 목록도 같이 늘어야 하는데 그
+# 손질을 잊는 것이 정확히 이 사고다. 폴더를 통째로 넘긴다 - Route 와 Stats
+# 처럼 클래스마다 파일을 가르는 규칙이 있으므로 (WorldVisionRoute.cs 의
+# 주석 참조) 파일은 앞으로도 늘어난다.
+$runtime = Get-ChildItem (Join-Path $here "..\Runtime") -Filter "*.cs" |
+           ForEach-Object { $_.FullName }
 
 # Roslyn 은 Visual Studio 나 Build Tools 와 함께 온다. 없으면 .NET Framework
 # 쪽 csc 를 쓴다 - 이 코드는 언어 기능을 특별히 쓰지 않아 둘 다 통과한다.
@@ -36,8 +43,9 @@ if (-not $csc) {
 }
 
 $out = Join-Path $env:TEMP "wv_unity_check.dll"
-& $csc /nologo /target:library /warn:4 /out:$out $stubs $importer $player $sim $route $stats
+$src = @($stubs, $importer) + $runtime
+& $csc /nologo /target:library /warn:4 /out:$out $src
 if ($LASTEXITCODE -ne 0) {
     Write-Error "임포터가 컴파일되지 않는다."
 }
-Write-Output "컴파일 통과: 임포터 + 플레이어"
+Write-Output "컴파일 통과: 임포터 + Runtime $($runtime.Count) 파일"

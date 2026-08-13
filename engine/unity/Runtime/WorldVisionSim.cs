@@ -529,6 +529,40 @@ namespace WorldVision
                 speed, speed * 3.6f, playing ? "재생" : "정지"), st);
             y += kRow + 4f;
 
+            // **지금 자차가 지면 위 몇 m 인가.**
+            //
+            // 자차는 궤적 위에 놓이고 노면은 점군에서 오므로, 이 차이는
+            // 카메라 장착 높이 하나여야 한다. 어긋나면 화면에서는 "차가 좀
+            // 낮은데?" 로만 보인다 - 그 느낌을 숫자로 바꿔 놓는다. 어디서
+            // 어긋나는지는 시퀀스 전체 값이 아니라 지금 이 자리의 값이라야
+            // 보이므로, 부팅 로그의 p50 옆에 현재 값을 같이 둔다.
+            if (boot != null && car != null)
+            {
+                float gy;
+                var lift = new GUIStyle(st);
+                string txt;
+                if (boot.GroundAt(car.position, out gy))
+                {
+                    float d = car.position.y - gy;
+                    txt = boot.egoLiftOk
+                        ? string.Format("지면 위 {0:0.00} m      시퀀스 {1:0.00} m",
+                                        d, boot.egoLift)
+                        : string.Format("지면 위 {0:0.00} m", d);
+                    // 지면 아래에 있으면 그것은 판정할 것이 없다. 0 은 고른
+                    // 수가 아니라 "박혔다" 의 정의다.
+                    if (d < 0f) lift.normal.textColor = Kind(LogKind.Error);
+                    else if (boot.egoLiftShaky)
+                        lift.normal.textColor = Kind(LogKind.Warn);
+                }
+                else
+                {
+                    txt = "지면 위 —  (이 자리에 지면 점이 없다)";
+                    lift.normal.textColor = Kind(LogKind.Warn);
+                }
+                GUI.Label(new Rect(kPadX, y, W - kPadX * 2f, kRow), txt, lift);
+                y += kRow + 4f;
+            }
+
             var track = new Rect(kPadX, y, W - kPadX * 2f, 6f);
             var g0 = GUI.color;
             GUI.color = new Color(1f, 1f, 1f, 0.12f);

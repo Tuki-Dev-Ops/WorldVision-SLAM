@@ -66,6 +66,7 @@ namespace UnityEngine
         public static int Min(int a, int b) { return a < b ? a : b; }
         public static float Pow(float a, float b) { return (float)Math.Pow(a, b); }
         public static int RoundToInt(float v) { return (int)Math.Round(v); }
+        public static int FloorToInt(float v) { return (int)Math.Floor(v); }
     }
 
     public struct Bounds
