@@ -213,6 +213,10 @@ build/win/tools/wme_kitti_convert data/kitti/dataset 00 data/kitti_00 --stride 2
 | 해상도 / 초점거리 / 베이스라인 | 1241×376 / 718.86 px / 0.537 m |
 | 유효 깊이 비율 (SGBM) | 67 – 74 % |
 
+> **`kitti_04` 는 나머지 셋과 같은 무게로 보면 안 된다.** 무텍스처 시골길에 프레임당 2.91 m 로, 궤적이 세로로 표류한다 — 정답 대비 수직오차 RMS 6.14 m(나머지 0.17 – 0.34 m), ATE 955 cm(나머지 94 – 141 cm). RPE 는 1.5 배밖에 나쁘지 않으므로 프레임 잡음이 아니라 **누적** 이다.
+>
+> 그 표류가 지도를 세로로 번지게 하고(노면 열의 세로 퍼짐 1.03 m 대 0.04 m), 번진 무리의 아래쪽에 앉은 지면 추정이 자차를 어디선 파묻고 어디선 띄운다. 진짜 노면 점이 `rel` 1–3 m 로 떠 버리면 "미상" 이 되므로 미상 비율도 33.6 % 로 튄다(나머지 2.9 – 4.9 %). Unity 뷰어가 불러올 때 자차 높이의 p10/p50/p90 을 재서 폭이 중앙값을 넘으면 **Error 로 운다** — 도시 셋은 그 비율이 0.09 – 0.12, kitti_04 는 1.8 이다.
+
 ### 360° 등장방형 — 잘라내지 않으면 조용히 틀린다
 
 파이프라인 전체가 **핀홀**을 가정한다. 360° 카메라의 등장방형 영상은 화소 좌표가 (경도, 위도)라 그 가정을 만족하지 않는다. 그런데 그대로 넣어도 **아무것도 실패하지 않는다** — 특징점은 잡히고 궤적도 나온다. 틀린 궤적이 나온다. 그래서 원근 뷰로 잘라내는 단계를 앞에 둔다.
@@ -233,7 +237,9 @@ build/win/tools/wme_equirect_convert --in <좌> --right <우> --baseline 0.30 \
     --out data/pano_stereo --yaw 0 --hfov 90 --width 640 --height 480
 ```
 
-검증은 합성 등장방형(정답 3D 좌표를 아는 장면을 해석적으로 투영)으로 한다 — 실데이터에는 비교할 진리값이 없어 애초에 답이 안 나온다.
+기하 검증은 합성 등장방형(정답 3D 좌표를 아는 장면을 해석적으로 투영)으로 한다 — 재투영 오차를 재려면 진리값이 있어야 하고, 실사진에는 그것이 없다.
+
+**다만 합성으로는 원리적으로 답할 수 없는 것이 하나 있었다.** 경도의 증가 방향, 즉 세계가 통째로 좌우 반전인가다. 검증 스크립트는 이 규약으로 원본을 만들고 같은 규약으로 되읽으므로 **반전이어도 오차 0 으로 통과한다.** 그리고 반전은 `--yaw` 로 흡수되지 않는다(원점 차이는 흡수된다). 그래서 실제 스티처의 출력으로만 답할 수 있었고, 제조사가 다른 소비자 360 카메라 두 대(GoPro Max · RICOH THETA SC)의 네이티브 스티치로 확정했다 — 간판 글자가 정상으로 읽히고, EXIF 의 GPS·UTC 에서 계산한 태양 방위와 영상에서 잰 위치가 맞으며, 길의 소실 방향이 OSM 도로 방위와 **3.5° 안**에서 일치한다(반전 가정이면 132° 어긋난다). 자세한 수치는 `python/wme/reference/equirect.py` 머리말.
 
 ```bash
 python python/tools/equirect_validate.py --e2e   # 결과: results/equirect/validate.json
@@ -247,6 +253,8 @@ python python/tools/equirect_validate.py --e2e   # 결과: results/equirect/vali
 | `calibrateCamera` 로 회수한 fx / cx | 0.29 % / 0.27 px (대조군 0.31 % / 0.32 px) |
 | 360 스테레오 깊이 (B = 0.30 m) | 유효 92.4 %, 상대오차 중앙 0.36 %, 편향 −0.005 m |
 | 스테레오로 쓸 수 있는 yaw 범위 | **±1.19°** (B 0.30 m, 최근접 3 m, H 480 에서 유도) |
+| 경도 규약 (실데이터, 제조사 2 곳) | **좌우 반전 없음.** 태양 방위 대 OSM 도로 방위 오차 3.5° |
+| C++ ↔ 오라클, **실사진** 7 개 뷰 | 최대 4 LSB (합성 1 LSB — 사진의 고주파에서 cubic 반올림이 갈린다) |
 
 > 마지막 줄이 이 경로의 진짜 제약이다. 단안 360 한 장에는 깊이가 없고, 리그를 써도 베이스라인과 나란한 방향에서는 시차가 깊이 정보를 잃는다. 자세한 유도는 `tools/equirect_convert.cpp` 의 `checkRectified()`.
 
@@ -340,6 +348,60 @@ python python/tools/bench_degrade.py      # 안개 스윕
 python python/tools/stereo_validate.py    # 스테레오 깊이를 TUM 실측 깊이에 대고 검증
 python python/tools/loop_optimize.py      # 포즈그래프 루프 클로저
 build/tools/wme_tum_loopclose data/rgbd_dataset_freiburg1_room out.txt
+```
+
+### 7. 인식한 장면을 눈으로 — C++ 뷰어와 Unity(C#)
+
+두 경로가 있고, **보는 것이 다르다.** C++ 뷰어는 점군과 판정을 그대로 보여 주는 계측기이고, Unity 빌드는 그 결과 위를 걸어 다니는 것이다. 둘은 파일로 이어져 있다 — 뷰어가 `.json` + `.wvpc` 를 내보내고 Unity 가 그것을 읽는다.
+
+#### C++ 뷰어 (`wme_bench_viewer`)
+
+```bash
+# Windows: OpenCV DLL 경로를 PATH 에 넣어야 한다
+$env:PATH = "C:\opencv-dl\opencv\build\x64\vc16\bin;" + $env:PATH
+
+build/win/tools/wme_bench_viewer --manifest results/bench/viewer.tsv \
+    --seq 0 --frame 399 --voxel 0.15 \
+    --export-json results/scene/kitti_00.json \
+    --screenshot  /tmp/shot.png
+```
+
+`--seq` 는 매니페스트 순서다 (`0` kitti_00 · `1` kitti_04 · `2` kitti_05 · `3` kitti_07). 조작은 `1`~`4` 카메라, `Space` 재생/정지, `←→` 스크럽, `C` 점군 색 전환, `F1`~`F7` 클래스 토글, `Q` 종료.
+
+> **DLL 경로를 빼면 `exit -1073741515` 로 죽는다.** 실행이 아예 안 되는 것인데 종료코드만 보면 크래시처럼 보인다.
+>
+> **`--frame` 에 시퀀스 길이 이상을 주지 마라.** 클램프와 헤드리스 스킵이 물려 **조용히 무한 루프한다** (실측: 15 분). `nframes` 는 kitti_00 / 05 / 07 = 400, kitti_04 = 136 이므로 각각 399, 135 가 최대다.
+>
+> 헤드리스 로그의 복셀 크기 표시는 앞 필드의 스트림 상태를 물려받아 **0.15 m 를 "0.2 m" 로 찍는다.** 실제 값은 요청대로 적용된다 (`--voxel` 을 바꾸면 칸 수가 갈리는 것으로 확인).
+
+#### Unity 빌드 (C#)
+
+```powershell
+powershell -ExecutionPolicy Bypass -File engine/unity/build.ps1 -Run
+```
+
+`build/unity/WorldVision.exe` 가 나온다. **WASD** 이동 · **Shift** 질주 · **Space** 점프 · 마우스 시점 · **F** 날기/걷기 · **Esc** 마우스 풀기 · **Q** 종료.
+
+데이터만 갈아 끼울 때는 **다시 빌드할 필요가 없다.** 실행 파일 옆 `wvdata/` 를 바꾸면 된다:
+
+```powershell
+Copy-Item results/scene/*.json,results/scene/*.wvpc build/unity/wvdata/ -Force
+```
+
+Unity 없이 C# 만 컴파일 검사하려면:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File engine/unity/Check/check.ps1
+```
+
+> **씬 파일을 손으로 고치지 마라.** `build.ps1` 이 매 빌드마다 `Assets/WorldVisionSim.unity` 를 지우고 `WorldVisionSceneImporter.cs` 가 코드로 다시 세운다. 씬을 바꾸려면 임포터를 고쳐야 한다.
+>
+> **한 `.cs` 파일에 `MonoBehaviour` 를 둘 이상 두지 마라.** 파일 하나에 `MonoScript` 는 하나뿐이라 나머지는 씬이 가리킬 에셋이 없고, 에디터 안에서는 멀쩡해 보이다가 **직렬화할 때** 끊긴다. 그 결과가 `level0 is corrupted` 다. 임포터가 빌드 전에 저장된 씬을 검사해 `exit 4` 로 막는다.
+
+임포터만 따로 (언리얼도 같은 `.json` 을 읽는다):
+
+```bash
+python engine/unreal/Check/check.py          # 엔진 없이 스텁으로 검증
 ```
 
 ---
