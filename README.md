@@ -4,7 +4,7 @@
 
 ### WME — World Model Engine
 
-**기술자(descriptor) 없는 SLAM.** 특징점을 기억하는 대신 세계를 기억한다.
+**기술자(descriptor)를 기억하는 대신, 세계를 기억하는 SLAM.**
 
 <br>
 
@@ -26,388 +26,783 @@
 
 ---
 
-## 프로젝트 배경
+## WME는 무엇을 하려는가?
 
-고전 시각 SLAM은 30년 가까이 같은 전제 위에 서 있다. **화소 주변을 숫자 벡터로 요약(기술자)하고, 그 벡터가 비슷하면 같은 점이라고 본다.** ORB, SIFT, BRIEF가 모두 이 전제를 공유한다.
+SLAM은 카메라나 LiDAR 같은 센서를 이용해 **내 위치와 주변 환경을 동시에 추정하는 기술**입니다.
 
-이 전제는 조건이 좋을 때 매우 잘 동작하고, 조건이 나빠지면 **조용히** 무너진다. 안개가 끼면 기술자는 "매칭 실패"를 보고하지 않는다. 그럴듯한 오답을 낸다. 밤이 되면, 비가 오면, 카메라가 흔들리면 같은 일이 벌어진다. 실패가 시끄럽지 않기 때문에 상위 계층은 그것을 알아차릴 방법이 없다.
+기존의 많은 시각 SLAM 시스템은 영상에서 특징점을 찾고, 그 주변의 픽셀을 descriptor라는 숫자 벡터로 표현한 다음, 이전 프레임에서 본 것과 비슷한 descriptor를 찾아 서로 같은 지점을 연결합니다.
 
-WME는 다른 질문에서 출발한다. **사람은 기술자를 매칭하지 않는다.** 어두운 방에 들어가도 책상이 어디 있는지 안다. 화소를 대조해서가 아니라, 그 방의 **모델**을 갖고 있어서다. 대응(correspondence) 문제를 화소 수준에서 풀지 않고, 세계 모델 수준에서 푼다.
+이 방법은 조명이 안정적이고 텍스처가 충분한 환경에서는 매우 잘 작동합니다.
 
-그래서 이 저장소가 만드는 것은 "더 나은 기술자"가 아니라 **기술자를 쓰지 않는 파이프라인**이고, 그 파이프라인이 정말 기술자 파이프라인보다 나은지를 같은 데이터에서 나란히 재는 장치다.
+문제는 환경이 조금만 어려워졌을 때입니다.
 
-### 이 프로젝트가 스스로에게 건 조건
+안개가 끼거나, 밤이 되거나, 모션 블러가 생기거나, 텍스처가 부족해지면 descriptor 자체가 불안정해집니다. 더 어려운 점은 **완전히 실패하는 것이 아니라 그럴듯한 오답을 만들어낼 수 있다는 것**입니다.
 
-주장은 쉽고 검증은 어렵다. 그래서 규칙을 먼저 정했다.
+WME는 여기서 다른 질문을 던집니다.
 
-| 규칙 | 이유 |
-|---|---|
-| **모든 C++ 구현에 독립 numpy 오라클을 붙인다** | 두 구현이 같은 답을 내야 그 답을 믿는다. 한 코드가 자기를 검증하면 버그가 자기를 가린다 |
-| **추정과 채점을 다른 코드가 한다** | 추정은 C++, ATE/RPE 채점은 Python. 같은 코드로 둘 다 하면 두 버그가 서로를 상쇄한다 |
-| **대조군은 "우리가 안 쓴다"고 선언한 바로 그 기술자 파이프라인이다** | 임의의 약한 상대를 이기는 것은 의미가 없다 |
-| **측정이 판별하는지를 먼저 확인한다** | 모든 입력에서 같은 값이 나오는 지표는 통과해도 아무것도 증명하지 않는다 |
-| **실패는 시끄러워야 한다** | "저장했다"고 찍고 파일을 안 쓴 도구, 초록으로 끝나는 도달 불가 테스트 — 전부 결함으로 취급한다 |
+> **"픽셀을 비교하지 않고도, 같은 장소라는 것을 알아낼 수 있다면 어떨까?"**
 
-이 규칙들이 실제로 무엇을 잡아냈는지는 [docs/06-results.md](docs/06-results.md)에 전부 기록되어 있다. 성공한 실험만이 아니라 **거부된 가설 다섯 개와 내가 만든 결함들**까지 남아 있다.
+사람은 어두운 방에 들어갔을 때 픽셀이나 특징점을 하나씩 비교하지 않습니다.
 
----
+책상, 의자, 벽, 문, 창문 같은 **세계의 구조와 관계**를 기억하고 있기 때문입니다.
 
-## 프로젝트 목적
+WME가 만들고 싶은 SLAM도 비슷한 방향입니다.
 
-### 1. 세 계층으로 대응 문제를 푼다
+특징점 자체를 오래 기억하는 대신,
 
-```
-Λ_total = α₀(E)·Λ_ECDA + α₁(E)·Λ_TCG + α₂(E)·Λ_SPA
-```
+* 어떤 물체가 있었는지
+* 물체들이 서로 어떻게 배치되어 있었는지
+* 바닥과 벽은 어디에 있었는지
+* 관측을 얼마나 믿을 수 있는지
+* 이전에 같은 장소에서 무엇을 보았는지
 
-| 계층 | 이름 | 하는 일 |
-|---|---|---|
-| **Tier 0** | ECDA | 직접 측광 정렬. 화소 밝기 잔차를 최소화한다. 기술자 없음 |
-| **Tier 1** | TCG | 토큰 성좌 기하. 물체(YOLO 검출)의 상대 배치로 위치를 잡는다 |
-| **Tier 2** | SPA | 구조 정렬. 평면의 법선/거리로 퇴화 축을 메운다 |
-
-`α_k(E)`는 손으로 쓴 분기가 아니다. **환경 증거 E**(어둠, 안개, 모션블러, 텍스처 빈곤 …)에서 계산된다. 야간용 코드도, 우천용 코드도 존재하지 않는다 — 열화는 각 정보원이 기여하는 **정보량의 감소**로만 표현된다.
-
-### 2. 그 주장을 같은 데이터에서 나란히 잰다
-
-`results/bench/index.html`은 **왼쪽에 기존 방식, 오른쪽에 WME**를 놓고 궤적·ATE·RPE·속도를 한 화면에서 비교하는 뷰어다. 20개 시퀀스가 들어 있다.
-
-<div align="center">
-
-| 데이터셋 | 시퀀스 | 대조군 | 결과 (단일 설정) |
-|---|---|---|---|
-| **TUM RGB-D** (실내, 손) | 16 | ORB+PnP, `cv2.Odometry` | **8 – 7** (둘 중 나은 쪽 기준) |
-| **KITTI odometry** (실외, 차량) | 4 | ORB+PnP | **4 – 0** |
-
-</div>
-
-**TUM은 사실상 무승부다.** 시퀀스마다 좋은 변형을 고르면 10–5가 되지만, 그건 배포되는 시스템이 못 하는 선택이다. 위 표는 **모든 시퀀스에 같은 설정**(Tier 0)을 돌린 숫자다.
-
-이 수치들은 두 번 크게 움직였고, 두 번 다 알고리즘이 아니라 측정 쪽이 원인이었다.
-
-- **KITTI를 붙이자 2–2로 뒤집혔다.** ECDA가 스테레오 깊이를 참값으로 믿고 있었다 — 60 m 지점의 깊이 오차는 ±4 m인데 6 m 지점(±4 cm)과 같은 무게로 들어가고 있었다. 불확실성을 잔차 분산으로 옮기고(계수는 `c = σ_d/(f·B)`로 **유도**, 튜닝 아님) 다시 재니 4–0이 되었다. ([§25.20–25.21](docs/06-results.md))
-- **TUM 16개 중 13개가 시퀀스의 일부만 채점하고 있었다** — 평균 35%, 최저 6.4%. 압축 해제가 중간에 끊겨도 프레임 인덱스는 멀쩡히 남았고, 로더는 있는 파일만 읽고 깨끗한 실행을 보고했다. 전부 다시 받아 재실행하니 판정 5개가 **양방향으로** 뒤집혔다. ([§25.22](docs/06-results.md))
-
-> **그전까지 "WME가 더 낫다"고 적혀 있던 문장은 알고리즘의 성질이 아니라, 한 번은 데이터셋의 성질이었고 한 번은 데이터의 3분의 1만 본 결과였다.**
-
-### 3. 무엇이 아닌지도 분명히 한다
-
-- **ORB-SLAM3가 아니다.** 대조군은 ORB 검출 → 해밍 매칭 → RANSAC PnP까지다. 루프 클로저도 번들 조정도 없다. 비교는 **오도메트리 대 오도메트리**로만 유효하다
-- 양쪽 모두 **번들 조정이 없다**. 포즈 그래프까지다
-- 열화(안개) 실험은 실제 TUM 프레임에 **실측 깊이**로 산란 방정식을 적용해 만든 것이지, 자연 열화 데이터가 아니다
-
-무엇이 확립되지 않았는지는 [docs/06-results.md §26](docs/06-results.md)에 목록으로 있다.
+같은 정보를 이용해 **세계 자체를 표현하고 다시 찾아가는 것**을 목표로 합니다.
 
 ---
 
-## 저장소 구조
+# 핵심 아이디어
 
+WME의 대응(correspondence)은 하나의 방법에 의존하지 않습니다.
+
+현재는 세 가지 서로 다른 정보원을 사용하고, 각 정보원이 현재 환경에서 얼마나 신뢰할 수 있는지를 정보량(information) 관점에서 계산해 결합합니다.
+
+```text
+                    Environment E
+                         │
+                         ▼
+              ┌─────────────────────┐
+              │ Environment Analyzer │
+              └──────────┬──────────┘
+                         │
+             information weighting
+                         │
+          ┌──────────────┼──────────────┐
+          ▼              ▼              ▼
+       Tier 0          Tier 1          Tier 2
+        ECDA            TCG             SPA
+          │              │              │
+       Photometric    World Tokens    Structure
+       Alignment      / Objects       / Planes
+          │              │              │
+          └──────────────┼──────────────┘
+                         ▼
+                    Pose Fusion
+                         │
+                         ▼
+                       Pose
 ```
+
+### Tier 0 — ECDA
+
+**Direct Photometric Alignment**
+
+이미지의 밝기 차이를 직접 이용해 두 프레임을 정렬합니다.
+
+descriptor나 feature matching을 사용하지 않습니다.
+
+환경이 충분히 안정적이라면 가장 많은 픽셀 정보를 직접 활용할 수 있다는 장점이 있습니다.
+
+---
+
+### Tier 1 — TCG
+
+**Token Constellation Geometry**
+
+이미지에서 인식된 물체를 하나의 `World Token`으로 보고, 개별 특징점 대신 **물체들의 상대적인 배치**를 이용합니다.
+
+예를 들어,
+
+```text
+        [Chair]
+
+[Table]       [Person]
+
+        [Monitor]
+```
+
+와 같은 배치를 하나의 구조로 기억합니다.
+
+카메라가 이동해도 개별 픽셀은 달라질 수 있지만, 물체 사이의 관계는 비교적 안정적으로 유지될 수 있습니다.
+
+현재 구현에서는 YOLO 기반 객체 검출을 이용해 토큰을 생성합니다.
+
+---
+
+### Tier 2 — SPA
+
+**Structural Plane Alignment**
+
+벽, 바닥, 천장과 같은 구조적 정보를 이용합니다.
+
+특징점이 거의 없는 복도나 텍스처가 부족한 벽처럼 일반적인 feature 기반 방법이 어려운 환경에서도 **평면의 방향과 거리**는 유용한 정보를 제공할 수 있습니다.
+
+---
+
+## 세 정보를 어떻게 합치는가?
+
+WME는 다음과 같이 각 정보원의 기여도를 하나의 정보 행렬로 합칩니다.
+
+```text
+Λ_total =
+    α₀(E) · Λ_ECDA
+  + α₁(E) · Λ_TCG
+  + α₂(E) · Λ_SPA
+```
+
+여기서 중요한 부분은 `α`입니다.
+
+WME에는
+
+```text
+if night:
+    use token
+
+if rain:
+    use plane
+
+if fog:
+    disable photometric
+```
+
+같은 환경별 분기 코드를 넣지 않습니다.
+
+대신 현재 환경에서 각각의 정보원이 얼마나 신뢰할 수 있는지를 측정하고, 그 결과에 따라 정보량을 조절합니다.
+
+즉,
+
+**"밤이면 A를 사용한다"가 아니라
+"현재 관측에서 A가 제공하는 정보량이 줄었다"**
+
+라는 방식으로 환경 변화를 다룹니다.
+
+---
+
+# 왜 기존 SLAM과 비교하는가?
+
+새로운 알고리즘을 만들었다고 해서 그것이 실제로 더 좋은 것은 아닙니다.
+
+그래서 WME에서는 비교 자체를 프로젝트의 중요한 부분으로 보고 있습니다.
+
+대조군은 일부러 단순하게 만들었습니다.
+
+```text
+ORB
+ ↓
+Descriptor Matching
+ ↓
+RANSAC
+ ↓
+PnP
+ ↓
+Pose
+```
+
+즉, WME가 사용하지 않겠다고 한 바로 그 종류의 파이프라인을 비교 대상으로 삼습니다.
+
+이를 통해 질문을 최대한 단순하게 만들었습니다.
+
+> **"descriptor 기반 대응보다 world-level correspondence가 실제로 더 나은가?"**
+
+현재 벤치마크에는 TUM RGB-D와 KITTI odometry가 포함되어 있으며, 동일한 데이터와 동일한 평가 방법으로 두 시스템을 비교합니다.
+
+| Dataset | Sequences | Baseline | Current Result |
+| --- | ---: | --- | ---: |
+| TUM RGB-D | 16 | ORB + PnP, `cv2.Odometry` | 8 – 7 |
+| KITTI Odometry | 4 | ORB + PnP | 4 – 0 |
+
+TUM에서는 사실상 비슷한 수준의 결과가 나옵니다.
+
+반면 KITTI에서는 현재 평가한 4개 시퀀스에서 WME가 앞서고 있습니다.
+
+다만 이 숫자를 "WME가 SLAM을 해결했다"는 의미로 해석하지는 않습니다.
+
+현재 결과는 **특정 데이터와 특정 설정에서의 실험 결과**이며, 일반적인 환경에서의 우월성을 증명하려면 더 많은 데이터와 비교가 필요합니다.
+
+그리고 위 표는 모든 시퀀스에 같은 설정으로 돌린 숫자입니다. 시퀀스마다 가장 좋은 변형을 골라 쓰면 TUM은 10–5가 되지만, 그것은 실제로 배포되는 시스템이 할 수 없는 선택입니다.
+
+---
+
+# 이 프로젝트에서 특히 중요하게 보는 것
+
+WME에서는 알고리즘만큼 **실험의 신뢰성**을 중요하게 보고 있습니다.
+
+그래서 몇 가지 원칙을 정해두었습니다.
+
+### 1. C++ 구현과 독립적인 Python Oracle
+
+핵심 수학 연산은 C++ 구현과 별도로 NumPy 기반 reference implementation을 가지고 있습니다.
+
+```text
+C++ implementation
+       │
+       │
+       ├──── compare ──── Python / NumPy Oracle
+       │
+       ▼
+     Result
+```
+
+한 구현이 자기 자신을 검증하는 구조를 피하기 위해서입니다.
+
+---
+
+### 2. 추정과 평가를 분리
+
+SLAM은 C++에서 실행하지만 ATE/RPE와 같은 평가는 Python에서 별도로 수행합니다.
+
+```text
+C++  →  trajectory
+
+Python → ATE / RPE / alignment
+```
+
+추정 코드에 있는 버그가 평가 코드의 버그와 서로 상쇄되는 상황을 최대한 피하려는 목적입니다.
+
+---
+
+### 3. 측정 방법 자체도 검증
+
+실험에서 가장 위험한 것은 알고리즘이 틀린 것이 아니라 **측정이 틀린 상태에서 결과를 믿는 것**입니다.
+
+실제로 개발 과정에서 그런 문제가 여러 번 발견되었습니다.
+
+예를 들어 KITTI에서는 깊이 오차에 대한 불확실성을 제대로 반영하지 않았을 때 결과가 2–2로 나왔습니다.
+
+60 m 지점의 깊이 오차는 ±4 m인데 6 m 지점(±4 cm)과 같은 무게로 들어가고 있었습니다. 이 불확실성을 잔차 분산으로 옮긴 뒤 결과가 4–0으로 바뀌었습니다. 계수는 손으로 맞춘 값이 아니라 `c = σ_d / (f·B)`로 유도한 값입니다.
+
+TUM에서도 일부 데이터셋의 압축이 중간에 끊어진 상태에서 프레임 인덱스만 정상적으로 남아 있어, 실제보다 훨씬 적은 데이터를 평가하고 있던 문제가 발견되었습니다.
+
+16개 중 13개가 평균 35 %, 최저 6.4 %만 채점되고 있었습니다. 데이터를 다시 받아 평가한 결과 일부 판정이 양방향으로 바뀌었습니다.
+
+이런 사례 때문에 WME에서는 **실험 결과뿐 아니라 실패 과정도 기록**합니다.
+
+자세한 내용은 [`docs/06-results.md`](docs/06-results.md)에 정리되어 있습니다.
+
+---
+
+### 4. 실패는 조용하면 안 된다
+
+가장 위험한 실패는 프로그램이 죽는 실패가 아니라, 그럴듯한 값을 내면서 계속 굴러가는 실패입니다.
+
+개발 과정에서 실제로 이런 것들이 있었습니다.
+
+* 정렬 비교자가 부동소수 잡음 1 ULP에 순위를 맡기고 있어서, 같은 지도를 다른 기계에서 돌리면 다른 장소가 루프 클로저 후보로 뽑혔습니다.
+* 거리 구간화 함수가 NaN을 그대로 통과시켜 `static_cast<int>(NaN)`에 닿았고, 그 결과가 멀쩡해 보이는 0번 구간이 되었습니다.
+* Unity 씬에 스크립트 참조가 끊긴 컴포넌트가 직렬화되어 실행할 때 `level0 is corrupted`로 죽었는데, 엔진은 매 빌드마다 원인을 로그에 적고 있었고 로그 필터가 그 줄을 지우고 있었습니다.
+
+지금은 이런 자리마다 시끄럽게 실패하도록 검사를 넣어두고 있습니다.
+
+---
+
+# 현재 구현 범위
+
+현재 WME는 단순한 SLAM 알고리즘 하나가 아니라, 실험부터 시각화까지 연결된 작은 연구 플랫폼에 가깝습니다.
+
+```text
 WorldVision-SLAM/
-├── include/wme/              공개 헤더 (25)
-│   ├── core/                 SE3, Frame, Result, ThreadPool, Assignment
-│   ├── localization/         DirectAligner            ← Tier 0 (ECDA)
-│   ├── token/                TokenStore, ConstellationIndex, WorldToken
-│   │                                                  ← Tier 1 (TCG)
-│   ├── geometry/             StructuralAligner, PlaneExtractor
-│   │                                                  ← Tier 2 (SPA)
-│   ├── fusion/               PoseFusion, TierInformation
-│   ├── perception/           ImageQualityEngine, EnvironmentAnalyzer,
-│   │                         StereoDepth, YoloRuntime{Cv,Ort}
-│   └── confidence/           ConfidenceEngine
 │
-├── src/                      구현 (19 파일, 4.3 kLOC / 헤더 포함 6.7 kLOC)
+├── include/wme/
+│   ├── core/
+│   ├── localization/       # ECDA
+│   ├── token/              # TCG
+│   ├── geometry/           # SPA
+│   ├── fusion/
+│   ├── perception/
+│   └── confidence/
 │
-├── tools/                    실행 가능한 실험 바이너리 (14)
-│   ├── tum_odometry.cpp      WME 오도메트리
-│   ├── tum_baseline.cpp      ORB+PnP 대조군 ← "안 쓴다"고 선언한 바로 그것
-│   ├── kitti_convert.cpp     KITTI → TUM 배치 + StereoSGBM 깊이
-│   ├── equirect_convert.cpp  360° 등장방형 → 원근 뷰 TUM 배치 (내부파라미터 유도)
-│   ├── tum_loopclose.cpp     대칭 루프 클로저 (ORB vs TCG)
-│   ├── tum_degrade.cpp       실측 깊이 기반 산란 열화
-│   ├── tum_fusion.cpp        3계층 융합 실행
-│   ├── scene_export.cpp      검출 상자 사전 내보내기
-│   ├── seg_export.cpp        SegFormer-B0 의미 분할 사전 내보내기 (ONNX)
-│   ├── bench_viewer.cpp      벤치 결과 뷰어
-│   └── …                     relocalize, tcg_density, plane_density, env_probe
+├── src/
 │
-├── tests/                    C++ 테스트 (16 파일, 236 케이스)
+├── tools/
+│   ├── tum_odometry.cpp
+│   ├── tum_baseline.cpp
+│   ├── kitti_convert.cpp
+│   ├── equirect_convert.cpp
+│   ├── tum_loopclose.cpp
+│   ├── tum_degrade.cpp
+│   ├── tum_fusion.cpp
+│   ├── scene_export.cpp
+│   ├── seg_export.cpp
+│   ├── bench_viewer.cpp
+│   └── ...
+│
+├── tests/
 │
 ├── python/
 │   ├── wme/
-│   │   ├── reference/        ★ C++ 과 대조되는 numpy 오라클
-│   │   │                       assignment, confidence, constellation,
-│   │   │                       environment, environment_cues, equirect,
-│   │   │                       geometry, tokens
-│   │   ├── localization/     ecda.py — DirectAligner 의 오라클
-│   │   ├── geometry/         spa.py, planes.py
-│   │   ├── eval/             ATE / RPE / Umeyama, TUM 로더  ← 채점 전담
-│   │   ├── graph/            포즈그래프, 팩터, 측광 SLAM
-│   │   ├── sim/ world/       합성 장면, 세계 모델 상태/예측/변화탐지
-│   │   ├── association/ calib/ planner/
-│   │   └── yolo.py
-│   ├── bindings/             pybind11 → wme._core
-│   ├── tools/                실험·벤치 스크립트 (35)
-│   │   ├── bench_run.py      두 시스템 실행 + 채점 → benchmark.json
-│   │   ├── bench_report.py   → results/bench/index.html  (좌/우 비교 뷰어)
-│   │   ├── fetch_kitti.py    KITTI 내려받기 (이어받기 지원)
-│   │   └── …
-│   └── tests/                Python 테스트 (27 파일, 645 케이스)
+│   │   ├── reference/
+│   │   ├── localization/
+│   │   ├── geometry/
+│   │   ├── eval/
+│   │   ├── graph/
+│   │   ├── sim/
+│   │   └── ...
+│   │
+│   ├── bindings/
+│   ├── tools/
+│   └── tests/
 │
 ├── docs/
-│   ├── 00-manifesto.md       왜 기술자를 버리는가
-│   ├── 01-architecture.md    계층 구조
-│   ├── 02-correspondence-problem.md   이론적 근거
+│   ├── 00-manifesto.md
+│   ├── 01-architecture.md
+│   ├── 02-correspondence-problem.md
 │   ├── 03-roadmap.md
 │   ├── 04-unified-objective.md
 │   ├── 05-research-program.md
-│   ├── 06-results.md         ★ 모든 실측 결과와 실패 기록
-│   └── 07-adverse-weather.md 실제 악천후 데이터 진입 조건과 변환기 설계
+│   ├── 06-results.md
+│   └── 07-adverse-weather.md
 │
-├── results/bench/index.html  ★ 좌: 기존 모델 / 우: WME  비교 뷰어
-├── cmake/                    의존성·경고 정책
-└── .github/workflows/        linux, windows-msvc, sanitizers, python
+├── results/
+│   └── bench/
+│
+└── engine/
+    ├── unity/
+    └── unreal/
 ```
 
 ---
 
-## 데이터셋
+# 데이터셋
 
-두 데이터셋 모두 저장소에 **포함되어 있지 않다** (합계 51 GB). 스크립트로 재현한다.
+## TUM RGB-D
 
-### TUM RGB-D — 실내, 손에 든 카메라, 측정된 깊이
+실내에서 손으로 카메라를 움직이는 환경입니다.
 
-Kinect 구조광 센서라 깊이가 **측정값**이다. 16개 시퀀스를 쓴다.
+Kinect 구조광 센서의 측정 깊이를 사용할 수 있기 때문에 WME의 기본적인 오도메트리 성능을 검증하기에 적합합니다.
+
+현재 16개 시퀀스를 사용합니다.
 
 ```bash
 python python/tools/tum_fetch.py
 ```
 
-| 그룹 | 시퀀스 | 성격 |
-|---|---|---|
-| `freiburg1` | xyz, desk, room, 360, plant, teddy | 왜곡 큼(k1=0.26), 일반 실내 |
-| `freiburg2` | desk, desk_with_person | 다른 카메라 — 일반화 확인용 |
-| `freiburg3` | structure/nostructure × texture/notexture | 퇴화 조건 격리 |
-| `freiburg3` | sitting_*, walking_* | 동적 물체 |
+다양한 텍스처와 움직임, 동적 객체가 포함되어 있어 일반적인 실내 환경부터 퇴화 조건까지 비교할 수 있습니다.
 
-> 내부 파라미터와 왜곡 계수는 freiburg 그룹마다 다르다. 하나로 고정하면 다른 그룹에서 **실패가 아니라 그럴듯한 오차**가 나온다.
-
-### KITTI odometry — 실외, 차량, 스테레오
-
-깊이가 없다. **우리가 만들어야 한다** — 그래서 `StereoDepth`(OpenCV SGBM) 프런트엔드가 여기서 처음 필요해진다. 깊이는 측정값이 아니라 **추정값**이고, 그 구분이 §25.21의 핵심이다.
-
-```bash
-python python/tools/fetch_kitti.py        # 21.6 GB, 이어받기 지원
-```
-
-변환 시 시차 탐색 범위는 장면의 최근접 거리에서 **유도**한다. 이 값을 대충 두면 SGBM은 "범위 밖"이라고 말하지 않고 **그럴듯한 오답**을 낸다 (실측: 깊이 스케일 2.42배).
-
-```bash
-build/win/tools/wme_kitti_convert data/kitti/dataset 00 data/kitti_00 --stride 2
-```
-
-| 항목 | 값 |
-|---|---|
-| 내려받는 시퀀스 | 00–21 (22개, 정답 궤적은 00–10) |
-| 현재 변환·평가된 시퀀스 | 00, 04, 05, 07 |
-| 해상도 / 초점거리 / 베이스라인 | 1241×376 / 718.86 px / 0.537 m |
-| 유효 깊이 비율 (SGBM) | 67 – 74 % |
-
-> **`kitti_04` 는 나머지 셋과 같은 무게로 보면 안 된다.** 무텍스처 시골길에 프레임당 2.91 m 로, 궤적이 세로로 표류한다 — 정답 대비 수직오차 RMS 6.14 m(나머지 0.17 – 0.34 m), ATE 955 cm(나머지 94 – 141 cm). RPE 는 1.5 배밖에 나쁘지 않으므로 프레임 잡음이 아니라 **누적** 이다.
->
-> 그 표류가 지도를 세로로 번지게 하고(노면 열의 세로 퍼짐 1.03 m 대 0.04 m), 번진 무리의 아래쪽에 앉은 지면 추정이 자차를 어디선 파묻고 어디선 띄운다. 진짜 노면 점이 `rel` 1–3 m 로 떠 버리면 "미상" 이 되므로 미상 비율도 33.6 % 로 튄다(나머지 2.9 – 4.9 %). Unity 뷰어가 불러올 때 자차 높이의 p10/p50/p90 을 재서 폭이 중앙값을 넘으면 **Error 로 운다** — 도시 셋은 그 비율이 0.09 – 0.12, kitti_04 는 1.8 이다.
-
-### 360° 등장방형 — 잘라내지 않으면 조용히 틀린다
-
-파이프라인 전체가 **핀홀**을 가정한다. 360° 카메라의 등장방형 영상은 화소 좌표가 (경도, 위도)라 그 가정을 만족하지 않는다. 그런데 그대로 넣어도 **아무것도 실패하지 않는다** — 특징점은 잡히고 궤적도 나온다. 틀린 궤적이 나온다. 그래서 원근 뷰로 잘라내는 단계를 앞에 둔다.
-
-내부파라미터는 상수로 박지 않고 뷰 파라미터에서 **유도**한다. 영상이 화소 인덱스 −0.5 … *W*−0.5, 즉 폭 *W* 화소를 덮으므로
-
-```
-cx = (W-1)/2        fx = (W/2) / tan(hfov/2)        (fy 도 같은 논리, 기본은 정사각 화소)
-```
-
-```bash
-# 단안: rgb 전용 배치가 나온다 (RGB-D 러너는 못 먹는다 — 도구가 크게 알린다)
-build/win/tools/wme_equirect_convert --in <360폴더> --out data/pano_front \
-    --yaw 0 --pitch 0 --hfov 90 --width 640 --height 480
-
-# 360 스테레오 리그: 깊이까지 만든다. yaw 는 0 또는 180 도 근방만 가능하다
-build/win/tools/wme_equirect_convert --in <좌> --right <우> --baseline 0.30 \
-    --out data/pano_stereo --yaw 0 --hfov 90 --width 640 --height 480
-```
-
-기하 검증은 합성 등장방형(정답 3D 좌표를 아는 장면을 해석적으로 투영)으로 한다 — 재투영 오차를 재려면 진리값이 있어야 하고, 실사진에는 그것이 없다.
-
-**다만 합성으로는 원리적으로 답할 수 없는 것이 하나 있었다.** 경도의 증가 방향, 즉 세계가 통째로 좌우 반전인가다. 검증 스크립트는 이 규약으로 원본을 만들고 같은 규약으로 되읽으므로 **반전이어도 오차 0 으로 통과한다.** 그리고 반전은 `--yaw` 로 흡수되지 않는다(원점 차이는 흡수된다). 그래서 실제 스티처의 출력으로만 답할 수 있었고, 제조사가 다른 소비자 360 카메라 두 대(GoPro Max · RICOH THETA SC)의 네이티브 스티치로 확정했다 — 간판 글자가 정상으로 읽히고, EXIF 의 GPS·UTC 에서 계산한 태양 방위와 영상에서 잰 위치가 맞으며, 길의 소실 방향이 OSM 도로 방위와 **3.5° 안**에서 일치한다(반전 가정이면 132° 어긋난다). 자세한 수치는 `python/wme/reference/equirect.py` 머리말.
-
-```bash
-python python/tools/equirect_validate.py --e2e   # 결과: results/equirect/validate.json
-```
-
-| 항목 | 값 |
-|---|---|
-| C++ ↔ numpy 오라클 (`wme/reference/equirect.py`) | 최대 화소차 1 LSB, >1 인 화소 0 % |
-| 체커보드 재투영 RMS (내보낸 K 로 예측) | **0.078 px** (최대 0.23 px) |
-| 같은 장면을 핀홀로 직접 렌더한 대조군 | 0.095 px — 워프가 더한 몫은 검출기 잡음에 묻힌다 |
-| `calibrateCamera` 로 회수한 fx / cx | 0.29 % / 0.27 px (대조군 0.31 % / 0.32 px) |
-| 360 스테레오 깊이 (B = 0.30 m) | 유효 92.4 %, 상대오차 중앙 0.36 %, 편향 −0.005 m |
-| 스테레오로 쓸 수 있는 yaw 범위 | **±1.19°** (B 0.30 m, 최근접 3 m, H 480 에서 유도) |
-| 경도 규약 (실데이터, 제조사 2 곳) | **좌우 반전 없음.** 태양 방위 대 OSM 도로 방위 오차 3.5° |
-| C++ ↔ 오라클, **실사진** 7 개 뷰 | 최대 4 LSB (합성 1 LSB — 사진의 고주파에서 cubic 반올림이 갈린다) |
-
-> 마지막 줄이 이 경로의 진짜 제약이다. 단안 360 한 장에는 깊이가 없고, 리그를 써도 베이스라인과 나란한 방향에서는 시차가 깊이 정보를 잃는다. 자세한 유도는 `tools/equirect_convert.cpp` 의 `checkRectified()`.
+내부 파라미터와 왜곡 계수는 freiburg 그룹마다 다릅니다. 하나로 고정하면 다른 그룹에서 실패가 아니라 그럴듯한 오차가 나옵니다.
 
 ---
 
-## 실행 방법
+## KITTI Odometry
 
-### 1. 사전 준비
+차량에서 촬영한 실외 데이터입니다.
 
-| 항목 | 버전 |
-|---|---|
-| 컴파일러 | MSVC 2022 / GCC 11+ / Clang 14+ (C++20) |
-| CMake | 3.24 이상 |
-| OpenCV | 4.8 이상 — `core imgproc imgcodecs videoio calib3d highgui dnn features2d` |
-| Python | 3.10 이상 + `numpy scipy pytest pybind11` |
-| (선택) ONNX Runtime | 1.22 — YOLO 토큰 마스킹용 |
-
-> OpenCV 컴포넌트에서 `features2d`를 빼면 링크 단계에서만 터진다. `cmake/WmeDependencies.cmake`에 이 함정이 주석으로 적혀 있다.
-
-### 2. 빌드
+TUM과 달리 직접적인 깊이 영상이 없기 때문에 스테레오 영상으로 깊이를 추정합니다.
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
+python python/tools/fetch_kitti.py
+build/win/tools/wme_kitti_convert data/kitti/dataset 00 data/kitti_00 --stride 2
 ```
 
-Windows (MSVC BuildTools):
+시차 탐색 범위는 장면의 최근접 거리에서 유도합니다. 이 값을 대충 두면 SGBM은 범위 밖이라고 말하지 않고 그럴듯한 오답을 냅니다. 실측으로 깊이 스케일이 2.42배 어긋난 적이 있습니다.
+
+현재 00, 04, 05, 07 네 시퀀스를 변환해 평가하고 있습니다.
+
+### kitti_04는 다른 셋과 같은 무게로 보면 안 됩니다
+
+텍스처가 부족한 시골길이고 프레임당 이동이 2.91 m로 큽니다. 여기서 궤적이 세로로 표류합니다.
+
+| 시퀀스 | 수직오차 RMS | ATE |
+| --- | ---: | ---: |
+| kitti_00 | 0.26 m | 94 cm |
+| kitti_05 | 0.17 m | 141 cm |
+| kitti_07 | 0.34 m | 108 cm |
+| kitti_04 | **6.14 m** | **955 cm** |
+
+RPE는 1.5배밖에 나쁘지 않습니다. 즉 프레임 단위 잡음이 아니라 누적된 표류입니다.
+
+이것은 화면에서 이렇게 보입니다.
+
+```text
+카메라 영상        평평한 길을 직진
+
+세계 모델          자차가 노면에 박히거나 떠 있음
+                  (내리막에서 박히고, 오르막에서 뜸)
+```
+
+원인이 이어지는 방식은 이렇습니다.
+
+```text
+궤적이 세로로 표류
+      ↓
+지도가 세로로 번짐          노면 열의 세로 퍼짐 1.03 m  (다른 시퀀스 0.04 m)
+      ↓
+지면 추정이 번진 무리의 아래쪽에 앉음
+      ↓
+자차가 지면에 박히거나 뜸    높이 폭 4.79 m           (다른 시퀀스 0.15 m)
+      ↓
+진짜 노면 점이 "미상"이 됨   미상 33.6 %              (다른 시퀀스 2.9–4.9 %)
+```
+
+이런 케이스도 단순히 "실패"라고 기록하지 않고, **왜 실패했는지 지도와 추정 상태까지 함께 확인**하는 것을 목표로 합니다.
+
+그래서 Unity 뷰어는 시퀀스를 불러올 때 자차 높이의 p10 / p50 / p90을 재고, 폭이 중앙값보다 크면 로그에 Error를 남깁니다. 문턱은 따로 고른 값이 아니라 그 시퀀스 자신에게서 나온 두 수이고, 폭이 값보다 크다는 것은 자차가 어디에서는 지면 아래에 있고 어디에서는 두 배 위에 있다는 뜻입니다.
+
+---
+
+# 360° 카메라도 지원
+
+일반적인 SLAM 파이프라인은 대부분 핀홀 카메라 모델을 전제로 합니다.
+
+하지만 360° 카메라의 원본 영상은 등장방형(equirectangular) 투영을 사용하기 때문에 그대로 입력하면 기하 모델이 맞지 않습니다.
+
+문제는 프로그램이 반드시 에러를 내는 것이 아니라는 점입니다.
+
+**정상적으로 실행되면서 잘못된 결과를 만들 수 있습니다.**
+
+그래서 WME에서는 360° 영상을 먼저 원근 뷰로 변환한 뒤 기존 SLAM 파이프라인에 넣습니다.
+
+```bash
+build/win/tools/wme_equirect_convert \
+    --in <360폴더> \
+    --out data/pano_front \
+    --yaw 0 \
+    --pitch 0 \
+    --hfov 90 \
+    --width 640 \
+    --height 480
+```
+
+내부 파라미터는 상수로 넣지 않고 뷰 파라미터에서 유도합니다.
+
+```text
+cx = (W - 1) / 2
+fx = (W / 2) / tan(hfov / 2)
+```
+
+변환 과정은 합성 데이터와 실제 360° 카메라 데이터를 이용해 별도로 검증하고 있습니다.
+
+| 항목 | 결과 |
+| --- | ---: |
+| C++ ↔ NumPy Oracle | 최대 1 LSB |
+| 체커보드 재투영 RMS | 0.078 px |
+| 같은 장면을 핀홀로 직접 렌더한 대조군 | 0.095 px |
+| 360° Stereo 유효 깊이 | 92.4 % |
+| Stereo 상대오차 중앙값 | 0.36 % |
+| C++ ↔ Oracle (실사진 7개 뷰) | 최대 4 LSB |
+
+## 합성 검증으로는 답할 수 없던 것
+
+경도가 증가하는 방향, 즉 세계가 좌우로 뒤집혀 있는지 여부는 합성 데이터로는 원리적으로 확인할 수 없었습니다.
+
+검증 스크립트가 같은 규약으로 원본을 만들고 같은 규약으로 다시 읽기 때문에, 규약이 통째로 뒤집혀 있어도 오차 0으로 통과합니다. 그리고 이 문제는 `--yaw` 값으로 흡수되지도 않습니다.
+
+그래서 제조사가 다른 소비자용 360 카메라 두 대(GoPro Max, RICOH THETA SC)의 실제 촬영본으로 확인했습니다.
+
+* 간판 글자가 정상으로 읽힙니다. 거울상이면 바로 드러납니다.
+* EXIF의 GPS와 UTC 시각으로 계산한 태양 방위가 영상에서 잰 위치와 맞습니다.
+* 길의 소실 방향이 OpenStreetMap의 실제 도로 방위와 3.5° 안에서 일치합니다. 좌우 반전을 가정하면 132° 어긋납니다.
+
+## 스테레오로 깊이를 만들 때의 제약
+
+360 스테레오 리그를 쓰면 깊이까지 만들 수 있지만, 아무 방향에서나 되는 것은 아닙니다.
+
+베이스라인과 나란한 방향에서는 시차가 깊이 정보를 잃고, 그와 직교하는 방향에서는 세로 시차가 생겨 SGBM이 쓸 수 없습니다.
+
+```bash
+build/win/tools/wme_equirect_convert \
+    --in <좌> --right <우> \
+    --baseline 0.30 --baseline-yaw 0 \
+    --out data/pano_stereo --yaw 0 --hfov 90
+```
+
+`--baseline-yaw`는 베이스라인이 향하는 파노라마 방위입니다. 기본값 0은 어디까지나 가정이고 리그마다 다릅니다.
+
+실제로 TartanAir의 리그는 이 방위가 90° 어긋나 있어서, 가정을 그대로 둔 상태에서는 정렬 판정이 정확히 거꾸로 나왔습니다. 시차가 깊이를 담지 않는 뷰를 통과시키고, 쓸 수 있는 뷰를 거부했습니다. 지금은 스테레오를 쓸 때마다 이 가정을 화면에 출력합니다.
+
+## 실제 360 시퀀스 받기
+
+아카이브를 통째로 받지 않고 HTTP 범위 요청으로 필요한 프레임만 꺼냅니다. 실측으로 3프레임에 21 MB이고, 아카이브 전체는 6.89 GB입니다.
+
+```bash
+python python/tools/fetch_tartanair_360.py --out data/pano_seq --frames 50
+```
+
+---
+
+# 시각화
+
+WME는 계산 결과를 숫자로만 확인하지 않도록 두 가지 뷰어를 제공합니다.
+
+## C++ Viewer
+
+점군과 포즈, 객체, 판정 결과를 직접 확인하는 계측용 뷰어입니다.
+
+```bash
+build/win/tools/wme_bench_viewer \
+    --manifest results/bench/viewer.tsv \
+    --seq 0 \
+    --frame 399 \
+    --voxel 0.15
+```
+
+조작은 `1`~`4` 카메라 전환, `Space` 재생·정지, `←→` 스크럽, `C` 점군 색 전환, `F1`~`F7` 클래스 토글, `Q` 종료입니다.
+
+Windows에서는 실행 전에 OpenCV DLL 경로를 PATH에 넣어야 합니다. 넣지 않으면 `exit -1073741515`로 끝나는데, 종료 코드만 보면 크래시처럼 보이지만 실제로는 실행 자체가 시작되지 않은 것입니다.
+
+`--frame`에 시퀀스 길이 이상을 주면 조용히 무한 루프합니다. `nframes`는 kitti_00 / 05 / 07이 400, kitti_04가 136입니다.
+
+---
+
+## Unity Viewer
+
+SLAM이 만들어낸 세계를 직접 돌아다니면서 확인할 수 있는 환경입니다.
+
+C++에서 생성한
+
+```text
+.json
+.wvpc
+```
+
+파일을 Unity가 읽어들입니다.
+
+```text
+SLAM
+ ↓
+World Model
+ ↓
+JSON / WVPC
+ ↓
+Unity
+ ↓
+3D World
+```
+
+Unity에서는 WASD 이동, 마우스 시점, 점프, 비행 등의 기본적인 탐색 기능을 제공합니다.
 
 ```powershell
-& "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
-cmake -S . -B build/win -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build/win
+powershell -ExecutionPolicy Bypass `
+    -File engine/unity/build.ps1 -Run
 ```
 
-### 3. 테스트 — 먼저 이것부터
-
-```bash
-cmake -S . -B build -DWME_BUILD_PYTHON=ON && cmake --build build   # ← 확장까지 빌드한다
-ctest --test-dir build --output-on-failure     # C++  236 케이스
-cd python && python -m pytest -q               # Python 645 케이스
-```
-
-Python 쪽 상당수는 **C++ ↔ numpy 차분 테스트**다. 여기가 초록이라는 것은 두 개의 독립 구현이 같은 답을 냈다는 뜻이고, 이 저장소에서 숫자를 믿는 근거는 그것뿐이다.
-
-> **`-DWME_BUILD_PYTHON=ON` 을 빼먹으면 안 된다.** 차분 테스트는 `wme._core` 확장이 없으면 전부 skip 되고, skip 은 초록으로 보인다 — 실제로 그렇게 41 개가 조용히 지나간 적이 있다 ([§19](docs/06-results.md)).
->
-> 그래서 지금은 **확장 없이 그냥 돌리면 조용히 초록이 되는 대신 시끄럽게 죽는다.** `wme/__init__.py` 가 `RuntimeWarning` 을 띄우고 `pyproject` 의 `filterwarnings = ["error::RuntimeWarning"]` 이 그것을 오류로 올리므로, 테스트 파일 26 개가 전부 **수집 단계에서** 실패한다 (실측: `no tests collected, 26 errors`). 확장이 없는 상태를 의도한 것이라면 `WME_NATIVE_OPTIONAL=1` 로 **선언해야** 하고, 그때 비로소 645 개 중 409 통과 / 234 skip / 2 xfail 이 나온다. 반대로 `WME_REQUIRE_NATIVE=1` 은 임포트 자체를 터뜨린다.
->
-> CI 의 두 잡도 각각 그 계약을 명시한다. `linux` 는 차분 테스트 **직전에** `assert HAS_NATIVE` 를 두어, 확장 빌드가 조용히 실패하면 skip 이 아니라 잡이 터지게 한다. `python` 은 확장을 **일부러** 빌드하지 않는 잡이라 `WME_NATIVE_OPTIONAL=1` 을 선언한다.
-
-확장을 포함해 차분 테스트만 따로 돌릴 때:
-
-```bash
-cd python && WME_REQUIRE_NATIVE=1 python -m pytest -q tests/test_differential.py   # 76 케이스
-```
-
-### 4. 벤치마크 실행 → 좌/우 비교 뷰어
-
-```bash
-python python/tools/bench_run.py               # 두 시스템 실행 + 채점
-python python/tools/bench_report.py            # → results/bench/index.html
-```
-
-일부만 다시 돌릴 때:
-
-```bash
-python python/tools/bench_run.py --only kitti --merge        # KITTI 만, 나머지 보존
-python python/tools/bench_run.py --skip-run                  # 재추정 없이 재채점
-```
-
-그리고 `results/bench/index.html`을 브라우저로 연다. **왼쪽 = 기존 모델(ORB+PnP), 오른쪽 = WME**, 아래에 궤적·ATE 시계열·RPE·프레임당 시간.
-
-### 5. 단일 시퀀스 실행
-
-```bash
-# TUM
-build/tools/wme_tum_odometry data/rgbd_dataset_freiburg1_xyz out.txt
-build/tools/wme_tum_baseline data/rgbd_dataset_freiburg1_xyz orb.txt
-python python/tools/tum_eval.py data/rgbd_dataset_freiburg1_xyz out.txt
-
-# KITTI — 깊이 상한과 불확실성 계수는 데이터셋에서 온다
-build/tools/wme_tum_odometry data/kitti_00 out.txt \
-    --kf-dist 1.0 --depth-max 60 --depth-sigma-rel 7.8e-4
-```
-
-### 6. 그 밖의 실험
-
-```bash
-python python/tools/baseline_cv2.py       # 제3자 대조군 (cv2.Odometry)
-python python/tools/bench_degrade.py      # 안개 스윕
-python python/tools/stereo_validate.py    # 스테레오 깊이를 TUM 실측 깊이에 대고 검증
-python python/tools/loop_optimize.py      # 포즈그래프 루프 클로저
-build/tools/wme_tum_loopclose data/rgbd_dataset_freiburg1_room out.txt
-```
-
-### 7. 인식한 장면을 눈으로 — C++ 뷰어와 Unity(C#)
-
-두 경로가 있고, **보는 것이 다르다.** C++ 뷰어는 점군과 판정을 그대로 보여 주는 계측기이고, Unity 빌드는 그 결과 위를 걸어 다니는 것이다. 둘은 파일로 이어져 있다 — 뷰어가 `.json` + `.wvpc` 를 내보내고 Unity 가 그것을 읽는다.
-
-#### C++ 뷰어 (`wme_bench_viewer`)
-
-```bash
-# Windows: OpenCV DLL 경로를 PATH 에 넣어야 한다
-$env:PATH = "C:\opencv-dl\opencv\build\x64\vc16\bin;" + $env:PATH
-
-build/win/tools/wme_bench_viewer --manifest results/bench/viewer.tsv \
-    --seq 0 --frame 399 --voxel 0.15 \
-    --export-json results/scene/kitti_00.json \
-    --screenshot  /tmp/shot.png
-```
-
-`--seq` 는 매니페스트 순서다 (`0` kitti_00 · `1` kitti_04 · `2` kitti_05 · `3` kitti_07). 조작은 `1`~`4` 카메라, `Space` 재생/정지, `←→` 스크럽, `C` 점군 색 전환, `F1`~`F7` 클래스 토글, `Q` 종료.
-
-> **DLL 경로를 빼면 `exit -1073741515` 로 죽는다.** 실행이 아예 안 되는 것인데 종료코드만 보면 크래시처럼 보인다.
->
-> **`--frame` 에 시퀀스 길이 이상을 주지 마라.** 클램프와 헤드리스 스킵이 물려 **조용히 무한 루프한다** (실측: 15 분). `nframes` 는 kitti_00 / 05 / 07 = 400, kitti_04 = 136 이므로 각각 399, 135 가 최대다.
->
-> 헤드리스 로그의 복셀 크기 표시는 앞 필드의 스트림 상태를 물려받아 **0.15 m 를 "0.2 m" 로 찍는다.** 실제 값은 요청대로 적용된다 (`--voxel` 을 바꾸면 칸 수가 갈리는 것으로 확인).
-
-#### Unity 빌드 (C#)
-
-```powershell
-powershell -ExecutionPolicy Bypass -File engine/unity/build.ps1 -Run
-```
-
-`build/unity/WorldVision.exe` 가 나온다. **WASD** 이동 · **Shift** 질주 · **Space** 점프 · 마우스 시점 · **F** 날기/걷기 · **Esc** 마우스 풀기 · **Q** 종료.
-
-데이터만 갈아 끼울 때는 **다시 빌드할 필요가 없다.** 실행 파일 옆 `wvdata/` 를 바꾸면 된다:
+데이터만 바꾸는 경우 Unity를 다시 빌드할 필요도 없습니다. 실행 파일 옆의 `wvdata/`를 교체하면 됩니다.
 
 ```powershell
 Copy-Item results/scene/*.json,results/scene/*.wvpc build/unity/wvdata/ -Force
 ```
 
-Unity 없이 C# 만 컴파일 검사하려면:
+Unity 없이 C# 코드만 컴파일 검사할 수도 있습니다.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File engine/unity/Check/check.ps1
 ```
 
-> **씬 파일을 손으로 고치지 마라.** `build.ps1` 이 매 빌드마다 `Assets/WorldVisionSim.unity` 를 지우고 `WorldVisionSceneImporter.cs` 가 코드로 다시 세운다. 씬을 바꾸려면 임포터를 고쳐야 한다.
->
-> **한 `.cs` 파일에 `MonoBehaviour` 를 둘 이상 두지 마라.** 파일 하나에 `MonoScript` 는 하나뿐이라 나머지는 씬이 가리킬 에셋이 없고, 에디터 안에서는 멀쩡해 보이다가 **직렬화할 때** 끊긴다. 그 결과가 `level0 is corrupted` 다. 임포터가 빌드 전에 저장된 씬을 검사해 `exit 4` 로 막는다.
+씬 파일은 직접 편집하지 않습니다. `build.ps1`이 매 빌드마다 씬을 지우고 임포터가 코드로 다시 세우기 때문에, 씬을 바꾸려면 임포터를 고쳐야 합니다.
 
-임포터만 따로 (언리얼도 같은 `.json` 을 읽는다):
+한 `.cs` 파일에는 `MonoBehaviour`를 하나만 둡니다. 파일 하나에 `MonoScript` 에셋은 하나뿐이라 나머지 클래스는 씬이 가리킬 대상이 없고, 에디터 안에서는 정상으로 보이다가 직렬화할 때 참조가 끊깁니다. 그것이 `level0 is corrupted`의 원인이었습니다. 지금은 임포터가 빌드 직전에 저장된 씬을 검사해서 막습니다.
+
+---
+
+## Unreal
+
+같은 `.json`을 읽는 임포터가 `engine/unreal/`에 있습니다. 엔진 없이 스텁으로 검증할 수 있습니다.
 
 ```bash
-python engine/unreal/Check/check.py          # 엔진 없이 스텁으로 검증
+python engine/unreal/Check/check.py
 ```
+
+---
+
+# 테스트
+
+현재 테스트는 두 층으로 구성되어 있습니다.
+
+```text
+C++ tests
+236 cases
+
+Python tests
+645 cases
+```
+
+특히 Python 테스트의 상당 부분은 C++ 구현과 NumPy reference implementation의 결과를 직접 비교합니다.
+
+```text
+C++ Result
+     │
+     ├──────────────┐
+     │              │
+     ▼              ▼
+  expected       NumPy
+                 Oracle
+     │              │
+     └──── compare ─┘
+```
+
+테스트를 실행하려면 먼저 Python extension을 포함해 빌드합니다.
+
+```bash
+cmake -S . -B build -DWME_BUILD_PYTHON=ON
+cmake --build build
+
+ctest --test-dir build --output-on-failure
+
+cd python
+python -m pytest -q
+```
+
+Native extension이 없는 상태에서 테스트가 조용히 skip되는 문제도 발견되어 현재는 이를 명시적으로 처리합니다.
+
+즉,
+
+> **테스트가 통과했다는 것과 테스트가 실제로 실행되었다는 것은 다르다.**
+
+확장이 없으면 `RuntimeWarning`이 오류로 올라가 수집 단계에서 멈춥니다. 확장이 없는 상태가 의도된 것이라면 `WME_NATIVE_OPTIONAL=1`로 선언해야 하고, 그때 645개 중 409 통과 / 234 skip / 2 xfail이 나옵니다. 반대로 `WME_REQUIRE_NATIVE=1`은 임포트 자체를 실패시킵니다.
+
+CI에서도 두 잡이 각자의 계약을 명시합니다. `linux`는 차분 테스트 직전에 `assert HAS_NATIVE`를 두고, `python`은 확장을 일부러 빌드하지 않는 잡이라 `WME_NATIVE_OPTIONAL=1`을 선언합니다.
+
+---
+
+# 벤치마크
+
+전체 벤치마크는 다음과 같이 실행합니다.
+
+```bash
+python python/tools/bench_run.py
+python python/tools/bench_report.py
+```
+
+그러면 다음 결과를 한 화면에서 비교할 수 있습니다.
+
+```text
+┌──────────────────────┬──────────────────────┐
+│ Existing Pipeline    │ WorldVision-SLAM     │
+│                      │                      │
+│ ORB + PnP            │ ECDA + TCG + SPA     │
+│                      │                      │
+│ Trajectory           │ Trajectory           │
+│ ATE                  │ ATE                  │
+│ RPE                  │ RPE                  │
+│ Runtime              │ Runtime              │
+└──────────────────────┴──────────────────────┘
+```
+
+결과 뷰어는 `results/bench/index.html`에 생성됩니다.
+
+일부만 다시 돌릴 수도 있습니다.
+
+```bash
+python python/tools/bench_run.py --only kitti --merge   # KITTI 만, 나머지 보존
+python python/tools/bench_run.py --skip-run             # 재추정 없이 재채점
+```
+
+---
+
+# 현재 결과를 어떻게 봐야 하는가
+
+WME는 아직 "기존 SLAM을 대체했다"고 말할 단계는 아닙니다.
+
+현재까지의 결과는 오히려 다음을 보여주는 단계에 가깝습니다.
+
+**1. descriptor 없이도 visual correspondence를 구성할 수 있다.**
+
+**2. 서로 다른 정보원들을 하나의 정보량 기반 모델로 결합할 수 있다.**
+
+**3. 환경이 나빠질수록 특정 정보원에 의존하지 않고 다른 정보원으로 무게를 이동시킬 수 있다.**
+
+**4. 하지만 이 방식이 모든 환경에서 기존 방법보다 우수하다는 것은 아직 증명되지 않았다.**
+
+특히 실제 비·눈·안개 환경, 더 다양한 카메라, 장시간 주행, 대규모 루프 클로저 등은 아직 더 검증해야 합니다.
+
+현재 안개 실험은 실제 TUM 프레임에 실측 깊이로 산란 방정식을 적용해 만든 합성 열화이며 자연 열화 데이터가 아닙니다. 실제 악천후 공개 데이터셋을 조사한 결과, 스테레오 영상과 정답 포즈를 동시에 제공하는 것이 생각보다 적다는 점도 확인했습니다. 조사 내용은 [`docs/07-adverse-weather.md`](docs/07-adverse-weather.md)에 정리되어 있습니다.
+
+그래서 WME에서는 **결과보다 아직 해결하지 못한 문제를 함께 공개하는 것**을 중요하게 생각합니다.
+
+---
+
+# Roadmap
+
+WME의 방향은 단순히 "descriptor를 다른 것으로 교체하는 것"에 있지 않습니다.
+
+장기적으로는 SLAM의 지도를 **기하 정보만 저장하는 공간에서 세계에 대한 기억으로 확장하는 것**을 목표로 합니다.
+
+```text
+현재
+
+Image
+  ↓
+Correspondence
+  ↓
+Pose
+  ↓
+Geometry Map
+```
+
+에서
+
+```text
+목표
+
+Observation
+     ↓
+World Understanding
+     ↓
+World Model
+     ↓
+Memory
+     ↓
+Prediction
+     ↓
+Localization
+```
+
+으로 확장하는 것입니다.
+
+이를 위해 앞으로는
+
+* Semantic World Model
+* Temporal Scene Memory
+* Object-level Mapping
+* Dynamic Object Modeling
+* Uncertainty-aware Memory
+* Hypothesis / Prediction Layer
+* Adaptive SLAM Policy
+* Long-term Localization
+* Adverse Weather SLAM
+* Loop Closure
+* Large-scale World Representation
+
+등을 단계적으로 연구할 예정입니다.
+
+---
+
+# 철학
+
+WME를 한 문장으로 설명하면 이렇습니다.
+
+> **SLAM이 특징점을 기억해야 하는가?
+> 아니면 세계를 기억해야 하는가?**
+
+이 프로젝트는 두 번째 질문에서 시작했습니다.
+
+아직 답을 완성한 것은 아닙니다.
+
+그래서 이 저장소에는 성공한 결과뿐만 아니라 잘못된 가설, 잘못된 측정, 데이터셋 문제, 구현상의 결함도 함께 남겨두고 있습니다.
+
+좋은 SLAM을 만드는 것만큼,
+
+**무엇을 믿을 수 있는지 정확하게 아는 것**
+
+이 중요하다고 생각하기 때문입니다.
+
+---
+
+## Documentation
+
+* [`00-manifesto.md`](docs/00-manifesto.md) — 왜 descriptor를 버리려 하는가
+* [`01-architecture.md`](docs/01-architecture.md) — WME 전체 구조
+* [`02-correspondence-problem.md`](docs/02-correspondence-problem.md) — 대응 문제에 대한 이론적 배경
+* [`03-roadmap.md`](docs/03-roadmap.md) — 개발 및 연구 방향
+* [`04-unified-objective.md`](docs/04-unified-objective.md) — 통합 목적함수
+* [`05-research-program.md`](docs/05-research-program.md) — 연구 프로그램
+* [`06-results.md`](docs/06-results.md) — 전체 실험 결과와 실패 기록
+* [`07-adverse-weather.md`](docs/07-adverse-weather.md) — 악천후 환경 연구
 
 ---
 
 <div align="center">
 
-**결과 전문 · 실패 기록 · 거부된 가설 → [docs/06-results.md](docs/06-results.md)**
+**WorldVision-SLAM**
+
+*Don't match the pixels. Understand the world.*
 
 </div>
