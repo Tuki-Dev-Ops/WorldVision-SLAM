@@ -60,7 +60,10 @@ def main() -> int:
     for e in report.get("sequences", []):
         name = e["name"]
         dataset = e.get("dataset", "tum")
-        seq_dir = (ROOT / "data" / (name if dataset == "kitti" else f"rgbd_dataset_{name}"))
+        # TUM 만 폴더 이름에 접두사가 붙는다 (data/rgbd_dataset_<name>).
+        # 나머지는 시퀀스 이름이 곧 폴더 이름이다.
+        seq_dir = (ROOT / "data"
+                   / (f"rgbd_dataset_{name}" if dataset == "tum" else name))
         gt = seq_dir / "groundtruth.txt"
         rows.append("\t".join([
             "SEQ", name, dataset, seq_dir.as_posix(), gt.as_posix(),

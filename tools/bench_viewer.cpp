@@ -252,6 +252,20 @@ struct Seq {
     bool loaded{false};
 };
 
+// **실외 도로인가, 실내 손카메라인가.**
+//
+// 이 화면의 축척은 두 가지뿐이다: 복셀 한 변, 지도 반경, 물체 상자 상한,
+// 지면 높이, 회랑 폭이 전부 여기에 매달려 있다. 그 자리들이 지금까지
+// `dataset == "kitti"` 라고 적혀 있었는데, 묻고 있던 것은 언제나 "실외
+// 도로인가" 였다. 데이터셋이 KITTI 하나뿐일 때는 두 질문의 답이 같아서
+// 티가 나지 않았다.
+//
+// 두 번째 실외 시퀀스(등장방형 360 도심 주행)가 들어오면서 그 이름이 실제로
+// 틀린 답을 내기 시작했다 - 30 m 앞이 보이는 도심을 TUM 축척(지도 반경 7 m,
+// 상자 상한 2.5 m)으로 그리면 화면에 거의 아무것도 남지 않는다. 실패가 아니라
+// 빈 화면이라 더 나쁘다. 그래서 묻는 것을 이름대로 적는다.
+inline bool outdoor(const Seq& s) { return s.dataset != "tum"; }
+
 // ===========================================================================
 // 파싱
 // ===========================================================================
@@ -5919,14 +5933,14 @@ int main(int argc, char** argv) {
             if (orb.dist <= 0.0) {
                 // 장면이 화면을 채우는 거리. 유효 깊이 상한(KITTI 80 m)을 그대로
                 // 쓰면 너무 멀어 점군이 먼지처럼 보인다.
-                orb.dist = (s.dataset == "kitti") ? 70.0 : 5.0;
+                orb.dist = (outdoor(s)) ? 70.0 : 5.0;
                 base_dist = orb.dist;
 
                 // 세계의 "위" 는 데이터셋마다 다르다. 하나로 고정하면 한쪽에서
                 // 카메라가 옆으로 누워 점군이 화면 구석으로 밀려난다.
                 //   KITTI: 정답 포즈가 **카메라 좌표계** 라 +y 가 아래 -> up = -y
                 //   TUM  : 정답 포즈가 모션캡처 **월드 좌표계** 이고 z 가 위
-                orb.world_up = (s.dataset == "kitti") ? Eigen::Vector3d(0, -1, 0)
+                orb.world_up = (outdoor(s)) ? Eigen::Vector3d(0, -1, 0)
                                                       : Eigen::Vector3d(0, 0, 1);
                 // 표면 격자는 성기게. 촘촘하면 선이 뭉쳐 면처럼 뭉개진다.
                 // 노면 격자의 두 축. world_up 과 함께 한 번만 정한다.
@@ -5938,7 +5952,7 @@ int main(int argc, char** argv) {
                     road_b = u.cross(road_a).normalized();
                 }
                 mesh[0].voxel = mesh[1].voxel =
-                    (s.dataset == "kitti") ? 2.2f : 0.16f;
+                    (outdoor(s)) ? 2.2f : 0.16f;
             }
 
             // 카메라 모드별 시선각. 항공뷰는 거의 수직으로 내려다보되 완전한
@@ -6007,7 +6021,14 @@ int main(int argc, char** argv) {
             const std::string t = ss.str();
             const int w = textW(t, T_TITLE, 1);
             text(canvas, t, {WIN_W - PAD - w, 40}, T_TITLE, C_INK, 1);
-            const std::string ds = s.dataset == "kitti" ? "KITTI  OUTDOOR" : "TUM  INDOOR";
+            // 어느 데이터셋을 보고 있는지 화면이 말한다. 실내/실외만 적으면
+            // 실외가 둘이 된 뒤로는 KITTI 와 360 도심 주행이 같은 배지를 달고
+            // 나란히 서고, 그러면 이 배지가 아무 것도 구분하지 않는다.
+            const std::string ds =
+                  s.dataset == "kitti"        ? "KITTI  OUTDOOR"
+                : s.dataset == "tartanground" ? "TARTANGROUND  OUTDOOR  360"
+                : outdoor(s)                  ? "OUTDOOR"
+                                              : "TUM  INDOOR";
             const int dw = textW(ds, T_MICRO, 1) + 20;
             fill(canvas, {WIN_W - PAD - w - dw - 16, 18, dw, 26}, C_PANEL);
             text(canvas, ds, {WIN_W - PAD - w - dw - 6, 36}, T_MICRO, C_INK2, 1);
@@ -6202,7 +6223,7 @@ int main(int argc, char** argv) {
             //
             // 2.5 m 는 사람이 설 수 있는 크기의 상한이다. 그보다 큰 person 은
             // 관측이 아니라 깊이 실패다.
-            const double box_max = (s.dataset == "kitti") ? 14.0 : 2.5;
+            const double box_max = (outdoor(s)) ? 14.0 : 2.5;
 
             // 점군 누적. 프레임이 뒤로 가면 다시 쌓는다.
             if (kDrawCloud) {
@@ -6244,11 +6265,11 @@ int main(int argc, char** argv) {
                                              cv::IMREAD_UNCHANGED);
                     if (d16.empty() || d16.type() != CV_16U) continue;
                     std::vector<Splat> pts;
-                    const double cmin = (s.dataset == "kitti") ? 4.0 : 0.6;
-                    const double cmax = (s.dataset == "kitti") ? 24.0 : 3.6;
+                    const double cmin = (outdoor(s)) ? 4.0 : 0.6;
+                    const double cmax = (outdoor(s)) ? 24.0 : 3.6;
                     // 기억이 없는 쪽은 성기게. ORB 가 프레임당 쓰는 점 수에 맞춘다.
-                    const int stride = has_memory ? (s.dataset == "kitti" ? 3 : 2)
-                                                  : (s.dataset == "kitti" ? 22 : 16);
+                    const int stride = has_memory ? (outdoor(s) ? 3 : 2)
+                                                  : (outdoor(s) ? 22 : 16);
                     // 이 프레임의 자차 높이. 하늘/노면밑 걸러내기의 기준이다.
                     const double ego_hh =
                         run.aligned[static_cast<std::size_t>(pi)].translation()
@@ -6275,8 +6296,8 @@ int main(int argc, char** argv) {
                     // 되찾는다. 7.5 m 위쪽은 압도적으로 하늘이지 지붕이 아니다.
                     // 근본 해결은 시차 신뢰도를 깊이와 함께 들고 오는 것이지
                     // 높이를 자르는 것이 아니고, 그건 StereoDepth 쪽 일이다.
-                    const double hlo = (s.dataset == "kitti") ? -3.0 : -2.0;
-                    const double hhi = (s.dataset == "kitti") ?  9.5 :  2.2;
+                    const double hlo = (outdoor(s)) ? -3.0 : -2.0;
+                    const double hhi = (outdoor(s)) ?  9.5 :  2.2;
                     // 같은 프레임의 회색 영상. 노면 표시는 기하가 아니라
                     // 밝기로만 존재하므로 이것 없이는 주차선을 그릴 수 없다.
                     const cv::Mat gimg = cv::imread(
@@ -6305,11 +6326,11 @@ int main(int argc, char** argv) {
                     //
                     // 높이는 월드에 고정된 값이라 언제 어디서 봐도 같다. 그래서
                     // 노면은 낮고 건물은 높은, 구조가 읽히는 지도가 된다.
-                    const double h0 = (s.dataset == "kitti") ? -1.8 : -0.6;
+                    const double h0 = (outdoor(s)) ? -1.8 : -0.6;
                     // 상한이 6 m 면 2 층 이상이 전부 같은 빨강으로 뭉쳐 도시가 평평해
                     // 보인다. 라이다 지도가 높이를 색으로 읽히게 하는 것은
                     // 범위가 실제 구조 높이를 덮기 때문이다.
-                    const double h1 = (s.dataset == "kitti") ? 14.0 :  2.4;
+                    const double h1 = (outdoor(s)) ? 14.0 :  2.4;
                     // **시점 섹터.** 어디에서 봤는지를 16 칸으로 접는다. 자차
                     // 위치를 5 m 로 양자화하므로 같은 자리에서 여러 프레임 본
                     // 것은 한 시점으로 세어진다 - 그것이 요점이다. 스테레오
@@ -6320,7 +6341,7 @@ int main(int argc, char** argv) {
                     // 맞지만 방 안에서는 전 구간이 한 섹터가 되어, 서로 다른
                     // 시점 조건을 영영 못 채우고 지도가 통째로 사라진다 -
                     // TUM 에서 실제로 그랬다.
-                    const double sec_m = (s.dataset == "kitti") ? 5.0 : 0.4;
+                    const double sec_m = (outdoor(s)) ? 5.0 : 0.4;
                     const Eigen::Vector3d epos =
                         run.aligned[static_cast<std::size_t>(pi)].translation();
                     const int sector = static_cast<int>(
@@ -6359,7 +6380,7 @@ int main(int argc, char** argv) {
                         // 않다. 오르막에서 어긋나고, 그 어긋남이 바로 이 값이다.
                         // 이번 프레임 점들의 **중앙값** 으로 바닥을 잡으면
                         // 가정이 사라진다 - 중앙값이라 차나 벽에 흔들리지 않는다.
-                        float floor_rel = (s.dataset == "kitti") ? -1.65f : -0.8f;
+                        float floor_rel = (outdoor(s)) ? -1.65f : -0.8f;
                         {
                             std::vector<float> lows;
                             lows.reserve(pts.size() / 4 + 1);
@@ -6407,7 +6428,7 @@ int main(int argc, char** argv) {
                     // 가까운 관측만 정정 권한을 갖는다. 30 m 에서 본 것으로
                     // 60 m 짜리를 지우면, 둘 다 못 믿을 값인데 하나가 다른
                     // 하나를 심판하는 꼴이 된다.
-                    const float trust_r = (s.dataset == "kitti") ? 18.0f : 2.0f;
+                    const float trust_r = (outdoor(s)) ? 18.0f : 2.0f;
                     for (const auto& p : pts) {
                         if (p.range > trust_r) continue;
                         acc[k].supersede(p.p, p.range, 1);
@@ -6424,7 +6445,7 @@ int main(int argc, char** argv) {
                         // 깨져 같은 물체가 여러 개로 늘어선다 - 실제로 그렇게
                         // 나왔다. 물체 수는 수백 개뿐이므로 최근접 탐색으로
                         // 같은 클래스 중 가장 가까운 것에 합친다.
-                        const double merge_r = (s.dataset == "kitti") ? 2.5 : 0.35;
+                        const double merge_r = (outdoor(s)) ? 2.5 : 0.35;
                         for (const auto& b : s.boxes) {
                             if (b.frame != fi) continue;
                             const double mx = b.size.maxCoeff();
@@ -6518,8 +6539,8 @@ int main(int argc, char** argv) {
                 // 시계를 아래 그리기 직전에 켜 두는 바람에, 반경을 고르는
                 // 훑기가 계측에 안 잡히고 있었다.
                 const auto t_c0 = std::chrono::steady_clock::now();
-                const double flat_r2 = ((s.dataset == "kitti") ? 55.0 : 7.0)
-                                     * ((s.dataset == "kitti") ? 55.0 : 7.0);
+                const double flat_r2 = ((outdoor(s)) ? 55.0 : 7.0)
+                                     * ((outdoor(s)) ? 55.0 : 7.0);
                 const Eigen::Vector3f ego_f = ego_k.cast<float>();
                 std::vector<Splat> flat;
                 flat.reserve(acc[k].cells.size() / 4 + 1);
@@ -6550,13 +6571,13 @@ int main(int argc, char** argv) {
                 // 라이다 뷰어가 예외 없이 센서 주변 일정 반경만 그리는 이유가
                 // 이것이다. 지도가 사라지는 것이 아니라, 지금 볼 수 있는 만큼만
                 // 보여 주는 것이다.
-                const double map_r = (s.dataset == "kitti") ? 55.0 : 7.0;
+                const double map_r = (outdoor(s)) ? 55.0 : 7.0;
                 const double map_r2 = map_r * map_r;
                 std::vector<Splat> near_pts, ground_pts;
                 near_pts.reserve(flat.size() / 2 + 1);
                 ground_pts.reserve(flat.size() / 2 + 1);
                 const GroundGrid gg(ob.world_up.cast<float>(),
-                                    (s.dataset == "kitti") ? 1.0f : 0.5f);
+                                    (outdoor(s)) ? 1.0f : 0.5f);
                 // 기준 지면 높이. **점을 나누기 전에** 정해야 한다 - 라벨이
                 // 없는 칸은 이 값으로 노면 여부를 판정하기 때문이다.
                 double plane_h;
@@ -6574,7 +6595,7 @@ int main(int argc, char** argv) {
                         plane_h = gh[gh.size() / 2];
                     } else {
                         plane_h = ego_k.dot(ob.world_up)
-                                - ((s.dataset == "kitti") ? 1.65 : 0.8);
+                                - ((outdoor(s)) ? 1.65 : 0.8);
                     }
                 }
                 {
@@ -6637,7 +6658,7 @@ int main(int argc, char** argv) {
                 // 12 m 밖이 통째로 어두워진다. 화면에 담으려는 범위가 기준이다.
                 cloud[k].setFadeRef(map_r);
                 cloud[k].groundPlane(ego_k, plane_h, ob.world_up, ob, fpx,
-                                     (s.dataset == "kitti") ? 5.0 : 0.5, map_r);
+                                     (outdoor(s)) ? 5.0 : 0.5, map_r);
 
                 // **노면은 밝기로 칠한다.**
                 //
@@ -6653,7 +6674,7 @@ int main(int argc, char** argv) {
                     cloud[k].roadTexture(road[k], road_tile[k], road_a, road_b,
                                          ob.world_up,
                                          ob, fpx, ego_k,
-                                         std::min(map_r, (s.dataset == "kitti")
+                                         std::min(map_r, (outdoor(s))
                                                          ? 28.0 : 5.0));
                 }
                 const bool L_map = (layer == 0 || layer == 1);
@@ -6713,11 +6734,11 @@ int main(int argc, char** argv) {
                         // 복셀이면 칸마다 복셀이 하나뿐이라, 구조 텐서가 요구
                         // 하는 점 수가 영영 안 모이고 전부 미상이 된다 - TUM
                         // 에서 라벨 240 개 중 236 개가 미상이었다.
-                        const float ccell = (s.dataset == "kitti") ? 1.0f : 0.5f;
+                        const float ccell = (outdoor(s)) ? 1.0f : 0.5f;
                         const auto t_lbl = std::chrono::steady_clock::now();
                         // 작업 반경. 자차가 지금 보고 있는 범위만 새로
                         // 분류하고 나머지는 이전 라벨을 재사용한다.
-                        const float work_r = (s.dataset == "kitti") ? 45.0f : 6.0f;
+                        const float work_r = (outdoor(s)) ? 45.0f : 6.0f;
                         // **자차가 의미 있게 움직였을 때만 다시 분류한다.**
                         //
                         // 프레임당 1 m 남짓 움직이는데 반경 45 m 를 매번 다시
@@ -6864,7 +6885,7 @@ int main(int argc, char** argv) {
                             const auto t_p1 = std::chrono::steady_clock::now();
                             cloud[k].predictions(pred[k], ob.world_up, ob,
                                                  fpx, ego_k,
-                                                 (s.dataset == "kitti") ? 130.0 : 14.0,
+                                                 (outdoor(s)) ? 130.0 : 14.0,
                                                  ccell);
                             const auto t_p2 = std::chrono::steady_clock::now();
                             prof_pred[k] = std::chrono::duration<double, std::milli>(
@@ -6889,7 +6910,7 @@ int main(int argc, char** argv) {
 
             // 거리 링. 간격은 장면 규모에서 정한다 - 실내 0.5 m, 도로 10 m.
             {
-                const double step = (s.dataset == "kitti") ? 10.0 : 0.5;
+                const double step = (outdoor(s)) ? 10.0 : 0.5;
                 // **인식하는 그 시점** 에 링을 건다. 화면 중심(고정 지도의
                 // 중심)에 그리면 링이 자차와 따로 놀아서 "지금 어디서 무엇을
                 // 보고 있는가" 를 전혀 말해 주지 못한다.
@@ -7143,7 +7164,7 @@ int main(int argc, char** argv) {
                             // 평면은 Tier 2 의 진단이지 화면의 주인공이 아니다.
                             // 장면 규모에 맞춰 줄이고 색도 배경 쪽으로 내린다.
                             const double half = std::clamp(q.extent, 0.15,
-                                           s.dataset == "kitti" ? 5.0 : 0.45);
+                                           outdoor(s) ? 5.0 : 0.45);
                             cloud[k].planeQuad(Tsnap, q.centroid, q.normal, half, ob, f3,
                                                cv::Scalar(74, 62, 52));
                         }
@@ -7263,7 +7284,7 @@ int main(int argc, char** argv) {
                     // 적 없는 것을 지어내는 것이고, 3 m 짜리 방에서 1.7 m
                     // 짜리 몸은 화면을 통째로 가린다 - 실제로 그렇게 나왔다.
                     // 카메라는 프러스텀이 이미 나타내고 있다.
-                    if (cam_mode != 0 && s.dataset == "kitti" && ob.dist > 12.0) {
+                    if (cam_mode != 0 && outdoor(s) && ob.dist > 12.0) {
                         const Eigen::Vector3d fw = (pan_head[k].squaredNorm() > 1e-12)
                                                  ? pan_head[k]
                                                  : (T.rotation() * Eigen::Vector3d::UnitZ());
@@ -7671,7 +7692,7 @@ int main(int argc, char** argv) {
             // 오른쪽 패널만 내보낸다 - 왼쪽은 설계상 매 프레임 지도를
             // 비우므로 내보낼 세계가 없다.
             if (!scene_json.empty()) {
-                const float ccell3 = (s.dataset == "kitti") ? 1.0f : 0.5f;
+                const float ccell3 = (outdoor(s)) ? 1.0f : 0.5f;
                 // 자차가 지나온 자리는 차로 중심의 가장 좋은 증거다.
                 // 이번 프레임까지만 넘긴다 - 아직 가 보지 않은 길에 선을
                 // 그으면 그것은 예측이 아니라 창작이다.
@@ -7703,7 +7724,7 @@ int main(int argc, char** argv) {
                 }
             }
             if (!scene_glb.empty()) {
-                const float ccell2 = (s.dataset == "kitti") ? 1.0f : 0.5f;
+                const float ccell2 = (outdoor(s)) ? 1.0f : 0.5f;
                 if (!exportScene(scene_glb, houses[1], stuff[1], road[1], mem[1],
                                  car_mesh, orb.world_up, ccell2,
                                  road_a, road_b, frame + 1)) {

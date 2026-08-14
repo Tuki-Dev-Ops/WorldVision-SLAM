@@ -60,6 +60,21 @@ powershell -ExecutionPolicy Bypass -File engine/unity/build.ps1 -Run
 | `Data_Set_02` | `kitti_04` | KITTI odometry 04 — 직선 도로 (자차 높이가 흔들리는 시퀀스다) |
 | `Data_Set_03` | `kitti_05` | KITTI odometry 05 — 주택가, 좌회전 구간 |
 | `Data_Set_04` | `kitti_07` | KITTI odometry 07 — 시가지, 정지 구간 포함 |
+| `Data_Set_05` | `tartanground_downtown_360` | TartanGround Downtown — 360° 등장방형에서 잘라낸 도심 주행 (합성) |
+
+`Data_Set_05` 만 KITTI 가 아니다. 큐브맵 여섯 면을 등장방형 2048×1024 로
+합성한 뒤 정면 110° 원근 뷰를 잘라 낸 것이고, 깊이와 포즈는 데이터셋의 렌더
+GT 다. 취득 방법·라이선스·합성이 맞다는 실측 근거는
+`data/tartanground_downtown_360/SOURCE.md` 와
+`python/tools/fetch_tartanground_360.py` 머리말에 있다.
+
+**이 시퀀스의 지도는 아직 좋지 않다.** 40 프레임 · 프레임당 약 1.4 m 구간에서
+WME 의 ATE 가 **1251 cm** 다 (같은 구간 ORB + PnP 는 31.58 cm). 지도가 그
+궤적으로 쌓이므로 지면이 평면으로 모이지 않고, 재생하면 자차가 지도 위로
+떠오른다 — 뷰어의 자차높이 검사가 "궤적과 지도가 같은 지면을 가리키지
+않는다" 로 화면에 적는다. `kitti_04` 와 같은 종류의 결함이고, 숨기지 않고
+적어 두는 쪽을 택했다. 프레임 간격을 줄이면(같은 궤적을 `--stride 1` 로 다시
+받으면) 나아질 것으로 보이지만 **아직 확인하지 않았다.**
 
 **산출물 이름은 바꾸지 않았다.** `results/bench/viewer.tsv` 의 `SEQ` 줄,
 `results/bench/*_baseline.txt`, `results/cam/<이름>/`, `results/scene/<이름>.json`

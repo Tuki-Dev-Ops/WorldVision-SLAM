@@ -88,11 +88,23 @@ DATASET_ARGS = {
         "wme_only": ["--depth-sigma-rel", "7.8e-4"],
         "skip_systems": ("wme_masked",),   # YOLO 는 TUM 쪽에서만 비교되어 있다
     },
+    # TartanGround 의 360 도심 주행. 프레임당 약 1.4 m 라 KITTI 와 같은 자리라
+    # 키프레임 간격도 KITTI 것을 쓴다 (TUM 의 0.03 m 면 매 프레임 키프레임이다).
+    # depth-sigma-rel 은 주지 않는다 - KITTI 값은 스테레오 정합 오차에서
+    # 유도된 것인데 이쪽 깊이는 렌더 GT 라 그 유도가 성립하지 않는다.
+    "tartanground": {
+        "common": ["--kf-dist", "1.0", "--depth-max", "60"],
+        "skip_systems": ("wme_masked",),   # YOLO 는 TUM 쪽에서만 비교되어 있다
+    },
 }
 
 
 def dataset_of(seq: Path) -> str:
-    return "kitti" if seq.name.startswith("kitti_") else "tum"
+    if seq.name.startswith("kitti_"):
+        return "kitti"
+    if seq.name.startswith("tartanground_"):
+        return "tartanground"
+    return "tum"
 
 
 def extra_args(seq: Path, system_key: str) -> list[str]:
@@ -255,7 +267,7 @@ def main() -> int:
     build = find_build()
 
     seqs = sorted(
-        (p for pat in ("rgbd_dataset_*", "kitti_*")
+        (p for pat in ("rgbd_dataset_*", "kitti_*", "tartanground_*")
          for p in (ROOT / "data").glob(pat)
          if (p / "rgb.txt").exists() and (p / "groundtruth.txt").exists()),
         key=lambda p: (dataset_of(p), p.name))
