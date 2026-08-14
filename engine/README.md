@@ -45,6 +45,39 @@ powershell -ExecutionPolicy Bypass -File engine/unity/build.ps1 -Run
 자차 자리에서 **3 m 위** 에 놓고 떨어뜨린다. 높이를 딱 맞추면 그 자리에
 주차된 차 안에서 시작하는 일이 생긴다.
 
+### 오른쪽 위 시퀀스 이름은 무엇인가
+
+화면 오른쪽 위 목록에 뜨는 이름은 **`wvdata` 안의 파일명 그대로다.**
+`Boot.Awake` 가 `wvdata/*.json` 을 훑어 확장자만 떼어 올리고 이름순으로
+정렬한다. 그래서 이름을 바꾸는 자리는 산출물이 아니라 **빌드가 복사하면서
+붙이는 이름** 이고, 그 대응표는 `engine/unity/wvdata_names.tsv` **한 곳뿐**
+이다. `build.ps1` 이 그 표를 읽어 복사할 때 갈아 붙인다 — `wvdata` 를 손으로
+고치면 다음 빌드에서 되돌아간다.
+
+| 화면 이름 | 산출물 | 무엇인가 |
+|---|---|---|
+| `Data_Set_01` | `kitti_00` | KITTI odometry 00 — 주택가, 폐곡선 |
+| `Data_Set_02` | `kitti_04` | KITTI odometry 04 — 직선 도로 (자차 높이가 흔들리는 시퀀스다) |
+| `Data_Set_03` | `kitti_05` | KITTI odometry 05 — 주택가, 좌회전 구간 |
+| `Data_Set_04` | `kitti_07` | KITTI odometry 07 — 시가지, 정지 구간 포함 |
+
+**산출물 이름은 바꾸지 않았다.** `results/bench/viewer.tsv` 의 `SEQ` 줄,
+`results/bench/*_baseline.txt`, `results/cam/<이름>/`, `results/scene/<이름>.json`
+이 전부 그 이름을 물고 있다. 화면 이름만 갈아 끼운다.
+
+**대응은 화면에서도 읽힌다.** 왼쪽 패널 "시퀀스" 칸이 표시 이름 아래
+`산출물 kitti_04` 를 함께 적는다 (장면 JSON 의 `sequence` 필드). 표를 펴지
+않아도 지금 보고 있는 것이 무엇인지 알 수 있어야 한다.
+
+점군(`.wvpc`)이 있는데 표에 줄이 없는 시퀀스가 나오면 **빌드가 선다.** 그것을
+산출물 이름 그대로 실으면 목록에 `Data_Set_03` 옆에 `kitti_09` 가 나란히
+서고, 그때는 화면과 표 중 어느 쪽이 맞는지 아무도 모른다.
+
+처음 여는 장면도 같은 이름이어야 한다. `build.ps1` 이 임포터에 `-wvName` 으로
+표시 이름을 넘기고 임포터가 그것을 `Boot.sceneName` 으로 직렬화한다. 이것을
+빼면 목록에는 `Data_Set_01` 이 떠 있는데 `Boot` 는 `kitti_00.json` 을 찾다
+못 찾고 빈 화면으로 시작한다.
+
 ![Unity 빌드에서 본 거리](../docs/img/unity_player.png)
 
 ## Unity

@@ -1,0 +1,21 @@
+# 뷰어 오른쪽 위 시퀀스 목록에 뜨는 이름의 대응표.
+#
+# **목록에 뜨는 이름은 wvdata 안의 파일명 그대로다.** Boot.Awake 가
+# wvdata/*.json 을 훑어 확장자를 뗀 것을 그대로 목록에 올린다
+# (engine/unity/Runtime/WorldVisionBoot.cs). 그래서 이름을 바꾸는 자리는
+# 산출물이 아니라 **빌드가 복사하면서 붙이는 이름** 이고, 그 표가 여기다.
+#
+# results/scene 의 산출물 이름은 바꾸지 않는다. 벤치 매니페스트
+# (results/bench/viewer.tsv 의 SEQ 줄), results/bench/*_baseline.txt,
+# results/cam/<이름>/ 이 전부 그 이름을 물고 있다. 화면 이름만 갈아 끼운다.
+#
+# engine/unity/build.ps1 이 이 파일을 읽는다. 점군(.wvpc)이 있는데 여기에
+# 줄이 없는 시퀀스가 나오면 빌드를 세운다 - 표와 화면이 어긋난 채로
+# 넘어가는 것이 제일 나쁘다.
+#
+# 형식:  산출물이름 <탭> 표시이름 <탭> 무엇인가
+#
+kitti_00	Data_Set_01	KITTI odometry 00 - 주택가, 폐곡선
+kitti_04	Data_Set_02	KITTI odometry 04 - 직선 도로 (자차 높이가 흔들리는 시퀀스다)
+kitti_05	Data_Set_03	KITTI odometry 05 - 주택가, 좌회전 구간
+kitti_07	Data_Set_04	KITTI odometry 07 - 시가지, 정지 구간 포함

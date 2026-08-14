@@ -512,11 +512,26 @@ namespace WorldVision
             y += kRow;
 
             Head(ref y, "시퀀스");
-            string seq = stats != null ? stats.sequence : "—";
+            // **표시 이름과 산출물 이름을 나란히 둔다.**
+            //
+            // 목록에 뜨는 이름은 wvdata 의 파일명이고 (Data_Set_01),
+            // build.ps1 이 engine/unity/wvdata_names.tsv 대로 붙인 것이다.
+            // 장면 JSON 이 들고 온 이름은 그것을 만든 산출물 (kitti_00) 이다.
+            // 하나만 보이면 화면의 Data_Set_02 가 어느 시퀀스에서 나온
+            // 것인지 화면 안에서는 알 길이 없다 - 대응표가 저장소에 있어도
+            // 화면을 보는 사람은 그것을 안 편다.
+            string shown = boot != null ? boot.sceneName : "—";
+            string src = stats != null ? stats.sequence : "";
             int fr = stats != null ? stats.frame : 0;
             GUI.Label(new Rect(kPadX, y, W - kPadX * 2f, kRow),
-                string.Format("{0}   누적 {1} 프레임", seq, fr), st);
+                string.Format("{0}   누적 {1} 프레임", shown, fr), st);
             y += kRow;
+            if (src.Length > 0 && src != shown)
+            {
+                GUI.Label(new Rect(kPadX, y, W - kPadX * 2f, kRow),
+                          "산출물 " + src, stDim);
+                y += kRow;
+            }
 
             Head(ref y, "주행");
             GUI.Label(new Rect(kPadX, y, 170f, 34f),

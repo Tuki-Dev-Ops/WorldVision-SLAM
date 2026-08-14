@@ -467,19 +467,20 @@ namespace WorldVision
         //
         //   Unity.exe -batchmode -quit -projectPath <프로젝트>
         //             -executeMethod WorldVision.SceneImporter.BuildSimFromCommandLine
-        //             -wvScene <장면.json> -wvOut <출력폴더>
+        //             -wvScene <장면.json> -wvOut <출력폴더> [-wvName <표시이름>]
         //
         // 씬에는 카메라와 빛과 부트 오브젝트만 넣는다. 지도는 실행할 때
         // StreamingAssets 에서 읽어 짓는다 - 씬에 다 넣었더니 큰 장면에서
         // 빌드가 실행 중에 죽었고, 그 원인을 좁히는 데 오래 걸렸다.
         public static void BuildSimFromCommandLine()
         {
-            string scene = null, outDir = null;
+            string scene = null, outDir = null, wvName = null;
             string[] args = Environment.GetCommandLineArgs();
             for (int i = 0; i + 1 < args.Length; ++i)
             {
                 if (args[i] == "-wvScene") scene = args[i + 1];
                 else if (args[i] == "-wvOut") outDir = args[i + 1];
+                else if (args[i] == "-wvName") wvName = args[i + 1];
             }
             if (string.IsNullOrEmpty(scene) || string.IsNullOrEmpty(outDir))
             {
@@ -498,7 +499,15 @@ namespace WorldVision
             // AssetDatabase.Refresh 가 방금 저장한 씬을 흔들어 - 씬 없는
             // 빌드가 나왔다. 데이터는 build.ps1 이 실행 파일 옆 wvdata 에
             // 넣고, 런타임이 거기서 읽는다.
+            // **처음 여는 장면의 이름은 화면에 뜨는 이름이어야 한다.**
+            //
+            // 목록의 이름은 wvdata 안의 파일명이고 (Boot.Awake), build.ps1 이
+            // engine/unity/wvdata_names.tsv 대로 갈아 붙인다. 여기서 산출물
+            // 이름을 그대로 직렬화하면 목록에는 Data_Set_01 이 떠 있는데
+            // Boot 는 kitti_00.json 을 찾다 못 찾고 빈 화면으로 시작한다.
+            // -wvName 을 안 주면 (에디터 메뉴에서 부를 때) 산출물 이름이다.
             string baseName = Path.GetFileNameWithoutExtension(scene);
+            if (!string.IsNullOrEmpty(wvName)) baseName = wvName;
 
             var root = new GameObject("WorldVision");
             var boot = root.AddComponent<Boot>();

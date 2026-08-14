@@ -18,7 +18,11 @@ namespace WorldVision
 {
     public class Boot : MonoBehaviour
     {
-        public string sceneName = "kitti_00";
+        // 처음 여는 장면. 빌드는 임포터가 이 값을 씬에 직렬화해 두므로
+        // (build.ps1 의 -wvName), 여기 적힌 값이 쓰이는 것은 에디터에서
+        // 재생할 때뿐이다. 이름은 wvdata 안의 파일명이고, 그 이름을 정하는
+        // 표는 engine/unity/wvdata_names.tsv 다.
+        public string sceneName = "Data_Set_01";
 
         [NonSerialized] public Log log;
         [NonSerialized] public Stats stats;

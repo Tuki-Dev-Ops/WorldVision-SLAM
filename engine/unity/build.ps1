@@ -63,6 +63,40 @@ $log = Join-Path $env:TEMP "wv_unity_build.log"
 $scenePath = (Resolve-Path (Join-Path $repo $Scene)).Path
 $outPath = Join-Path $repo $Out
 
+# **화면에 뜨는 이름은 여기서 정한다.**
+#
+# Boot.Awake 는 wvdata/*.json 의 파일명에서 확장자만 떼어 목록에 올린다.
+# 그러니 목록의 이름을 바꾸려면 산출물 이름을 바꾸거나 복사할 때 갈아
+# 붙이거나 둘 중 하나인데, 산출물 이름은 벤치 매니페스트와 결과 파일들이
+# 물고 있으므로 후자다. 대응표는 engine/unity/wvdata_names.tsv 한 곳뿐이고
+# wvdata 를 손으로 고치는 것과 달리 다음 빌드에서도 그대로 나온다.
+$mapFile = Join-Path $repo "engine\unity\wvdata_names.tsv"
+if (-not (Test-Path $mapFile)) {
+    Write-Error "이름 대응표가 없다: $mapFile"
+    exit 1
+}
+$displayOf = @{}
+foreach ($line in (Get-Content $mapFile -Encoding UTF8)) {
+    $t = $line.Trim()
+    if ($t -eq "" -or $t.StartsWith("#")) { continue }
+    $f = $line -split "`t"
+    if ($f.Count -lt 2 -or $f[0].Trim() -eq "" -or $f[1].Trim() -eq "") {
+        Write-Error "대응표 줄을 읽을 수 없다 (탭으로 나눈 두 칸이 필요하다): $line"
+        exit 1
+    }
+    $displayOf[$f[0].Trim()] = $f[1].Trim()
+}
+
+# 처음 여는 장면도 같은 이름이어야 한다. 임포터가 씬에 직렬화하는
+# Boot.sceneName 이 산출물 이름으로 남으면, 목록에는 Data_Set_01 이 떠 있는데
+# 그 파일을 못 찾아 빈 화면으로 시작한다.
+$sceneBase = [IO.Path]::GetFileNameWithoutExtension($scenePath)
+if (-not $displayOf.ContainsKey($sceneBase)) {
+    Write-Error "대응표에 없는 시작 장면이다: $sceneBase  ($mapFile)"
+    exit 1
+}
+$sceneDisplay = $displayOf[$sceneBase]
+
 # **출력 폴더도 지우고 시작한다.**
 #
 # BuildPlayer 는 기존 폴더에 덧쓴다. 이전 빌드의 WorldVision_Data 가 남아
@@ -73,7 +107,7 @@ Remove-Item $outPath -Recurse -Force -ErrorAction SilentlyContinue
 
 & $Editor -batchmode -quit -projectPath $proj `
     -executeMethod WorldVision.SceneImporter.BuildSimFromCommandLine `
-    -wvScene $scenePath -wvOut $outPath -logFile $log
+    -wvScene $scenePath -wvOut $outPath -wvName $sceneDisplay -logFile $log
 
 # 배치 모드는 셰이더 컴파일이 남은 채로 제어를 돌려주기도 한다.
 $n = 0
@@ -119,17 +153,39 @@ if (-not (Test-Path (Join-Path $outPath "WorldVision_Data\level0"))) {
 $dataDir = Join-Path $outPath "wvdata"
 New-Item -ItemType Directory -Force $dataDir | Out-Null
 $sceneSrc = Split-Path -Parent $scenePath
-Get-ChildItem $sceneSrc -Filter "*.json" | ForEach-Object {
-    $pc = Join-Path $sceneSrc ($_.BaseName + ".wvpc")
+$missing = @()
+foreach ($j in (Get-ChildItem $sceneSrc -Filter "*.json")) {
+    $pc = Join-Path $sceneSrc ($j.BaseName + ".wvpc")
     # 점군이 없는 장면은 싣지 않는다 - 목록에는 뜨는데 열면 빈 편이 더 나쁘다.
-    if (Test-Path $pc) {
-        Copy-Item $_.FullName $dataDir -Force
-        Copy-Item $pc $dataDir -Force
+    if (-not (Test-Path $pc)) { continue }
+    # **이름이 없으면 세운다.** 표에 없는 것을 산출물 이름 그대로 실으면
+    # 목록에 Data_Set_03 옆에 kitti_09 가 나란히 서고, 그러면 화면과
+    # 대응표 중 어느 쪽이 맞는지 아무도 모른다.
+    if (-not $displayOf.ContainsKey($j.BaseName)) {
+        $missing += $j.BaseName
+        continue
     }
+    $dst = $displayOf[$j.BaseName]
+    Copy-Item $j.FullName (Join-Path $dataDir ($dst + ".json")) -Force
+    Copy-Item $pc         (Join-Path $dataDir ($dst + ".wvpc")) -Force
 }
+if ($missing.Count -gt 0) {
+    Write-Error ("대응표에 없는 시퀀스: " + ($missing -join ", ") + "  ($mapFile)")
+    exit 1
+}
+# 카메라 프레임 폴더도 같은 이름으로 옮긴다 - Boot.CamFrame 이
+# cam/<sceneName> 을 찾고, 못 찾으면 cam/ 을 통째로 뒤져 엉뚱한 시퀀스의
+# 사진을 옆에 띄운다.
 $camSrc = Join-Path $repo "results\cam"
 if (Test-Path $camSrc) {
-    Copy-Item $camSrc (Join-Path $dataDir "cam") -Recurse -Force
+    $camDst = Join-Path $dataDir "cam"
+    New-Item -ItemType Directory -Force $camDst | Out-Null
+    foreach ($d in (Get-ChildItem $camSrc -Directory)) {
+        if ($displayOf.ContainsKey($d.Name)) {
+            Copy-Item $d.FullName (Join-Path $camDst $displayOf[$d.Name]) `
+                      -Recurse -Force
+        }
+    }
 }
 $n = (Get-ChildItem $dataDir -Filter "*.wvpc" | Measure-Object).Count
 $mb = [int](((Get-ChildItem $dataDir -Recurse -File | Measure-Object -Property Length -Sum).Sum) / 1MB)
