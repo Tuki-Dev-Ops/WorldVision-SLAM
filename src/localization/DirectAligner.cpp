@@ -423,7 +423,8 @@ Mat6 DirectAligner::poseInformation(const Accumulator& acc, double sensor_var) c
 
 Result<AlignmentResult> DirectAligner::align(const Frame& ref, const Frame& cur, const SE3& init,
                                              const ImageQuality* quality,
-                                             const EnvironmentState* env) {
+                                             const EnvironmentState* env,
+                                             const MotionPrior* prior) {
     if (!ref.valid() || !cur.valid()) {
         return {ErrorCode::InvalidArgument, "프레임이 유효하지 않음"};
     }
@@ -450,10 +451,58 @@ Result<AlignmentResult> DirectAligner::align(const Frame& ref, const Frame& cur,
 
         cfg_ = relaxed;
         Result<AlignmentResult> r_relaxed = align(ref, cur, init, quality, env);
+        cfg_ = relaxed;
+        cfg_.robust_arbitration = true;
+
+        // --- 두 번째 풀이를 물어볼 이유가 있을 때만 --------------------------
+        // 아래 교체 조건의 (1) 은 c_relaxed > floor 다. 그것이 거짓이면 대안이
+        // 무엇이든 교체가 일어나지 않으므로 tight 를 푼 결과는 쓰이지 않는다.
+        // 즉 이 게이트는 최적화가 아니라 **교체 조건 (1) 을 앞으로 옮긴 것**
+        // 이고, 걸러지는 프레임은 정의상 교체가 불가능한 프레임뿐이다.
+        // 궤적은 비트 단위로 같다.
+        //
+        // c_relaxed > floor 는 depth_sigma_scale(rho) > 1 과 같은 판정이다 -
+        // rho = max(1, c/floor) 이므로. 실측 발동률은 kitti_04 39 %,
+        // kitti_00/05/07 은 9~14 % 라 대부분의 프레임에서 풀이가 한 번으로 준다.
+        //
+        // 풀리지 않은 경우(!ok)는 값이 없어 판정할 수 없다. 그때는 아래의
+        // "완화가 실패하면 tight 를 쓴다" 경로가 살아 있어야 하므로 풀어 본다.
+        const bool ask_tight =
+            !r_relaxed.ok() ||
+            r_relaxed.value().depth_consistency >
+                r_relaxed.value().depthNoiseFloor(cfg_.depth_sigma_rel);
+        if (!ask_tight) {
+            // 심판이 물어볼 필요가 없었다는 사실 자체를 남긴다. tight 는 풀지
+            // 않았으므로 -1(판정 불가)로 둔다 - 0 으로 적으면 "풀었는데 0" 과
+            // 구분되지 않는다.
+            r_relaxed.value().arb_c_relaxed = r_relaxed.value().depth_consistency;
+            return r_relaxed;
+        }
+
         cfg_ = tight;
         Result<AlignmentResult> r_tight = align(ref, cur, init, quality, env);
         cfg_ = relaxed;
         cfg_.robust_arbitration = true;
+
+        // --- 세 번째 후보: 운동 사전분포 ------------------------------------
+        // 여기까지 온 프레임은 정의상 rho > 1 이다 (게이트가 그 판정이다).
+        // 그 rho 로 사전분포를 키워 같은 프레임을 한 번 더 푼다. 채택 여부는
+        // 아래 심판이 정하므로, 사전분포 세기가 틀려도 틀린 답이 들어오지는
+        // 않는다. 근거는 헤더 motion_prior_arbitration.
+        Result<AlignmentResult> r_prior{ErrorCode::InsufficientData, "사전분포 후보 없음"};
+        bool have_prior_cand = false;
+        if (cfg_.motion_prior_arbitration && prior != nullptr && prior->valid() &&
+            r_relaxed.ok()) {
+            prior_     = prior;
+            prior_rho_ = r_relaxed.value().depth_sigma_scale;
+            cfg_ = relaxed;
+            r_prior = align(ref, cur, init, quality, env);
+            prior_     = nullptr;
+            prior_rho_ = 1.0;
+            cfg_ = relaxed;
+            cfg_.robust_arbitration = true;
+            have_prior_cand = r_prior.ok();
+        }
 
         // 심판이 판정하지 못하면 기존 동작(완화)을 그대로 둔다. "모른다" 를
         // "저쪽이 낫다" 로 접지 않는다.
@@ -485,10 +534,58 @@ Result<AlignmentResult> DirectAligner::align(const Frame& ref, const Frame& cur,
             const double floor   = r_relaxed.value().depthNoiseFloor(cfg_.depth_sigma_rel);
             const double resolve =
                 r_relaxed.value().depthMedianResolution(cfg_.depth_sigma_rel);
-            if (c_relaxed > floor && c_tight >= 0.0 && c_tight <= floor &&
-                c_relaxed - c_tight > resolve) {
-                AlignmentResult v = r_tight.value();
-                v.arbitrated = true;
+
+            const double c_prior = have_prior_cand ? r_prior.value().depth_consistency : -1.0;
+            for (auto* v : {&r_relaxed, &r_tight}) v->value().arb_c_prior = c_prior;
+
+            // 후보가 셋이 되어도 조건 (1)(2)(3) 은 그대로다. 다만 조건(2)
+            // "대안이 바닥 안에 들어온다" 를 어디까지 요구할 것인가가 남는다.
+            //
+            // 원래 근거는 "바닥을 넘은 두 후보 사이에서는 이 채널이 순위를 매길
+            // 근거가 없다" 였고, 실측 실패(kitti_07 108 -> 5014)가 그것을 뒷받침
+            // 했다. 그런데 그 실패의 후보들은 포즈가 1~10 mm 차이에 c 가 소수
+            // 넷째 자리까지 같았다 - 구분되지 않는 둘이었다. 그 뒤에 들어온 조건(3)
+            // 이 정확히 그것을 잡는다.
+            //
+            // 다만 조건(3)의 분해능 depthMedianResolution() 은
+            //   se = sqrt(2)*sqrt(pi/2) * floor / sqrt(N)
+            // 이고, 여기서 floor 는 **모델** 산포다. 이 프레임이 실제로 잰 산포는
+            // 그 rho 배이므로 중앙값의 표준오차도 rho 배다. 바닥 밖에서 순위를
+            // 매기려면 그 자에 맞춰 바를 rho 배로 올려야 한다 - 안 올리면 rho 가
+            // 큰(=가장 못 믿을) 프레임에서 바가 가장 낮아지는 거꾸로가 된다.
+            //
+            // 시도했고 버린 것: N 을 표본 수가 아니라 공간 독립 단위 수
+            // (info_cluster_grid^2 = 64)로 바꿔 바를 50 배 더 올려 봤다. 통계적
+            // 근거는 더 낫지만(깊이 오차는 화소가 아니라 면 단위로 상관된다)
+            // 실측이 나빠졌다: kitti_04 222 -> 211, kitti_05 147 -> 144 로 좋아진
+            // 대신 kitti_07 110 -> 187 이었다. 유도되지 않은 보정을 얹어 결과가
+            // 나빠졌으므로 넣지 않는다.
+            const double rho_c = (floor > 0.0) ? std::max(1.0, c_relaxed / floor) : 1.0;
+            const double resolve_above = rho_c * resolve;
+            const auto passes = [&](double c) {
+                if (c < 0.0) return false;
+                if (c <= floor) return c_relaxed - c > resolve;
+                // 바닥 밖: 실제 산포로 잰 분해능을 넘어야 한다.
+                return cfg_.arb_rank_above_floor && (c_relaxed - c > resolve_above);
+            };
+            const bool tight_ok = c_relaxed > floor && passes(c_tight);
+            const bool prior_ok = c_relaxed > floor && have_prior_cand && passes(c_prior);
+
+            if (tight_ok || prior_ok) {
+                // 둘 다 통과했으면 심판이 더 낫다고 한 쪽. 다만 그 차이도 구분
+                // 가능해야 한다 - 아니면 기존 동작(조임)을 유지한다. 자는 둘이
+                // 놓인 자리에 맞춘다.
+                const double tie = (c_tight <= floor && c_prior <= floor) ? resolve
+                                                                         : resolve_above;
+                const bool take_prior =
+                    prior_ok && (!tight_ok || c_tight - c_prior > tie);
+                AlignmentResult v = take_prior ? r_prior.value() : r_tight.value();
+                v.arbitrated   = true;
+                v.arb_choice   = take_prior ? 2 : 1;
+                v.arb_delta_t  = delta_t;
+                v.arb_c_relaxed = c_relaxed;
+                v.arb_c_tight   = c_tight;
+                v.arb_c_prior   = c_prior;
                 return Result<AlignmentResult>{v};
             }
         } else if (!r_relaxed.ok() && r_tight.ok()) {
@@ -608,6 +705,45 @@ Result<AlignmentResult> DirectAligner::align(const Frame& ref, const Frame& cur,
         double huber = robustDelta(noise_sigma);
         acc = accumulateAll(T, a, b, huber);
 
+        // --- 운동 사전분포 항 -----------------------------------------------
+        // 음의 로그우도로 쓰면
+        //     chi2(T) / (2 sigma_I^2)  +  (1/2) e^T Lambda_p e,
+        //     e = log(T * T_pred^-1),  Lambda_p = diag(1/sigma_i^2)
+        // 이고, 누산기의 H 는 (1/2)chi2 의 헤시안이므로 양변에 sigma_I^2 를 곱해
+        //     H += sigma_I^2 Lambda_p,   g += sigma_I^2 Lambda_p e
+        // 가 된다. sigma_I^2 는 상수가 아니라 이 레벨이 실제로 남긴 잔차 분산
+        // chi2/wsum 이다 (센서 바닥으로 하한). poseInformation 이 정보행렬을
+        // 만들 때 쓰는 분모와 같은 양이라, 사전분포와 측광이 같은 자로 재진다.
+        //
+        // 여기에 rho^2 를 더 곱한다. rho 는 이 프레임의 깊이가 센서 모델보다 몇
+        // 배 나쁜지이고, 깊이가 rho 배 나쁘면 그 깊이로 만든 포즈 구속도 rho 배
+        // 부정확하다 - 측광 정보를 rho^2 로 나누는 것과 사전분포에 rho^2 를
+        // 곱하는 것은 같은 연산이다. rho = 1 이면 이 항은 사실상 아무 일도 하지
+        // 않는다(H 대각의 1 % 미만). 그래서 이 후보는 rho > 1 일 때만 만든다.
+        //
+        // 좌섭동 규약(T <- exp(dx) T)에서 de/ddx = I 를 1차로 쓴다. 위의
+        // 레벨간 투영이 delta = (T * T_start^-1).log() 로 같은 규약을 쓴다.
+        const bool use_prior = (prior_ != nullptr && prior_->valid());
+        Vec6 prior_lam = Vec6::Zero();
+        double prior_w = 0.0;
+        if (use_prior) {
+            const double sensor_var = (quality != nullptr) ? quality->photometricVariance() : 1.0;
+            const double var = std::max(sensor_var,
+                                        acc.chi2 / std::max(1e-9, acc.wsum));
+            prior_w = var * prior_rho_ * prior_rho_;
+            for (int k = 0; k < 6; ++k) {
+                const double s = std::max(1e-9, prior_->sigma(k));
+                prior_lam(k) = 1.0 / (s * s);
+            }
+        }
+        // 사전분포 비용. 수용 판정이 이 항을 빼먹으면 LM 이 전체 목적함수를
+        // 올리는 걸음도 받아들인다.
+        const auto priorCost = [&](const SE3& Tx) {
+            if (!use_prior) return 0.0;
+            const Vec6 e = (Tx * prior_->T_pred.inverse()).log();
+            return prior_w * e.dot(prior_lam.cwiseProduct(e));
+        };
+
         const SE3 T_level_start = T;
         double lambda = cfg_.lambda_init;
 
@@ -627,6 +763,14 @@ Result<AlignmentResult> DirectAligner::align(const Frame& ref, const Frame& cur,
                 // 아핀을 고정하려면 해당 자유도를 잠근다
                 H.row(6).setZero(); H.col(6).setZero(); H(6, 6) = 1.0; g(6) = 0.0;
                 H.row(7).setZero(); H.col(7).setZero(); H(7, 7) = 1.0; g(7) = 0.0;
+            }
+
+            if (use_prior) {
+                const Vec6 e = (T * prior_->T_pred.inverse()).log();
+                for (int k = 0; k < 6; ++k) {
+                    H(k, k) += prior_w * prior_lam(k);
+                    g(k)    += prior_w * prior_lam(k) * e(k);
+                }
             }
 
             // LM 감쇠는 대각 스케일에 비례시켜 단위 차이(병진/회전/밝기)를 흡수한다.
@@ -661,8 +805,10 @@ Result<AlignmentResult> DirectAligner::align(const Frame& ref, const Frame& cur,
 
             // 평균 잔차로 비교한다. 워프에 따라 유효 점 수가 달라지므로
             // chi2 총합을 그대로 비교하면 시야를 벗어나는 방향으로 최적화된다.
-            const double cost_old = acc.chi2 / std::max<std::size_t>(1, acc.used);
-            const double cost_new = acc_new.chi2 / std::max<std::size_t>(1, acc_new.used);
+            const double cost_old = (acc.chi2 + priorCost(T)) /
+                                    static_cast<double>(std::max<std::size_t>(1, acc.used));
+            const double cost_new = (acc_new.chi2 + priorCost(T_new)) /
+                                    static_cast<double>(std::max<std::size_t>(1, acc_new.used));
 
             if (acc_new.used >= cfg_.min_points && cost_new < cost_old) {
                 T = T_new; a = a_new; b = b_new;

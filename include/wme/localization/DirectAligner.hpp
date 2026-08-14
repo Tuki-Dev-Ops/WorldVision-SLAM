@@ -171,6 +171,25 @@ struct DirectAlignerConfig {
     // 비용은 그 프레임에서 정렬 두 번이다.
     bool   robust_arbitration{true};
 
+    // 운동 사전분포를 중재의 **세 번째 후보** 로 넣을 것인가 (MotionPrior 참조).
+    //
+    // 왜 목적함수에 그냥 더하지 않는가. 사전분포 세기를 정보 단위로 유도하면
+    //   H += rho^2 * sigma_I^2 * Lambda_p
+    // 인데, 측광 H 의 병진 대각은 1e7 대라 프레임당 오차 2.5 mm 를 주장하고
+    // 실제 프레임간 오차는 30 mm 다 - 100 배 넘게 과신한다. 그래서 rho=1 인
+    // 프레임에서는 이 항이 H 의 1 % 도 안 되어 아무 일도 일어나지 않고, 그 과신을
+    // 상수로 깎으면 그것이 곧 튜닝이다. 대신 심판을 둔다: 사전분포로 푼 해가
+    // 정렬이 보지 않은 관측(cur 깊이)에서 더 낫다고 판정될 때만 채택한다.
+    // 그러면 사전분포 세기가 틀려도 틀린 답이 채택되지는 않는다.
+    //
+    // 후보는 rho > 1 인 프레임에서만 만든다. rho = 1 이면 이 프레임의 깊이가
+    // 모델보다 나쁘다는 증거가 없고, 증거 없이 사전분포를 키울 이유도 없다.
+    bool   motion_prior_arbitration{true};
+
+    // 바닥 밖의 두 후보 사이에서도 순위를 매길 것인가 (근거는 align 안의 주석).
+    // 실제 산포 rho*floor 로 계산한 중앙값 분해능을 넘을 때만 매긴다.
+    bool   arb_rank_above_floor{true};
+
     // inlier 판정용 고정 임계 = health_k * max(측정 잡음, huber_min_delta).
     // 커널 임계와 분리해야 한다. 적응형 임계로 inlier 를 세면 잔차가 커질 때
     // 임계도 같이 넓어져 비율이 유지되고, 건강 신호가 동어반복이 된다.
@@ -370,6 +389,11 @@ struct AlignmentResult {
     double arb_delta_t{-1.0};      // |t_tight - t_relaxed| (m)
     double arb_c_relaxed{-1.0};
     double arb_c_tight{-1.0};
+    double arb_c_prior{-1.0};      // 운동 사전분포 후보의 기하 정합성
+
+    // 어느 후보가 채택됐는가. 0 = 완화(기본), 1 = 조임, 2 = 운동 사전분포.
+    // arbitrated 만으로는 후보가 셋이 되는 순간 무엇이 이겼는지 알 수 없다.
+    int    arb_choice{0};
 
     [[nodiscard]] bool fullRank() const { return observable_dof == 6; }
 
@@ -453,6 +477,28 @@ struct AlignmentResult {
     }
 };
 
+// 운동 사전분포. 프레임간 운동이 시간적으로 매끄럽다는 관측을 정보로 넘긴다.
+//
+// 왜 필요한가. kitti_04 의 잔여 표류는 분산이 아니라 **편향** 이다. 정보행렬은
+// 해에서의 곡률이라 최소점이 틀린 자리에 있는 것을 못 본다(8d8af7c). 실측:
+// 프레임 0~38 이 수직표류 13.01 m 중 9.45 m 를 담고, 그 구간에서 프레임간
+// 회전오차가 피치축으로 15.28 도 쌓인다. 오라클로 확인하면 병진만 고쳐서
+// 629 -> 396, 회전만 고쳐서 629 -> 390, 둘 다 고쳐야 629 -> 149 다. 즉 편향은
+// 병진과 회전에 같이 실려 있어 SE3 전체에 걸어야 한다.
+//
+// sigma 는 호출자가 **잰다**. 등속 예측 잔차 e_k = log(T_est,k * T_pred,k^-1) 의
+// 축별 로버스트 산포 1.4826*median|e_k| 다. 맞춘 상수가 아니라 그 시퀀스가 스스로
+// 낸 수이고, 중앙값이라 고치려는 그 이상치들이 산포를 부풀리지 않는다.
+struct MotionPrior {
+    SE3  T_pred;                       // 예측 (보통 등속)
+    Vec6 sigma{Vec6::Zero()};          // 축별 로버스트 산포 [m, m, m, rad, rad, rad]
+    std::size_t samples{0};            // sigma 를 만든 표본 수
+
+    [[nodiscard]] bool valid() const {
+        return samples >= 3 && (sigma.array() > 0.0).all();
+    }
+};
+
 class DirectAligner {
 public:
     explicit DirectAligner(DirectAlignerConfig config = {}, ThreadPool* pool = nullptr);
@@ -460,10 +506,13 @@ public:
     // ref -> cur 상대 포즈 추정.
     // ref 는 깊이를 가져야 한다(RGB-D/스테레오). init 은 초기 추정 (보통 등속 예측).
     // quality/env 가 주어지면 픽셀 가중과 정보 스케일에 반영된다.
+    // prior 가 주어지면 로버스트 커널 중재의 후보 하나로만 쓰인다 - 그냥 목적함수에
+    // 더하지 않는다. 근거는 motion_prior_arbitration 주석.
     [[nodiscard]] Result<AlignmentResult> align(const Frame& ref, const Frame& cur,
                                                 const SE3& init,
                                                 const ImageQuality* quality = nullptr,
-                                                const EnvironmentState* env = nullptr);
+                                                const EnvironmentState* env = nullptr,
+                                                const MotionPrior* prior = nullptr);
 
     [[nodiscard]] const DirectAlignerConfig& config() const { return cfg_; }
 
@@ -530,6 +579,11 @@ private:
 
     DirectAlignerConfig cfg_;
     ThreadPool*         pool_;
+
+    // 이번 풀이에 걸린 운동 사전분포. 중재가 세 번째 후보를 풀 때만 채워지고
+    // 그 호출이 끝나면 다시 비워진다 (cfg_ 를 바꿔 재귀하는 것과 같은 규약).
+    const MotionPrior* prior_{nullptr};
+    double             prior_rho_{1.0};   // 사전분포를 키우는 배율 rho (1 = 사용 안 함)
 
     std::vector<cv::Mat>    depth_pyramid_;
     std::vector<AlignPoint> points_;             // 현재 레벨 점 집합

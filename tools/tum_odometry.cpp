@@ -25,6 +25,7 @@
 #include <opencv2/imgproc.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
@@ -276,6 +277,8 @@ int main(int argc, char** argv) {
         else if (k == "--depth-sigma-rel") cfg.depth_sigma_rel = std::atof(argv[i + 1]);
         // 로버스트 커널 중재. 끄면 완화 커널 하나로만 푼다(이 기구 도입 전 동작).
         else if (k == "--arbitrate")   cfg.robust_arbitration = std::atoi(argv[i + 1]) != 0;
+        else if (k == "--motion-prior") cfg.motion_prior_arbitration = std::atoi(argv[i + 1]) != 0;
+        else if (k == "--arb-rank")    cfg.arb_rank_above_floor = std::atoi(argv[i + 1]) != 0;
     }
     tcfg.collect_assoc_probes = !assoc_diag_path.empty();
 
@@ -357,6 +360,10 @@ int main(int argc, char** argv) {
     wme::SE3 T_cur_ref_prev = wme::SE3::identity();
     wme::SE3 velocity       = wme::SE3::identity();
 
+    // 등속 예측의 잔차 표본. 운동 사전분포의 산포는 여기서만 나온다.
+    std::vector<wme::Vec6> prior_res;
+    std::vector<double>    prior_scratch;
+
     std::ofstream out(out_path);
     out << "# timestamp tx ty tz qx qy qz qw\n";
     out << std::fixed << std::setprecision(6);
@@ -393,6 +400,7 @@ int main(int argc, char** argv) {
         // 정보행렬을 쌓을 때 쓴 깊이 잡음 배율. 이것이 있어야 "관측 DOF 가
         // 떨어졌다" 는 보고가 장면 기하 때문인지 깊이 불신 때문인지 가릴 수 있다.
         diag << ",depth_sigma_scale,effective_dof";
+        diag << ",arb_c_prior,arb_choice";
         diag << "\n";
         diag << std::fixed << std::setprecision(6);
     }
@@ -402,6 +410,9 @@ int main(int argc, char** argv) {
     int  bad_streak = 0, reloc_tried = 0, reloc_ok = 0;
     auto orb = cv::ORB::create(1000, 1.2F, 8);
     cv::BFMatcher bf(cv::NORM_HAMMING, false);
+    // 중재가 실제로 몇 번 무엇을 골랐는지. 이 수가 없으면 기구가 도움이 됐는지
+    // 해가 됐는지 사후에 못 가린다.
+    int arb_tight_n = 0, arb_prior_n = 0, rho_gate_n = 0;
     double rmse_sum = 0.0, inlier_sum = 0.0, point_sum = 0.0, dof_sum = 0.0;
     int    stat_n = 0;
     double masked_sum = 0.0, det_sum = 0.0, yolo_ms = 0.0;
@@ -448,6 +459,18 @@ int main(int argc, char** argv) {
     env.track_persistence_scale = 1.0;
     env.memory_retention_scale = 1.0;
 
+    // --- 시간 계측 ----------------------------------------------------------
+    // "느려졌다" 를 고치려면 어디에 시간이 가는지부터 봐야 한다. 벽시계 하나로는
+    // 정렬 비용과 디스크/디코딩 비용이 섞여 어느 쪽을 손대도 설명이 되지 않는다.
+    // 단위는 초, 누산은 스티디 클럭.
+    using Clock = std::chrono::steady_clock;
+    auto   t_now = [] { return Clock::now(); };
+    auto   t_add = [](double& acc, Clock::time_point s) {
+        acc += std::chrono::duration<double>(Clock::now() - s).count();
+    };
+    double sec_io = 0.0, sec_quality = 0.0, sec_align = 0.0, sec_orb = 0.0, sec_diag = 0.0;
+    const auto t_wall0 = Clock::now();
+
     for (const auto& rr : rgb_rows) {
         if (max_frames > 0 && used >= max_frames) break;
 
@@ -459,6 +482,7 @@ int main(int argc, char** argv) {
         const std::string depth_file = root + "/" + depth_rows[static_cast<std::size_t>(di)].file;
         if (!fileExists(depth_file)) continue;
 
+        const auto t_io0 = t_now();
         cv::Mat gray_raw = cv::imread(rgb_file, cv::IMREAD_GRAYSCALE);
         cv::Mat draw     = cv::imread(depth_file, cv::IMREAD_UNCHANGED);
         if (gray_raw.empty() || draw.empty()) continue;
@@ -480,10 +504,13 @@ int main(int argc, char** argv) {
         f.depth = depth;
         f.intrinsics = K;
         f.sensor = wme::SensorKind::RgbD;
+        t_add(sec_io, t_io0);
 
         // 품질 지표는 로버스트 커널의 잡음 기준으로 쓰인다.
         // 이 경로가 있어야 임계가 실제 센서 잡음에 묶인다.
+        const auto t_q0 = t_now();
         const wme::ImageQuality q = iq.evaluate(f);
+        t_add(sec_quality, t_q0);
 
         // 동적 마스크는 ref 프레임에 붙어야 한다. ECDA 는 ref 에서 점을 고르므로,
         // cur 에 붙이면 아무 효과가 없다.
@@ -628,7 +655,32 @@ int main(int argc, char** argv) {
         } else {
             const wme::SE3 init = use_prior ? velocity * T_cur_ref_prev
                                             : wme::SE3::identity();
-            const auto r = aligner.align(ref, f, init, &q);
+
+            // --- 운동 사전분포 ------------------------------------------------
+            // 예측은 init(등속) 그대로다. 세기는 이 시퀀스가 스스로 낸 예측 잔차
+            // e_k = log(T_est,k * T_pred,k^-1) 의 축별 로버스트 산포에서 나온다.
+            //   sigma_i = 1.4826 * median_k |e_k,i|
+            // 중앙값이라 고치려는 이상치들이 산포를 부풀리지 않는다. 표본이 3 개
+            // 미만이면 산포를 말할 수 없으므로 사전분포를 걸지 않는다 -
+            // "모른다" 를 "0 이다" 로 접지 않는다.
+            wme::MotionPrior mprior;
+            if (use_prior && prior_res.size() >= 3) {
+                mprior.T_pred  = init;
+                mprior.samples = prior_res.size();
+                for (int k = 0; k < 6; ++k) {
+                    prior_scratch.clear();
+                    for (const auto& e : prior_res) prior_scratch.push_back(std::abs(e(k)));
+                    const std::size_t mid = prior_scratch.size() / 2;
+                    std::nth_element(prior_scratch.begin(), prior_scratch.begin() + mid,
+                                     prior_scratch.end());
+                    mprior.sigma(k) = 1.4826 * std::max(1e-9, prior_scratch[mid]);
+                }
+            }
+
+            const auto t_a0 = t_now();
+            const auto r = aligner.align(ref, f, init, &q, nullptr,
+                                         mprior.valid() ? &mprior : nullptr);
+            t_add(sec_align, t_a0);
             if (!r.ok()) {
                 ++failed;
                 // 실패를 조용히 넘기지 않는다. 참조를 갱신해 다음 프레임에 건다.
@@ -643,8 +695,16 @@ int main(int argc, char** argv) {
                 const wme::SE3 T_ref_cur = T_cur_ref.inverse();
                 T_world_cam = T_world_ref * T_ref_cur;
 
+                // 사전분포의 산포를 기르는 표본. 예측이 실제로 얼마나 틀렸는가.
+                // 채택된 해로 재야 한다 - 다음 프레임의 예측도 이 해에서 나온다.
+                if (use_prior) prior_res.push_back((T_cur_ref * init.inverse()).log());
+
                 velocity       = T_cur_ref * T_cur_ref_prev.inverse();
                 T_cur_ref_prev = T_cur_ref;
+
+                if (r.value().arb_choice == 1) ++arb_tight_n;
+                if (r.value().arb_choice == 2) ++arb_prior_n;
+                if (r.value().depth_sigma_scale > 1.0) ++rho_gate_n;
 
                 rmse_sum   += r.value().photometric_rmse;
                 inlier_sum += r.value().inlier_ratio;
@@ -653,6 +713,7 @@ int main(int argc, char** argv) {
                 ++stat_n;
 
                 if (diag.is_open()) {
+                    const auto t_d0 = t_now();
                     const auto& v = r.value();
                     // 고유값은 내림차순이 아니라 Eigen 관례상 오름차순으로 담긴다.
                     const double ev_min = v.eigenvalues.minCoeff();
@@ -696,8 +757,10 @@ int main(int argc, char** argv) {
                         << "," << v.arb_delta_t << "," << v.arb_c_relaxed
                         << "," << v.arb_c_tight;
                     ext << "," << v.depth_sigma_scale << "," << v.effective_dof;
+                    ext << "," << v.arb_c_prior << "," << v.arb_choice;
 
                     diag << ext.str() << "\n";
+                    t_add(sec_diag, t_d0);
                 }
 
                 // --- 재측위 ---------------------------------------------
@@ -795,6 +858,7 @@ int main(int argc, char** argv) {
                 if (T_ref_cur.translation().norm() > kf_dist || geom_bad) {
                     // 지도에 남긴다. 재측위가 돌아갈 좌표계는 여기서 만들어진다.
                     if (reloc_after > 0) {
+                        const auto t_o0 = t_now();
                         MapKeyFrame mk;
                         mk.T_world = T_world_cam;
                         orb->detectAndCompute(gray, cv::noArray(), mk.kp, mk.desc);
@@ -812,6 +876,7 @@ int main(int argc, char** argv) {
                             mk.has_xyz[pi] = true;
                         }
                         map_kfs.push_back(std::move(mk));
+                        t_add(sec_orb, t_o0);
                     }
                     ref = f;
                     T_world_ref = T_world_cam;
@@ -846,6 +911,26 @@ int main(int argc, char** argv) {
     }
     std::cout << "프레임 " << used << "  정렬실패 " << failed
               << "  키프레임교체 " << kf_switches << "\n";
+
+    std::cout << "중재: rho>1 게이트 " << rho_gate_n
+              << "  조임 채택 " << arb_tight_n
+              << "  운동사전분포 채택 " << arb_prior_n << "\n";
+
+    // 시간 내역. 합이 벽시계보다 작으면 그 차이는 여기서 재지 않은 부분(YOLO,
+    // 토큰, 출력)이다. 어느 항이 줄었는지 말할 수 있어야 최적화가 검증된다.
+    {
+        const double wall = std::chrono::duration<double>(Clock::now() - t_wall0).count();
+        const double n = static_cast<double>(std::max(1, used));
+        std::cout << std::fixed << std::setprecision(2)
+                  << "시간(초): 벽시계 " << wall
+                  << "  정렬 " << sec_align << "  입출력 " << sec_io
+                  << "  품질 " << sec_quality << "  ORB " << sec_orb
+                  << "  진단 " << sec_diag << "\n"
+                  << "  프레임당(ms): 벽시계 " << (1000.0 * wall / n)
+                  << "  정렬 " << (1000.0 * sec_align / n) << "\n";
+        std::cout.unsetf(std::ios::floatfield);
+        std::cout << std::setprecision(6);
+    }
     if (stat_n > 0) {
         std::cout << "평균 측광 RMSE " << (rmse_sum / stat_n)
                   << "  inlier " << (inlier_sum / stat_n)
