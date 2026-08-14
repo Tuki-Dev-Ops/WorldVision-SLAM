@@ -23,6 +23,8 @@
 #include "wme/perception/EnvironmentState.hpp"
 #include "wme/perception/ImageQuality.hpp"
 
+#include <cmath>
+#include <cstddef>
 #include <vector>
 
 namespace wme {
@@ -144,6 +146,30 @@ struct DirectAlignerConfig {
     double huber_k{1.345};           // sigma 배수. 가우시안 95% 효율 상수
     double huber_noise_ratio{2.0};   // 이 배수 이내면 커널을 완전히 조인다
     double huber_min_delta{2.0};     // 잡음 추정이 없을 때의 대체 잡음 수준 (intensity)
+
+    // 완화 규칙을 프레임마다 **측정으로** 고를 것인가.
+    //
+    // 위의 완화 규칙(relax = sigma / (noise_ratio * noise))은 "잔차가 잡음보다
+    // 훨씬 크면 아직 해에 도달하지 못한 것" 이라는 전제 위에 서 있고, 그 전제는
+    // TUM 에서 맞다 - 수렴한 잔차가 센서 잡음의 약 2 배다. KITTI 에서는 수렴한
+    // 잔차가 잡음의 3~11 배라(측정: rmse 7~25 대 noise_sigma 2.2) 규칙이 해에서도
+    // "미수렴" 이라고 읽고 커널을 사실상 꺼 버린다. kitti_04 의 표류 프레임에서
+    // sigma ~ 20, delta ~ 121 로 잔차 전체가 커널 안에 들어간다 - 순수 L2 다.
+    //
+    // 그런데 어느 쪽이 옳은지는 시퀀스가 아니라 **프레임** 마다 다르다. 커널을
+    // 전역으로 조이면 kitti_04 는 좋아지고(ATE 955 -> 245~288 cm) 나머지 셋은
+    // 전부 나빠진다(00 94->120, 05 141->157, 07 108->150). 즉 상수 하나로
+    // 고를 문제가 아니다.
+    //
+    // 그래서 고르지 않고 잰다. 같은 프레임을 완화/비완화 두 커널로 각각 풀고,
+    // **정렬에 쓰이지 않은 관측** 인 cur 깊이맵과의 정합성(depth_consistency)이
+    // 더 좋은 쪽을 택한다. 측광 목적함수는 이 값을 한 번도 보지 않으므로 심판이
+    // 선수를 겸하지 않는다. kitti_04 실측에서 이 신호는 프레임별 수직 표류와
+    // 상관 +0.93 이고, 표류 프레임 35 개가 전체 표류의 87 % 를 담는다.
+    //
+    // 새로 맞춘 상수는 없다. 판정 불가(-1)이거나 둘이 같으면 기존 동작을 유지한다.
+    // 비용은 그 프레임에서 정렬 두 번이다.
+    bool   robust_arbitration{true};
 
     // inlier 판정용 고정 임계 = health_k * max(측정 잡음, huber_min_delta).
     // 커널 임계와 분리해야 한다. 적응형 임계로 inlier 를 세면 잔차가 커질 때
@@ -293,6 +319,25 @@ struct AlignmentResult {
     double depth_consistency{-1.0};      // median |z_pred - z_meas| / z_meas
     double depth_outlier_ratio{-1.0};    // 상대차 > 10 % 인 표본 비율
 
+    // 위 표본들의 깊이 중앙값 (m). -1 = 표본 없음.
+    // depth_consistency 가 "센서 잡음만으로 설명되는 수준" 인지 판정하려면 그
+    // 잡음이 깊이에 의존하므로(sigma_Z = c*Z^2) 어느 깊이에서 잰 값인지가 있어야 한다.
+    double depth_median_z{-1.0};
+
+    // 위 통계를 만든 표본 수. 중앙값의 표준오차가 여기에 걸린다.
+    std::size_t depth_sample_count{0};
+
+    // 로버스트 커널 중재가 비완화 쪽 해를 택했는가 (robust_arbitration 참조).
+    // 몇 프레임에서 무엇이 바뀌었는지 밖에서 셀 수 없으면, 이 기구가 도움이
+    // 됐는지 해가 됐는지도 사후에 가릴 수 없다.
+    bool   arbitrated{false};
+
+    // 중재가 실제로 무엇을 놓고 골랐는지. 두 후보의 병진 차이와 각각의
+    // 기하 정합성. -1 = 중재를 돌리지 않음.
+    double arb_delta_t{-1.0};      // |t_tight - t_relaxed| (m)
+    double arb_c_relaxed{-1.0};
+    double arb_c_tight{-1.0};
+
     [[nodiscard]] bool fullRank() const { return observable_dof == 6; }
 
     // 기하적으로 신뢰할 수 있는가. 판정 불가(-1)는 "괜찮다"로 읽지 않는다.
@@ -310,6 +355,56 @@ struct AlignmentResult {
     // J 0.14) 어떤 문턱도 분리하지 못한다. 이 신호는 카메라에 따라 **분리력
     // 자체가** 달라진다.
     static constexpr double kDepthConsistencyGate = 0.0057;
+
+    // 센서 잡음만으로 설명되는 불일치 수준. 위의 적합된 상수와 달리 유도된다.
+    //
+    // z_pred 는 ref 의 깊이를, z_meas 는 cur 의 깊이를 쓴다. 둘은 서로 다른
+    // 프레임의 독립 측정이고 각각 상대오차 sigma_Z/Z = c*Z 를 가지므로(sigma_Z =
+    // c*Z^2), 차이의 표준편차는 sqrt(2)*c*Z 다. 그 분포의 |.| 중앙값은
+    // 0.6745*sqrt(2)*c*Z = 0.954*c*Z 이고, 이것이 **포즈가 완벽할 때** 이 통계가
+    // 앉을 자리다.
+    //
+    // 실측이 이 유도를 그대로 확인한다. KITTI c=7.8e-4, 표본 깊이 중앙 ~15 m 면
+    // 예측 중앙값 0.0111 이고, 표류가 없는 세 시퀀스의 실측 중앙값은
+    // 0.0108 / 0.0115 / 0.0109 다.
+    //
+    // 문턱은 그 분포의 1 sigma 자리, 즉 sqrt(2)*c*Z 로 둔다. 중앙값(0.67 sigma)
+    // 보다 위이고 어떤 시퀀스에도 맞추지 않은 자리다. 모델이 독립을 가정하므로
+    // 실제 발동률은 모델값보다 낮다 - 같은 표면을 비슷한 시차로 두 번 재면
+    // 오차가 상관되기 때문이다. 실측 발동률은 kitti_00/05/07 에서 2~4 %,
+    // kitti_04 에서 55 % 다.
+    //
+    // c 를 모르면(depth_sigma_rel = 0, 예: TUM 기본 설정) 유도할 근거가 없으므로
+    // 위의 적합 상수로 돌아간다. 그 상수는 정확히 그 데이터에서 적합된 것이다.
+    [[nodiscard]] double depthNoiseFloor(double depth_sigma_rel) const {
+        if (depth_sigma_rel <= 0.0 || depth_median_z <= 0.0) return kDepthConsistencyGate;
+        return 1.41421356237 * depth_sigma_rel * depth_median_z;
+    }
+
+    // 두 후보의 depth_consistency 차이가 이만큼은 되어야 "다르다" 고 말할 수 있다.
+    //
+    // 비교하는 양은 표본 하나가 아니라 표본 N 개의 **중앙값** 이다. 중앙값의
+    // 표준오차는 sqrt(pi/2)*sigma/sqrt(N) 이므로, 산포 sigma 가 곧 잡음 바닥인
+    // 이 통계에서 두 중앙값을 가르는 한계는
+    //     sqrt(2) * sqrt(pi/2) * floor / sqrt(N)
+    // 이다 (sqrt(2) 는 중앙값 둘의 차이라서).
+    //
+    // 이 항이 필요한 이유는 실측이다. 네 시퀀스에서 중재가 발동한 12 프레임 중
+    // 5 개는 두 후보 포즈가 1~10 mm 밖에 다르지 않았고 c 도 소수 4 자리까지 같았다
+    // (0.0112 대 0.0112, 0.0102 대 0.0102 ...). 구분되지 않는 둘 중 하나를 잡음으로
+    // 고른 것이고, 그 한 번이 운동 사전분포를 바꿔 뒤따르는 프레임의 수렴을 바꾼다 -
+    // kitti_07 에서 그런 교체 2 회가 ATE 108 -> 172 cm 를 만들었다. 나머지 7 개는
+    // c 가 0.025~0.050 에서 0.012~0.018 로 떨어져 차이가 이 한계의 20 배 위였다.
+    //
+    // 표본 하나의 분해능(sqrt(2)*c*Z^2, KITTI 에서 0.19~0.28 m)으로 자르면 안 된다.
+    // 그 값은 중앙값이 아니라 화소 하나의 한계라 실제로 옳았던 교체(후보차
+    // 0.20~0.26 m)까지 같이 잘라내고, 그러면 kitti_04 가 955 -> 1156 cm 로
+    // 오히려 나빠진다. 실측한 실패다.
+    [[nodiscard]] double depthMedianResolution(double depth_sigma_rel) const {
+        if (depth_sample_count < 1) return 0.0;
+        return 1.41421356237 * 1.25331413732 * depthNoiseFloor(depth_sigma_rel) /
+               std::sqrt(static_cast<double>(depth_sample_count));
+    }
 
     [[nodiscard]] bool depthConsistent(double max_rel = kDepthConsistencyGate) const {
         return depth_consistency >= 0.0 && depth_consistency <= max_rel;

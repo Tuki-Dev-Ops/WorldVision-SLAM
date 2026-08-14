@@ -428,6 +428,73 @@ Result<AlignmentResult> DirectAligner::align(const Frame& ref, const Frame& cur,
         return {ErrorCode::InsufficientData, "ECDA 는 ref 프레임의 깊이를 요구"};
     }
 
+    // --- 로버스트 커널 중재 --------------------------------------------------
+    // 같은 프레임을 완화 커널과 비완화 커널로 각각 풀고, 측광이 보지 않은 관측
+    // (cur 깊이맵)이 더 낫다고 하는 쪽을 택한다. 근거는 헤더 robust_arbitration.
+    //
+    // 재귀로 부르는 이유: 두 번의 풀이는 완전히 같은 코드여야 한다. 여기서 루프를
+    // 복제하면 두 경로가 언젠가 어긋나고, 그 차이가 커널 차이로 오독된다.
+    // 내부 버퍼(points_, blocks_ ...)는 중첩 호출이 끝난 뒤에야 다시 쓰이므로
+    // 결과를 먼저 복사해 두면 안전하다.
+    if (cfg_.robust_arbitration) {
+        DirectAlignerConfig relaxed = cfg_, tight = cfg_;
+        relaxed.robust_arbitration = false;
+        tight.robust_arbitration = false;
+        // 완화를 끄는 것은 noise_ratio 를 무한대로 두는 것과 같다.
+        // relax = max(1, sigma / (inf * noise)) = 1 이므로 delta = huber_k * sigma,
+        // 즉 로버스트 통계가 원래 의도한 임계 그대로다.
+        tight.huber_noise_ratio = std::numeric_limits<double>::infinity();
+
+        cfg_ = relaxed;
+        Result<AlignmentResult> r_relaxed = align(ref, cur, init, quality, env);
+        cfg_ = tight;
+        Result<AlignmentResult> r_tight = align(ref, cur, init, quality, env);
+        cfg_ = relaxed;
+        cfg_.robust_arbitration = true;
+
+        // 심판이 판정하지 못하면 기존 동작(완화)을 그대로 둔다. "모른다" 를
+        // "저쪽이 낫다" 로 접지 않는다.
+        if (r_relaxed.ok() && r_tight.ok()) {
+            const double c_relaxed = r_relaxed.value().depth_consistency;
+            const double c_tight   = r_tight.value().depth_consistency;
+            const double delta_t = (r_tight.value().T_cur_ref.translation() -
+                                    r_relaxed.value().T_cur_ref.translation()).norm();
+            for (auto* v : {&r_relaxed, &r_tight}) {
+                v->value().arb_delta_t   = delta_t;
+                v->value().arb_c_relaxed = c_relaxed;
+                v->value().arb_c_tight   = c_tight;
+            }
+            // 교체 조건은 두 개고 둘 다 같은 바닥에 대한 판정이다.
+            //   (1) 기본 답이 바닥을 넘었다            - 물어볼 이유가 있다
+            //   (2) 대안이 바닥 안에 들어온다          - 답할 자격이 있다
+            //   (3) 둘의 차이가 중앙값의 표준오차 위다 - 구분되는 둘이다
+            //
+            // (2) 를 "그냥 더 낫다" 로 느슨하게 두면 안 된다는 것이 실측이다.
+            // 나쁜 둘 중 덜 나쁜 쪽을 고르는 일이 생기고, 그 한 번이 되돌아오지
+            // 않는다: kitti_07 은 320~379 프레임에서 차가 서 있는데(정답 프레임간
+            // 이동 0.01~0.36 m), 감속이 시작되는 한 프레임에서 잘못 고른 뒤 그
+            // 구간 전체가 발산해 ATE 108 -> 5014 cm 가 됐다. 기본 경로는 같은
+            // 구간을 depth_consistency 0.0075~0.0082 로 멀쩡히 지난다.
+            // 바닥을 넘은 두 후보 사이에서는 이 채널이 순위를 매길 근거가 없다.
+            //
+            // (3) 이 없으면 구분되지 않는 둘 중 하나를 잡음으로 고른다.
+            // 근거와 실측은 depthMedianResolution 주석에 있다.
+            const double floor   = r_relaxed.value().depthNoiseFloor(cfg_.depth_sigma_rel);
+            const double resolve =
+                r_relaxed.value().depthMedianResolution(cfg_.depth_sigma_rel);
+            if (c_relaxed > floor && c_tight >= 0.0 && c_tight <= floor &&
+                c_relaxed - c_tight > resolve) {
+                AlignmentResult v = r_tight.value();
+                v.arbitrated = true;
+                return Result<AlignmentResult>{v};
+            }
+        } else if (!r_relaxed.ok() && r_tight.ok()) {
+            // 완화 쪽이 아예 풀리지 않았으면 풀린 쪽을 쓴다.
+            return r_tight;
+        }
+        return r_relaxed;
+    }
+
     // 로버스트 임계의 기준이 되는 물리 잡음. 품질 엔진이 측정한 값을 그대로 쓴다.
     const double noise_sigma = (quality != nullptr && quality->noise_sigma > 0.0)
                                    ? quality->noise_sigma
@@ -696,8 +763,21 @@ Result<AlignmentResult> DirectAligner::align(const Frame& ref, const Frame& cur,
     if (!ref.depth.empty() && !cur.depth.empty() &&
         ref.depth.type() == CV_32F && cur.depth.type() == CV_32F) {
         const auto& K = cur.intrinsics;
+        // 유효 깊이 범위는 데이터셋의 것을 쓴다. 여기 0.1/8.0 이 박혀 있었다 -
+        // tools/dataset_calib.hpp 머리말이 기록한 바로 그 상수이고, 두 도구에서는
+        // 걷어냈는데 라이브러리에는 남아 있었다. KITTI 는 유효 깊이가 3.2~48 m 라
+        // 이 검사가 3.2~8 m 구간, 즉 카메라 바로 앞 노면 몇 미터만 표본으로 삼았다.
+        // 장면의 임의 표본이 아니라 한쪽으로 치우친 표본이면, 이 채널이 "측광과
+        // 독립인 관측" 이라는 계약을 지키지 못한다. 정렬이 점을 고를 때 쓰는
+        // 범위(cfg_.min_depth/max_depth)와 같은 값을 쓴다.
+        const auto z_lo = static_cast<float>(cfg_.min_depth);
+        const auto z_hi = static_cast<float>(cfg_.max_depth);
         std::vector<double> rel;
         rel.reserve(2048);
+        // 표본 깊이도 같이 모은다. 이 통계의 잡음 바닥이 깊이에 의존하므로
+        // (depthNoiseFloor 주석) 어느 깊이에서 잰 값인지가 결과와 함께 있어야 한다.
+        std::vector<double> zs;
+        zs.reserve(2048);
         std::size_t outliers = 0;
         // 성긴 격자로 충분하다 - 추정이 아니라 검사다. 6 화소 간격이면
         // 640x480 에서 ~8500 표본이고 비용은 정렬의 1 % 미만이다.
@@ -705,7 +785,7 @@ Result<AlignmentResult> DirectAligner::align(const Frame& ref, const Frame& cur,
             const auto* zr_row = ref.depth.ptr<float>(v);
             for (int u = 4; u + 4 < ref.depth.cols; u += 6) {
                 const float zr = zr_row[u];
-                if (!(zr > 0.1F) || zr > 8.0F) continue;
+                if (!(zr > z_lo) || zr > z_hi) continue;
                 const Vec3 p_ref((u - K.cx) * zr / K.fx, (v - K.cy) * zr / K.fy, zr);
                 const Vec3 p_cur = result.T_cur_ref * p_ref;
                 if (!(p_cur.z() > 0.1)) continue;
@@ -713,9 +793,10 @@ Result<AlignmentResult> DirectAligner::align(const Frame& ref, const Frame& cur,
                 const int vi = static_cast<int>(std::lround(K.fy * p_cur.y() / p_cur.z() + K.cy));
                 if (ui < 0 || vi < 0 || ui >= cur.depth.cols || vi >= cur.depth.rows) continue;
                 const float zm = cur.depth.ptr<float>(vi)[ui];
-                if (!(zm > 0.1F) || zm > 8.0F) continue;
+                if (!(zm > z_lo) || zm > z_hi) continue;
                 const double r = std::abs(p_cur.z() - zm) / zm;
                 rel.push_back(r);
+                zs.push_back(zm);
                 if (r > 0.10) ++outliers;
             }
         }
@@ -726,6 +807,9 @@ Result<AlignmentResult> DirectAligner::align(const Frame& ref, const Frame& cur,
             result.depth_consistency   = rel[rel.size() / 2];
             result.depth_outlier_ratio = static_cast<double>(outliers) /
                                          static_cast<double>(rel.size());
+            std::nth_element(zs.begin(), zs.begin() + zs.size() / 2, zs.end());
+            result.depth_median_z = zs[zs.size() / 2];
+            result.depth_sample_count = rel.size();
         }
     }
 

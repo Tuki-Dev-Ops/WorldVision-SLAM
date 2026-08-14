@@ -274,6 +274,8 @@ int main(int argc, char** argv) {
         else if (k == "--depth-max")   depth_max_cli = std::atof(argv[i + 1]);
         // sigma_Z = c * Z^2. 스테레오면 c = sigma_d/(f*B).
         else if (k == "--depth-sigma-rel") cfg.depth_sigma_rel = std::atof(argv[i + 1]);
+        // 로버스트 커널 중재. 끄면 완화 커널 하나로만 푼다(이 기구 도입 전 동작).
+        else if (k == "--arbitrate")   cfg.robust_arbitration = std::atoi(argv[i + 1]) != 0;
     }
     tcfg.collect_assoc_probes = !assoc_diag_path.empty();
 
@@ -382,6 +384,12 @@ int main(int argc, char** argv) {
         }
         // 기존 열은 다른 도구가 파싱하므로 순서를 바꾸지 않고 뒤에만 덧붙인다.
         diag << ",depth_incons,depth_outlier";
+        // 정렬기 자신이 낸 기하 정합성과 그 잡음 바닥, 그리고 로버스트 커널
+        // 중재가 발동했는지. 위의 depth_incons 는 이 도구가 따로 계산한 값이라
+        // 정렬기 내부의 판정과 같은 수가 아니다 - 게이트가 무엇을 보고 움직였는지
+        // 알려면 정렬기가 본 수가 그대로 있어야 한다.
+        diag << ",align_incons,align_median_z,arbitrated"
+                ",arb_delta_t,arb_c_relaxed,arb_c_tight";
         diag << "\n";
         diag << std::fixed << std::setprecision(6);
     }
@@ -680,6 +688,10 @@ int main(int argc, char** argv) {
                     double d_out = -1.0;
                     const double d_inc = depthConsistency(ref, f, T_cur_ref, d_out);
                     ext << "," << d_inc << "," << d_out;
+                    ext << "," << v.depth_consistency << "," << v.depth_median_z
+                        << "," << (v.arbitrated ? 1 : 0)
+                        << "," << v.arb_delta_t << "," << v.arb_c_relaxed
+                        << "," << v.arb_c_tight;
 
                     diag << ext.str() << "\n";
                 }
