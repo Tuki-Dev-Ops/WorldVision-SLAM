@@ -59,6 +59,30 @@ def load_groundtruth(root: Path) -> tuple[np.ndarray, list[SE3]]:
     return np.array(stamps)[order], [poses[k] for k in order]
 
 
+def gt_max_gap(stamps: np.ndarray) -> float:
+    """How wide a ground-truth gap may be interpolated across, for THIS sequence.
+
+    The old code had this as the constant 0.05 s, and the constant was not
+    wrong — it was TUM-shaped. TUM's ground truth is motion capture at 100 Hz
+    (measured median gap 0.010 s), so 0.05 s is "do not interpolate across more
+    than about five sampling intervals". KITTI's ground truth is one pose per
+    image, median gap 0.208 s, so *every* gap exceeds the constant, every
+    interpolation returns None, every T_gt is None, and sections 1 and 4 print
+    `n=0 ... nan` for all three tiers. Not "no signal" — no comparison
+    attempted, reported as if measured. That is the failure this repo calls
+    quiet, and it hid the tier calibration on all four KITTI sequences.
+
+    So the rule is stated in the units it belongs to: the sequence's own
+    sampling interval. 1.5 intervals is one step plus margin — beyond that the
+    linear/geodesic interpolant is extrapolating through unobserved motion.
+    The 0.05 s floor stays as a floor, which is why TUM is bit-identical:
+    1.5 * 0.010 = 0.015 < 0.05.
+    """
+    if stamps.size < 3:
+        return 0.05
+    return max(0.05, 1.5 * float(np.median(np.diff(np.sort(stamps)))))
+
+
 def interpolate(stamps: np.ndarray, poses: list[SE3], t: float,
                 max_gap: float = 0.05) -> SE3 | None:
     """Linear in translation, geodesic in rotation. None if the gap is too wide."""
@@ -117,6 +141,7 @@ def _pose(row: dict, prefix: str) -> SE3:
 
 def load_records(csv_path: Path, gt_stamps: np.ndarray, gt_poses: list[SE3]) -> list[Record]:
     out: list[Record] = []
+    gap = gt_max_gap(gt_stamps)
     with open(csv_path, "r", encoding="utf-8") as f:
         for row in csv.DictReader(f):
             r = Record(
@@ -140,11 +165,19 @@ def load_records(csv_path: Path, gt_stamps: np.ndarray, gt_poses: list[SE3]) -> 
                 depth_rel=float(row.get("t0_depth_rel", 1.0) or 1.0),
             )
             if r.ref_idx >= 0:
-                g_cur = interpolate(gt_stamps, gt_poses, r.stamp)
-                g_ref = interpolate(gt_stamps, gt_poses, r.ref_stamp)
+                g_cur = interpolate(gt_stamps, gt_poses, r.stamp, gap)
+                g_ref = interpolate(gt_stamps, gt_poses, r.ref_stamp, gap)
                 if g_cur is not None and g_ref is not None:
                     r.T_gt = g_cur.inverse() @ g_ref
             out.append(r)
+
+    # 진리값과 짝지어지지 않은 프레임이 얼마인지 반드시 말한다. 이것이 없으면
+    # 1절/4절의 n 이 왜 작은지 사후에 물을 방법이 없다.
+    paired = sum(1 for r in out if r.T_gt is not None)
+    usable = sum(1 for r in out if r.ref_idx >= 0)
+    if paired < usable:
+        print(f"  [gt] paired {paired}/{usable} frames at max_gap {gap:.3f} s"
+              f"  ({usable - paired} unpaired, dropped from sections 1 and 4)")
     return out
 
 

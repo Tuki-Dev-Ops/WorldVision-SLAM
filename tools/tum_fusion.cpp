@@ -15,15 +15,31 @@
 // 사용:
 //   wme_tum_fusion <시퀀스경로> <출력접두사> [--yolo models/yolo11n.onnx]
 //                  [--max-frames N] [--kf-dist M] [--kappa1 K] [--kappa2 K]
+//                  [--depth-min M] [--depth-max M] [--depth-sigma-rel C]
+//                  [--arbitrate 0|1]
+//                  [--plane-depth-max M] [--plane-disc M] [--plane-dist-bin M]
+//                  [--plane-refine M] [--plane-min-inliers N] [--spa-min-matches N]
+//
+// 데이터셋 설정에 대하여: 내부파라미터도 깊이 유효 범위도 tum_odometry.cpp 와
+// **같은 자리에서 같은 값** 이 들어가야 한다. 그렇지 않으면 이 도구가 낸 t0 와
+// wme_tum_odometry 가 낸 Tier 0 단독은 서로 다른 추정기이고, 그 둘을 비교해
+// "융합이 도왔다/해쳤다" 고 말하는 것은 아무 뜻이 없다. 그래서
+//   - 내부파라미터/왜곡/깊이스케일/깊이범위: tools/dataset_calib.hpp (calib.txt)
+//   - 깊이 불확실성 c, 로버스트 커널 중재: CLI 로 DirectAlignerConfig 에
+// 두 도구가 같은 경로를 쓴다. 경로 문자열로 freiburg 를 찾던 이전 코드는 KITTI
+// 에서 조용히 틀렸다 - fx=517/640x480 이 1226x370 영상에 적용되는데, 결과는
+// 실패가 아니라 그럴듯한 오차로 나온다.
 
 #include "wme/fusion/PoseFusion.hpp"
 #include "wme/fusion/TierInformation.hpp"
 #include "wme/geometry/PlaneExtractor.hpp"
 #include "wme/geometry/StructuralAligner.hpp"
 #include "wme/localization/DirectAligner.hpp"
+#include "wme/perception/Detection.hpp"
 #include "wme/perception/EnvironmentAnalyzer.hpp"
 #include "wme/perception/ImageQualityEngine.hpp"
 #include "wme/token/ConstellationIndex.hpp"
+#include "dataset_calib.hpp"
 #ifdef WME_HAS_ORT
 #include "wme/perception/YoloRuntimeOrt.hpp"
 #endif
@@ -109,8 +125,13 @@ void toQuat(const Mat3& R, double& qx, double& qy, double& qz, double& qw) {
 // 한 프레임의 검출만으로 성좌 노드를 만든다. 지도 지식 없음, 카메라 좌표계.
 // tools/tum_relocalize.cpp 의 nodesFromFrame 과 같은 규약이다 (그 파일은 다른
 // 에이전트 소유라 재사용 대신 같은 계산을 여기서 한다).
+// depth_min/max 는 데이터셋에서 온다. 0.1~60 m 를 박아 두면 KITTI(유효 하한
+// 3.2 m)에서는 노면 잡음이 노드 깊이로 들어오고, TUM(상한 8 m)에서는 센서가
+// 내지 않는 깊이까지 받는다. Tier 1 의 입력이 Tier 0 과 다른 깊이를 보면
+// 두 티어의 차이가 알고리즘 차이인지 창 차이인지 말할 수 없다.
 std::vector<ConstellationNode> nodesFromFrame(const DetectionSet& dets, const Frame& frame,
-                                              double depth_shrink, std::size_t max_nodes) {
+                                              double depth_shrink, std::size_t max_nodes,
+                                              double depth_min, double depth_max) {
     std::vector<ConstellationNode> nodes;
     const auto& K = frame.intrinsics;
     if (!frame.hasDepth()) return nodes;
@@ -132,7 +153,8 @@ std::vector<ConstellationNode> nodesFromFrame(const DetectionSet& dets, const Fr
             const float* row = frame.depth.ptr<float>(y);
             for (int x = x0; x < x1; ++x) {
                 const float z = row[x];
-                if (std::isfinite(z) && z > 0.1f && z < 60.0f) vals.push_back(z);
+                if (std::isfinite(z) && z > static_cast<float>(depth_min) &&
+                    z < static_cast<float>(depth_max)) vals.push_back(z);
             }
         }
         if (vals.size() < 8) continue;
@@ -266,7 +288,13 @@ bool loadRecords(const std::string& path, std::vector<FrameRecord>& out) {
 int main(int argc, char** argv) {
     if (argc < 3) {
         std::cerr << "사용: wme_tum_fusion <시퀀스경로> <출력접두사> "
-                     "[--yolo M] [--max-frames N] [--kf-dist M] [--kappa1 K] [--kappa2 K]\n";
+                     "[--yolo M] [--max-frames N] [--kf-dist M] [--kappa1 K] [--kappa2 K]\n"
+                     "      [--depth-min M] [--depth-max M] [--depth-sigma-rel C] "
+                     "[--arbitrate 0|1]\n"
+                     "      [--plane-depth-max M] [--plane-disc M] [--plane-dist-bin M] "
+                     "[--plane-refine M] [--plane-min-inliers N]\n"
+                     "      [--spa-min-matches N] [--levels N] [--huber-k K] "
+                     "[--noise-ratio R]\n";
         return 2;
     }
     const std::string root   = argv[1];
@@ -281,6 +309,17 @@ int main(int argc, char** argv) {
     std::array<double, 3> kappa{{1.0, 1.0, 1.0}};
     std::string replay;   // 기록 CSV 를 다시 읽어 융합만 다시 한다
 
+    // Tier 0 설정. 기본값은 DirectAlignerConfig 그대로이고, 깊이 범위는
+    // calib.txt 가 덮어쓴다 (아래). tum_odometry.cpp 와 같은 순서다.
+    DirectAlignerConfig cfg;
+    double depth_min_cli = -1.0, depth_max_cli = -1.0;   // <0 = 지정 안 함
+    double plane_depth_max_cli = -1.0;
+    double plane_disc_cli = -1.0, plane_dist_bin_cli = -1.0, plane_refine_cli = -1.0;
+    int    plane_min_inliers_cli = -1;
+    int    spa_min_matches_cli = -1;
+    // Tier 1 노드가 받는 깊이 창. 기본은 데이터셋 범위를 그대로 따른다.
+    double node_depth_min = 0.0, node_depth_max = 0.0;
+
     for (int i = 3; i + 1 < argc; i += 2) {
         const std::string k = argv[i];
         if (k == "--replay")          replay = argv[i + 1];
@@ -291,6 +330,61 @@ int main(int argc, char** argv) {
         else if (k == "--kappa0")     kappa[0] = std::atof(argv[i + 1]);
         else if (k == "--kappa1")     kappa[1] = std::atof(argv[i + 1]);
         else if (k == "--kappa2")     kappa[2] = std::atof(argv[i + 1]);
+        // 아래 넷은 tum_odometry.cpp 와 이름도 의미도 같아야 한다. 이름이
+        // 갈리면 같은 값을 넣었다고 믿으면서 다른 값을 넣게 된다.
+        else if (k == "--depth-min")   depth_min_cli = std::atof(argv[i + 1]);
+        else if (k == "--depth-max")   depth_max_cli = std::atof(argv[i + 1]);
+        // sigma_Z = c * Z^2. 스테레오면 c = sigma_d/(f*B).
+        else if (k == "--depth-sigma-rel") cfg.depth_sigma_rel = std::atof(argv[i + 1]);
+        // 로버스트 커널 중재. 끄면 완화 커널 하나로만 푼다(이 기구 도입 전 동작).
+        else if (k == "--arbitrate")   cfg.robust_arbitration = std::atoi(argv[i + 1]) != 0;
+        // Tier 2 만 따로 흔들기 위한 것. Tier 0 의 깊이 창을 그대로 주면 KITTI
+        // 에서 평면 추출이 80 m 까지 보게 되는데, 그것이 도움인지 해인지는
+        // 재 봐야 아는 것이지 가정할 것이 아니다.
+        else if (k == "--plane-depth-max") plane_depth_max_cli = std::atof(argv[i + 1]);
+        // PlaneExtractorConfig 의 절대 미터 문턱들. 실내 0.2~15 m 에 맞춰진 값이라
+        // KITTI(3.2~60 m)에서는 Tier 2 를 통째로 비운다 - 실측으로 확인한 사실이다.
+        //
+        //   depth_discontinuity 0.15 m 는 "이웃 화소가 같은 표면인가" 를 묻는데,
+        //   노면은 멀어지면서 z 가 z^2 에 비례해 늘어난다. stride 4, fy=707,
+        //   카메라 높이 1.65 m 면 이웃 격자 간 정상 단차가 4*z^2/(fy*h) 이고
+        //   z=15 m 에서 0.77 m 다. 즉 노면 자체가 매 화소 불연속으로 판정된다.
+        //   실측: kitti_04 첫 프레임에서 세로 이웃의 74.5 % 가 0.15 m 를 넘고,
+        //   그 결과 136 프레임 중 130 프레임에서 평면이 0 개다.
+        //
+        // 옳은 고침은 이 문턱을 상대값(c*z^2)으로 바꾸는 것이고 그것은
+        // PlaneExtractor 의 일이다. 여기서는 고치지 않고, 문턱을 밖에서 흔들어
+        // "Tier 2 가 재료를 받으면 kitti_04 에 도움이 되는가" 를 잴 수 있게만 한다.
+        else if (k == "--plane-disc")      plane_disc_cli = std::atof(argv[i + 1]);
+        else if (k == "--plane-min-inliers")
+            plane_min_inliers_cli = std::atoi(argv[i + 1]);
+        else if (k == "--plane-dist-bin")  plane_dist_bin_cli = std::atof(argv[i + 1]);
+        else if (k == "--plane-refine")    plane_refine_cli = std::atof(argv[i + 1]);
+        // SPA 가 요구하는 최소 평면 대응 수. 기본 2 다.
+        //
+        // 이 과제가 물으려던 것은 "지면 평면 구속이 kitti_04 의 수직 표류를
+        // 줄이는가" 였고, 지면은 평면 **하나** 다. 도로 장면에는 그것 말고 잡히는
+        // 평면이 없다 (실측: kitti_04 에서 문턱을 풀어도 프레임당 평면 최대 1 개,
+        // 2 개인 프레임은 136 중 1 개). min_matches=2 는 그 한 개를 거부하므로
+        // Tier 2 는 어떤 설정에서도 발동하지 않는다.
+        //
+        // 1 로 내리는 것은 근거 없는 완화가 아니다. StructuralAligner 는 랭크
+        // 부족을 이미 다루도록 쓰여 있다 - rotation_prior_weight 주석이 "법선이
+        // 한 방향뿐이면 Kabsch 해가 1-매개변수 족" 인 경우를 명시하고, 병진도
+        // degeneracy_ratio 로 절단한다. 즉 평면 하나는 "못 푸는 입력" 이 아니라
+        // "3 자유도만 구속하는 입력" 이다. 그것이 도움인지 해인지를 재려면
+        // 일단 들여보내야 한다.
+        else if (k == "--spa-min-matches")
+            spa_min_matches_cli = std::atoi(argv[i + 1]);
+        else if (k == "--levels")      cfg.pyramid_levels = std::atoi(argv[i + 1]);
+        else if (k == "--huber-k")     cfg.huber_k = std::atof(argv[i + 1]);
+        else if (k == "--noise-ratio") cfg.huber_noise_ratio = std::atof(argv[i + 1]);
+        else {
+            // 오타로 넣은 옵션이 조용히 무시되면 "같은 설정" 이 아닌 채로 비교표가
+            // 만들어진다. 실패는 시끄러워야 한다.
+            std::cerr << "알 수 없는 옵션: " << k << "\n";
+            return 2;
+        }
     }
 
     const auto rgb_rows   = readIndex(root + "/rgb.txt");
@@ -300,31 +394,58 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // 내부 파라미터/왜곡은 freiburg 그룹마다 다르다. tum_odometry.cpp 와 동일.
-    CameraIntrinsics K;
-    K.width = 640; K.height = 480;
-    cv::Vec<double, 5> dist;
-    if (root.find("freiburg2") != std::string::npos) {
-        K.fx = 520.908620; K.fy = 521.007327; K.cx = 325.141442; K.cy = 249.701764;
-        dist = {0.2312, -0.7849, -0.0033, -0.0001, 0.9172};
-    } else if (root.find("freiburg3") != std::string::npos) {
-        K.fx = 535.4; K.fy = 539.2; K.cx = 320.1; K.cy = 247.6;
-        dist = {0.0, 0.0, 0.0, 0.0, 0.0};
-    } else {
-        K.fx = 517.306408; K.fy = 516.469215; K.cx = 318.643040; K.cy = 255.313989;
-        dist = {0.2624, -0.9531, -0.0054, 0.0026, 1.1633};
-    }
-    constexpr double kDepthScale = 5000.0;
+    // 내부파라미터/왜곡/깊이스케일/깊이범위. 값은 dataset_calib.hpp 한 곳에만
+    // 있고 tum_odometry.cpp 도 같은 함수를 부른다. calib.txt 가 있으면 이긴다.
+    wme_tools::DatasetCalib dc;
+    if (!wme_tools::resolveCalib(root, dc)) return 1;
+    CameraIntrinsics K = dc.K;
+    cv::Vec<double, 5> dist = dc.dist;
+    const double kDepthScale = dc.depth_scale;
+
+    // 정렬기의 유효 깊이도 데이터셋을 따라야 한다. DirectAlignerConfig 의 기본
+    // 40 m 는 TUM 실내를 넉넉히 덮지만 KITTI(최대 80 m)는 자른다.
+    cfg.min_depth = dc.depth_min;
+    cfg.max_depth = dc.depth_max;
+    if (depth_min_cli > 0.0) cfg.min_depth = depth_min_cli;
+    if (depth_max_cli > 0.0) cfg.max_depth = depth_max_cli;
+    node_depth_min = cfg.min_depth;
+    node_depth_max = cfg.max_depth;
+
+    PlaneExtractorConfig pcfg;
+    pcfg.min_depth = cfg.min_depth;
+    pcfg.max_depth = (plane_depth_max_cli > 0.0) ? plane_depth_max_cli : cfg.max_depth;
+    if (plane_disc_cli > 0.0)        pcfg.depth_discontinuity = plane_disc_cli;
+    if (plane_dist_bin_cli > 0.0)    pcfg.distance_bin        = plane_dist_bin_cli;
+    if (plane_refine_cli > 0.0)      pcfg.refine_threshold    = plane_refine_cli;
+    if (plane_min_inliers_cli > 0)
+        pcfg.min_inliers = static_cast<std::size_t>(plane_min_inliers_cli);
+
+    // 설정을 전부 찍는다. 비교표를 나중에 읽을 때 "같은 설정이었나" 를 로그만
+    // 보고 답할 수 있어야 한다.
+    std::cout << "깊이 유효 범위: [" << cfg.min_depth << ", " << cfg.max_depth << "] m"
+              << "  depth_sigma_rel " << cfg.depth_sigma_rel
+              << "  arbitrate " << (cfg.robust_arbitration ? 1 : 0) << "\n"
+              << "평면: 깊이 [" << pcfg.min_depth << ", " << pcfg.max_depth << "] m"
+              << "  disc " << pcfg.depth_discontinuity
+              << "  dist_bin " << pcfg.distance_bin
+              << "  refine " << pcfg.refine_threshold
+              << "  min_inliers " << pcfg.min_inliers << "\n";
+
+    StructuralAlignerConfig scfg;
+    if (spa_min_matches_cli > 0)
+        scfg.min_matches = static_cast<std::size_t>(spa_min_matches_cli);
+    std::cout << "SPA: min_matches " << scfg.min_matches << "\n";
+
     const cv::Matx33d Kcv(K.fx, 0.0, K.cx, 0.0, K.fy, K.cy, 0.0, 0.0, 1.0);
     cv::Mat map1, map2;
     cv::initUndistortRectifyMap(Kcv, dist, cv::Mat(), Kcv,
                                 cv::Size(K.width, K.height), CV_16SC2, map1, map2);
 
-    DirectAligner       aligner{DirectAlignerConfig{}};
+    DirectAligner       aligner{cfg};
     ImageQualityEngine  iq;
     EnvironmentAnalyzer envan;
-    PlaneExtractor      planes_ref_ex, planes_cur_ex;
-    StructuralAligner   spa{StructuralAlignerConfig{}};
+    PlaneExtractor      planes_ref_ex{pcfg}, planes_cur_ex{pcfg};
+    StructuralAligner   spa{scfg};
     ConstellationConfig ccfg;
 
     std::unique_ptr<IYoloRuntime> yolo;
@@ -372,6 +493,19 @@ int main(int argc, char** argv) {
     SE3 velocity       = SE3::identity();
 
     int used = 0, t0_fail = 0;
+    // Tier 1 이 왜 비었는지를 한 티어 안에서 끝까지 따라가기 위한 계수기.
+    // "n=0, abstain no_input" 만 보면 YOLO 가 아무것도 못 봤는지, 봤는데 깊이가
+    // 없어 노드가 안 됐는지, 노드는 됐는데 min_nodes 를 못 넘겼는지 구분이 안 된다.
+    double yolo_det_sum = 0.0;
+    int    yolo_frames = 0;
+    long long node_sum = 0;
+    int    frames_with_dets = 0, frames_nodes_ge_min = 0;
+    // 성좌가 만들어지려면 노드 개수만으로는 부족하다. 쌍 거리가
+    // [min_distance, max_distance] 안에 들어야 역색인이 투표를 하고, 노드
+    // 위치 불확실성이 max_rms_error 보다 작아야 Kabsch 잔차 게이트를 통과한다.
+    // 그 둘을 노드에서 직접 잰다 - 안 재면 "failed" 만 보고 원인을 추측하게 된다.
+    std::vector<double> node_sigmas, node_pair_d;
+    long long pairs_total = 0, pairs_in_range = 0;
     for (const auto& rr : rgb_rows) {
         if (max_frames > 0 && used >= max_frames) break;
 
@@ -407,7 +541,26 @@ int main(int argc, char** argv) {
         std::vector<ConstellationNode> cur_nodes;
         if (yolo) {
             const auto d = yolo->infer(f);
-            if (d.ok()) cur_nodes = nodesFromFrame(d.value(), f, depth_shrink, ccfg.max_nodes);
+            if (d.ok()) {
+                cur_nodes = nodesFromFrame(d.value(), f, depth_shrink, ccfg.max_nodes,
+                                           node_depth_min, node_depth_max);
+                yolo_det_sum += static_cast<double>(d.value().items.size());
+                ++yolo_frames;
+                if (!d.value().items.empty()) ++frames_with_dets;
+                node_sum += static_cast<long long>(cur_nodes.size());
+                if (cur_nodes.size() >= ccfg.min_nodes) ++frames_nodes_ge_min;
+                for (const auto& n : cur_nodes) node_sigmas.push_back(n.sigma);
+                for (std::size_t a = 0; a < cur_nodes.size(); ++a) {
+                    for (std::size_t b = a + 1; b < cur_nodes.size(); ++b) {
+                        const double dd =
+                            (cur_nodes[a].position - cur_nodes[b].position).norm();
+                        ++pairs_total;
+                        node_pair_d.push_back(dd);
+                        if (dd >= ccfg.min_distance && dd <= ccfg.max_distance)
+                            ++pairs_in_range;
+                    }
+                }
+            }
         }
         std::vector<Plane> cur_planes;
         if (auto pr = planes_cur_ex.extract(depth, K); pr.ok()) cur_planes = pr.value();
@@ -540,6 +693,39 @@ int main(int argc, char** argv) {
     }
 
     std::cout << "프레임 " << records.size() << "  Tier0 실패 " << t0_fail << "\n";
+    if (yolo_frames > 0) {
+        // 검출 -> 노드 -> 성좌 성립. 어디서 0 이 되는지가 곧 Tier 1 이 빈 이유다.
+        std::cout << "Tier1 입력: 프레임당 검출 " << (yolo_det_sum / yolo_frames)
+                  << "  검출>0 프레임 " << frames_with_dets << "/" << yolo_frames
+                  << "  프레임당 노드 "
+                  << (static_cast<double>(node_sum) / yolo_frames)
+                  << "  노드>=min_nodes(" << ccfg.min_nodes << ") 프레임 "
+                  << frames_nodes_ge_min << "/" << yolo_frames << "\n";
+        auto med = [](std::vector<double>& v) {
+            if (v.empty()) return -1.0;
+            std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
+            return v[v.size() / 2];
+        };
+        std::cout << "Tier1 기하: 노드 sigma 중앙 " << med(node_sigmas) << " m"
+                  << " (max_rms_error " << ccfg.max_rms_error << " m)"
+                  << "  쌍거리 중앙 " << med(node_pair_d) << " m"
+                  << "  구간 [" << ccfg.min_distance << ", " << ccfg.max_distance
+                  << "] 안 쌍 " << pairs_in_range << "/" << pairs_total << "\n";
+    }
+    {
+        // Tier 2 도 같은 이유로 입력 단계를 따로 본다. 평면이 0 개인 프레임 수가
+        // 곧 "SPA 가 존재하지 않는 프레임" 수다.
+        long long psum = 0;
+        int pzero = 0;
+        for (const auto& r : records) {
+            psum += r.spa_cur_planes;
+            if (r.spa_cur_planes == 0) ++pzero;
+        }
+        std::cout << "Tier2 입력: 프레임당 평면 "
+                  << (records.empty() ? 0.0
+                                      : static_cast<double>(psum) / records.size())
+                  << "  평면 0 개 프레임 " << pzero << "/" << records.size() << "\n";
+    }
     }
 
     // --- 2 패스: ablation 별 융합 + 적분 ------------------------------------
