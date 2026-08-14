@@ -390,6 +390,9 @@ int main(int argc, char** argv) {
         // 알려면 정렬기가 본 수가 그대로 있어야 한다.
         diag << ",align_incons,align_median_z,arbitrated"
                 ",arb_delta_t,arb_c_relaxed,arb_c_tight";
+        // 정보행렬을 쌓을 때 쓴 깊이 잡음 배율. 이것이 있어야 "관측 DOF 가
+        // 떨어졌다" 는 보고가 장면 기하 때문인지 깊이 불신 때문인지 가릴 수 있다.
+        diag << ",depth_sigma_scale,effective_dof";
         diag << "\n";
         diag << std::fixed << std::setprecision(6);
     }
@@ -692,6 +695,7 @@ int main(int argc, char** argv) {
                         << "," << (v.arbitrated ? 1 : 0)
                         << "," << v.arb_delta_t << "," << v.arb_c_relaxed
                         << "," << v.arb_c_tight;
+                    ext << "," << v.depth_sigma_scale << "," << v.effective_dof;
 
                     diag << ext.str() << "\n";
                 }

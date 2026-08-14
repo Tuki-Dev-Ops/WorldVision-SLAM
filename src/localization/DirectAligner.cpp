@@ -199,7 +199,7 @@ void DirectAligner::accumulate(const cv::Mat& cur_gray, const cv::Mat& cur_gx,
                                const SE3& T, double affine_a, double affine_b,
                                double huber, double health, double photo_sigma,
                                std::size_t lo, std::size_t hi, Accumulator& acc,
-                               int cluster_grid) const {
+                               int cluster_grid, double depth_sigma_scale) const {
     const double fx = K.fx, fy = K.fy, cx = K.cx, cy = K.cy;
     const double min_z = cfg_.min_depth;
 
@@ -255,9 +255,12 @@ void DirectAligner::accumulate(const cv::Mat& cur_gray, const cv::Mat& cur_gx,
         // 이것은 이상치 제거가 아니다. 이상치는 huber 가 잔차 크기로 자르고,
         // 여기는 잔차가 **작아도** 깊이가 못 미더우면 무게를 내린다 - 두 신호가
         // 다르다. 먼 벽의 잔차는 대개 작다.
+        //
+        // depth_sigma_scale 은 이 프레임이 **측정한** 깊이 오차가 센서 모델보다
+        // 얼마나 큰지다 (align() 의 해당 주석). 1 이면 모델 그대로.
         if (photo_sigma > 0.0 && cfg_.depth_sigma_rel > 0.0) {
             const double dr_dd = Jp.dot(Q - T.translation()) / d;
-            const double sigma_d = cfg_.depth_sigma_rel * d * d;
+            const double sigma_d = depth_sigma_scale * cfg_.depth_sigma_rel * d * d;
             const double var_depth = (dr_dd * sigma_d) * (dr_dd * sigma_d);
             const double photo_var = photo_sigma * photo_sigma;
             w *= photo_var / (photo_var + var_depth);
@@ -531,6 +534,11 @@ Result<AlignmentResult> DirectAligner::align(const Frame& ref, const Frame& cur,
     Accumulator final_acc;
     bool any_level_converged = false;
 
+    // final_acc 를 낸 레벨과 그때의 커널 임계. 아래에서 깊이 잡음 배율을 바꿔
+    // 정보행렬만 다시 쌓을 때 **같은 조건** 으로 쌓아야 비교가 성립한다.
+    int    final_level = -1;
+    double final_huber = std::numeric_limits<double>::infinity();
+
     // 거친 레벨부터 세밀한 레벨로. 큰 변위는 거친 레벨에서만 잡힌다.
     for (int level = levels - 1; level >= 0; --level) {
         selectPoints(*rp, ref.static_mask, quality, level);
@@ -740,7 +748,9 @@ Result<AlignmentResult> DirectAligner::align(const Frame& ref, const Frame& cur,
             }
         }
 
-        final_acc = fin;
+        final_acc   = fin;
+        final_level = level;
+        final_huber = huber;
     }
 
     if (!any_level_converged || final_acc.used < cfg_.min_points) {
@@ -813,6 +823,81 @@ Result<AlignmentResult> DirectAligner::align(const Frame& ref, const Frame& cur,
         }
     }
 
+    // --- 깊이 잡음을 모델값이 아니라 측정값으로 -----------------------------
+    //
+    // 여기까지 정보행렬은 sigma_Z = c*Z^2 라는 **모델** 위에 서 있었다. c 는
+    // 센서 상수(스테레오라면 sigma_d/(f*B))이므로 프레임마다 같다. 그래서 깊이가
+    // 실제로 그 모델보다 나쁜 프레임에서도 정보행렬은 같은 확신을 보고했다.
+    //
+    // 실측이 그 결과를 잰다 (kitti_04, 133 프레임):
+    //   depth_incons 와 프레임간 수직오차의 상관   +0.95
+    //   observable_dof                            133 프레임 내내 상수 6
+    //   cond                                      +0.18
+    // 즉 이 실패를 보는 채널은 있는데 퇴화 보고가 그것을 안 읽고 있었다.
+    //
+    // 읽는 방법은 새로 만들지 않는다. depth_consistency 는 이미 "정렬에 쓰이지
+    // 않은 관측(cur 깊이)과의 상대 불일치" 이고, 그 값이 센서 잡음만으로 설명
+    // 가능한 한계 depthNoiseFloor() = sqrt(2)*c*Z 도 이미 유도되어 있다. 둘의 비
+    //
+    //     rho = depth_consistency / (sqrt(2) * c * Z)
+    //
+    // 는 "이 프레임의 깊이 오차가 센서 모델보다 몇 배인가" 다. 무차원이고,
+    // 적합한 상수가 들어 있지 않다. rho > 1 이면 sigma_Z 를 rho 배로 키워
+    // **같은 식** 으로 정보행렬을 다시 쌓는다.
+    //
+    //   var_depth,i = (dr_i/dd)^2 * (rho * c * d_i^2)^2
+    //   w_i        *= sigma_I^2 / (sigma_I^2 + var_depth,i)
+    //
+    // 왜 이것이 "depth_incons 를 DOF 에 곱하는 것" 과 다른가. 곱셈은 방향을
+    // 구분하지 못한다. 여기서는 rho 가 점별 sigma_Z 로 들어가고, 그 무게가
+    // dr/dd = Jp.(Q-t)/d - 즉 **그 점의 잔차가 깊이에 얼마나 민감한가** - 에
+    // 따라 다르게 걸린다. 먼 점과 시선 방향으로 기울어진 점이 먼저 빠지므로
+    // 정보의 감소가 방향에 따라 다르게 나타난다. 정보행렬은 여전히 "관측이
+    // 실제로 얼마나 구속하는가" 를 재고 있고, 다만 그 관측의 잡음을 모델값이
+    // 아니라 이 프레임이 잰 값으로 쓴다.
+    //
+    // 한 방향으로만 쓴다. rho 는 1 아래로 내려가지 않는다 - 측정이 모델보다
+    // 좋게 나왔다고 확신을 키우면, 표본 잡음이 확신으로 바뀐다.
+    //
+    // 추정은 건드리지 않는다. 이 재누산은 T 가 확정된 뒤에 돌고 결과는
+    // 정보행렬에만 들어간다 (T, a, b, rmse, inlier 는 그대로다).
+    double rho = 1.0;
+    if (cfg_.depth_sigma_rel > 0.0 && result.depth_consistency >= 0.0 &&
+        final_level >= 0 && quality != nullptr) {
+        const double floor = result.depthNoiseFloor(cfg_.depth_sigma_rel);
+        if (floor > 0.0) rho = std::max(1.0, result.depth_consistency / floor);
+    }
+    result.depth_sigma_scale = rho;
+
+    if (rho > 1.0) {
+        // final_acc 를 낸 레벨을 그대로 다시 고른다. 레벨이 바뀌면 점 집합이
+        // 바뀌어 rho 의 효과와 레벨 차이가 섞인다.
+        const auto fl = static_cast<std::size_t>(final_level);
+        selectPoints(*rp, ref.static_mask, quality, final_level);
+        if (points_.size() >= cfg_.min_points) {
+            Accumulator re;
+            abs_res_.assign(points_.size(), -1.f);
+            if (cfg_.information_model == InformationModel::ClusterRobust) {
+                scores_.assign(static_cast<std::size_t>(cfg_.info_cluster_grid) *
+                                   static_cast<std::size_t>(cfg_.info_cluster_grid),
+                               Eigen::Matrix<double, 8, 1>::Zero());
+                score_count_.assign(scores_.size(), 0u);
+            }
+            accumulate(cp->gray[fl], cp->grad_x[fl], cp->grad_y[fl], rp->intrinsics[fl],
+                       T, a, b, final_huber, health_delta, noise_sigma,
+                       0, points_.size(), re,
+                       cfg_.information_model == InformationModel::ClusterRobust
+                           ? cfg_.info_cluster_grid : 0,
+                       rho);
+            // 점이 다 빠져 버리면 판정할 근거가 없다. 그때는 모델값 그대로 둔다 -
+            // "재 보니 아무것도 안 남았다" 를 "정보가 0 이다" 로 접으면 안 된다.
+            if (re.used >= cfg_.min_points) final_acc = re;
+            else                            result.depth_sigma_scale = 1.0;
+        } else {
+            result.depth_sigma_scale = 1.0;
+        }
+    }
+
     // --- 정보행렬 -----------------------------------------------------------
     // 아핀 자유도는 주변화한다. 그대로 두면 노출 변화에 대한 불확실성이
     // 포즈 확신도로 잘못 새어 들어간다. 잡음 모델은 cfg_.information_model.
@@ -846,6 +931,15 @@ Result<AlignmentResult> DirectAligner::align(const Frame& ref, const Frame& cur,
         for (int k = 0; k < 6; ++k) {
             if (result.eigenvalues(k) > max_ev * cfg_.degeneracy_ratio) ++result.observable_dof;
         }
+        // 같은 스펙트럼을 문턱 없이 읽은 유효 자유도 (effective_dof 주석).
+        // 위의 계단이 KITTI 에서 한 번도 밟히지 않는다는 실측이 이 항의 근거다.
+        const double sum_ev = std::max(1e-300, ev.sum());
+        double h = 0.0;
+        for (int k = 0; k < 6; ++k) {
+            const double p = std::max(1e-300, ev(k) / sum_ev);
+            h -= p * std::log(p);
+        }
+        result.effective_dof = std::exp(h);
         // 가장 약한 축 = 최소 고유값의 고유벡터. Tier 2 가 채워야 할 방향.
         result.weakest_direction = es.eigenvectors().col(0);
     }

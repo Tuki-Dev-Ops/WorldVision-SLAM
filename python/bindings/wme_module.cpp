@@ -377,6 +377,12 @@ PYBIND11_MODULE(_core, m) {
         .def_readwrite("track_persistence_scale", &EnvironmentState::track_persistence_scale)
         .def_readonly("detection_threshold_scale", &EnvironmentState::detection_threshold_scale)
         .def_readonly("scene_complexity", &EnvironmentState::scene_complexity)
+        // 비/눈 판정 가능 여부. 이 둘이 노출되지 않으면 자기운동 게이트가
+        // 기권했는지 밖에서 확인할 수 없고, 그러면 rain=0 이 "비 없음" 인지
+        // "잴 수 없음" 인지 차등 테스트가 구별하지 못한다 (27 절).
+        .def_readonly("particles_measurable", &EnvironmentState::particles_measurable)
+        .def_readonly("particle_window_shift_px",
+                      &EnvironmentState::particle_window_shift_px)
         .def_property_readonly("lighting", [](const EnvironmentState& s) {
             return std::string(toString(s.lighting)); })
         .def_property_readonly("weather", [](const EnvironmentState& s) {
@@ -683,6 +689,10 @@ PYBIND11_MODULE(_core, m) {
         .def_readonly("information", &AlignmentResult::information)
         .def_readonly("eigenvalues", &AlignmentResult::eigenvalues)
         .def_readonly("observable_dof", &AlignmentResult::observable_dof)
+        // 문턱 없는 유효 자유도와 정보행렬에 실제로 쓴 깊이 잡음 배율.
+        // 노출하지 않으면 파이썬 쪽에서 차등 검증을 할 수 없다.
+        .def_readonly("effective_dof", &AlignmentResult::effective_dof)
+        .def_readonly("depth_sigma_scale", &AlignmentResult::depth_sigma_scale)
         .def_readonly("affine_a", &AlignmentResult::affine_a)
         .def_readonly("affine_b", &AlignmentResult::affine_b)
         .def_readonly("photometric_rmse", &AlignmentResult::photometric_rmse)

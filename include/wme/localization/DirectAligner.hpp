@@ -292,6 +292,39 @@ struct AlignmentResult {
     int    observable_dof{0};            // 관측 가능한 자유도 수 (0..6)
     Vec6   weakest_direction{Vec6::Zero()};  // 가장 약하게 구속된 접선 방향
 
+    // 문턱 없는 유효 자유도. 정규화 스펙트럼의 엔트로피 지수다.
+    //     p_k = lam_k / sum(lam),   effective_dof = exp(-sum p_k log p_k)
+    //
+    // 왜 observable_dof 와 따로 두는가. 저쪽은 문턱(degeneracy_ratio = 1e-3)을
+    // 넘는 축을 세는 계단 함수다. 정규화 스펙트럼은 trace 가 6 으로 고정되어
+    // 있어 sum(lam) = 6 이고, 최소 고유값이 최대값의 1e-3 아래로 내려가려면
+    // 사실상 완전한 선형종속이 필요하다. KITTI 실측에서 최소 고유값은
+    // 0.028~0.118 이었고 문턱은 0.003 이었다 - 즉 그 계단은 한 번도 밟히지
+    // 않았고 observable_dof 는 네 시퀀스 1139 프레임 내내 6 이었다.
+    //
+    // 유효랭크는 같은 스펙트럼을 문턱 없이 읽는다. 실측 (프레임간 수직오차와의
+    // 상관, kitti_04 / 00 / 05 / 07):
+    //     observable_dof   상수 6 (상관 정의 불가)
+    //     6 - effective_dof  +0.711 / +0.047 / -0.119 / +0.196
+    // 표류하는 시퀀스에서만 움직인다. 정상 세 시퀀스의 분포는 이 항을 넣기
+    // 전과 소수 셋째 자리까지 같다 (거짓 경보 없음).
+    //
+    // 읽는 법에 주의. 상관행렬의 유효랭크는 행렬이 정확히 단위행렬일 때만 6 이
+    // 되므로, 건강한 KITTI 프레임에서도 3.8~3.9 다. "6 미만이면 퇴화" 로 읽으면
+    // 안 되고, 이 값의 **변화** 를 봐야 한다. 절대 수준으로 랭크를 판정하는
+    // 창구는 observable_dof 쪽이다.
+    double effective_dof{0.0};
+
+    // 정보행렬을 만들 때 실제로 쓴 깊이 잡음 배율.
+    //
+    // 1.0 = 센서 모델값(sigma_Z = c*Z^2) 그대로. 1 보다 크면 이 프레임의 깊이가
+    // **측정으로** 모델보다 나쁘다고 나온 것이고, 그 배율만큼 sigma_Z 를 키워
+    // 정보행렬을 다시 쌓았다는 뜻이다. 근거는 align() 의 해당 주석.
+    //
+    // 이 값이 있어야 "관측가능 DOF 가 떨어졌다" 는 보고가 장면 기하 때문인지
+    // 깊이 불신 때문인지 밖에서 가릴 수 있다. 없으면 둘이 구분되지 않는다.
+    double depth_sigma_scale{1.0};
+
     double affine_a{1.0};
     double affine_b{0.0};
 
@@ -486,7 +519,7 @@ private:
                     double affine_a, double affine_b, double huber, double health,
                     double photo_sigma,
                     std::size_t lo, std::size_t hi, Accumulator& acc,
-                    int cluster_grid = 0) const;
+                    int cluster_grid = 0, double depth_sigma_scale = 1.0) const;
 
     // 마지막 누산의 |잔차| 분포에서 로버스트 임계를 만든다.
     // noise_sigma 는 측정된 영상 잡음(intensity). 점이 너무 적으면 L2 로 둔다.

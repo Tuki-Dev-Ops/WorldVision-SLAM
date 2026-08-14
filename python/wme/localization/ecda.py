@@ -64,6 +64,14 @@ class EcdaConfig:
     max_depth: float = 40.0
     # sigma_Z = depth_sigma_rel * Z^2 (1/m). 0 이면 끈다.
     # C++ DirectAlignerConfig::depth_sigma_rel 과 같은 뜻. 근거는 그쪽 주석.
+    #
+    # 미구현 차이 하나를 명시한다. C++ 는 정보행렬을 쌓을 때 이 c 를 그대로
+    # 쓰지 않고, cur 깊이맵과의 불일치가 센서 잡음 바닥을 넘으면 그 배율만큼
+    # sigma_Z 를 키워 다시 쌓는다 (AlignmentResult::depth_sigma_scale). 이 오라클은
+    # 기하 정합성 채널(cur 깊이)을 아예 갖고 있지 않아 그 배율이 항상 1 이다.
+    # 차등 테스트는 cur 깊이가 없는 합성 장면에서 돌므로 C++ 쪽 배율도 1 이고
+    # 비교가 성립한다 - cur 깊이를 주는 차등 케이스를 추가하려면 이쪽에도
+    # 그 채널을 먼저 포팅해야 한다.
     depth_sigma_rel: float = 0.0
     # 4-이웃 깊이 상대차가 이보다 크면 경계로 보고 버린다.
     # C++ DirectAlignerConfig::depth_edge_ratio 와 같은 값이어야 한다.
@@ -134,6 +142,11 @@ class EcdaResult:
     # (예: 원거리 정면 평면에서 y축 회전 vs x축 병진).
     # 랭크 판정만 보고하면 그 상황을 정상으로 오인한다.
     condition_number: float = np.inf
+    # 문턱 없는 유효 자유도. exp(-sum p log p), p = lam/sum(lam).
+    # C++ AlignmentResult::effective_dof 와 같은 뜻이고 근거는 그쪽 주석이다.
+    # observable_dof 의 계단(1e-3)이 KITTI 에서 한 번도 밟히지 않는다는 실측이
+    # 이 항의 이유다.
+    effective_dof: float = 0.0
     weakest_direction: np.ndarray = field(default_factory=lambda: np.zeros(6))
     affine_a: float = 1.0
     affine_b: float = 0.0
@@ -553,6 +566,9 @@ def align(ref_gray: np.ndarray, ref_depth: np.ndarray, cur_gray: np.ndarray,
     result.eigenvalues = eig
     result.observable_dof = int(np.sum(eig > max(eig[0], 1e-12) * cfg.degeneracy_ratio))
     result.condition_number = float(eig[0] / max(eig[-1], 1e-12))
+    # 같은 스펙트럼을 문턱 없이 읽은 유효 자유도 (effective_dof 주석).
+    p = np.maximum(eig, 1e-300) / max(float(np.sum(eig)), 1e-300)
+    result.effective_dof = float(np.exp(-np.sum(p * np.log(p))))
     # 가장 약하게 구속된 접선 방향. Tier 2(SPA) 가 채워야 할 축이다.
     result.weakest_direction = vecs[:, -1]
     return result
