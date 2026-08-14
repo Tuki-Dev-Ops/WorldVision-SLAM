@@ -46,7 +46,13 @@ struct TokenStoreConfig {
     bool   allow_cross_class{false};        // 클래스가 다른 연관 허용 여부
 
     // --- 3D 추정 -----------------------------------------------------------
-    double depth_noise_coeff{0.006};        // sigma_z = coeff * z^2 (스테레오/ToF 공통형)
+    // sigma_z = coeff * z^2 의 coeff. 기본값은 **구조광(Kinect/TUM)** 계수이지
+    // "스테레오/ToF 공통형" 이 아니다 - 그렇게 적어 두었던 탓에 같은 값이
+    // KITTI 스테레오에 그대로 쓰였고, 20 m 에서 sigma_z 를 2.4 m 로 부풀려
+    // Tier 1 성좌를 통째로 죽였다 (nodePositionSigma 주석의 실측).
+    // 스테레오에서는 c = sigma_d/(f*B) 로 유도된다. KITTI gray 는 7.8e-4 다.
+    // 데이터셋이 바뀌면 이 값도 바꿔야 한다.
+    double depth_noise_coeff{kStructuredLightDepthSigmaRel};
     double bearing_noise_px{2.0};           // 박스 중심 픽셀 잡음
     double no_depth_sigma{5.0};             // 깊이 없을 때 위치 표준편차 (m)
     double depth_sample_shrink{0.5};        // 박스 중앙 이 비율만 깊이 샘플에 사용

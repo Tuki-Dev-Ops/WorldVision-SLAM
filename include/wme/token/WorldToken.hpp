@@ -22,6 +22,17 @@
 
 namespace wme {
 
+// 깊이의 상대 잡음 계수. sigma_z = c * z^2 의 c 이고, **센서가 정한다**.
+//
+// 여기 있는 값은 구조광(Kinect/TUM RGB-D)의 적합값이다. 스테레오는 시차에서
+// c = sigma_d/(f*B) 로 유도되며 (docs/06-results.md 25.21) KITTI gray 는
+// 0.3 px / (718.856 * 0.537) = 7.8e-4 로 여기보다 여덟 배 작다.
+//
+// 한 곳에만 둔다. 같은 6e-3 이 TokenStoreConfig 와 성좌 노드 생성기에 각각
+// 복사되어 있었고, 후자에는 "스테레오/ToF 공통형" 이라는 잘못된 딱지가 붙어
+// 있었다. 그 딱지 때문에 실내 계수가 자동차 규모에 그대로 적용됐다.
+inline constexpr double kStructuredLightDepthSigmaRel = 0.006;
+
 // 객체 생애 단계. 관측이 끊겨도 즉시 삭제하지 않는다.
 enum class TokenLifecycle : std::uint8_t {
     Provisional,  // 관측 1~2회. 아직 세계에 편입 안 됨

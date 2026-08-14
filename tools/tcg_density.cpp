@@ -18,6 +18,17 @@
 //
 // 사용:
 //   wme_tcg_density <시퀀스> --yolo <model.onnx> [--kf-dist M] [--window N]
+//                   [--nodes out.csv] [--stride N] [--conf T]
+//
+// --nodes 는 밀도표와 별개의 두 번째 목적이다: 성좌 노드를 그대로 CSV 로 흘려
+// 보내 **노드 위치 오차를 진리값 포즈로 실측** 할 수 있게 한다. sigma 모델
+// (sz = c*z^2) 의 c 가 맞는지, Kabsch 잔차 게이트 max_rms_error 가 맞는지는
+// 둘 중 하나를 다른 하나에 맞춰 올리는 것으로는 판정되지 않는다. 같은 물체를
+// 두 프레임에서 본 위치의 차이가 유일한 외부 근거다.
+// 계산 규약은 tools/tum_fusion.cpp 의 nodesFromFrame 과 같아야 한다 - 다르면
+// 여기서 잰 sigma 가 Tier 1 이 실제로 쓰는 sigma 가 아니다.
+
+#include "dataset_calib.hpp"
 
 #include "wme/core/Frame.hpp"
 #include "wme/perception/YoloRuntimeOrt.hpp"
@@ -68,7 +79,13 @@ int nearest(const std::vector<IndexRow>& rows, double stamp, double tol) {
 }
 
 // 박스 중앙 절반의 중앙값 깊이. 한 화소만 보면 구멍 하나로 노드가 사라진다.
-bool boxDepth(const cv::Mat& depth, const wme::Detection& d, double& z) {
+//
+// 유효 범위는 데이터셋에서 온다. 예전에는 `zz > 0.1 && zz < 8.0` 이 박혀 있었고
+// 그것은 TUM RGB-D 센서의 범위다 - KITTI(유효 [3.2, 80] m)에서는 노드의 거의
+// 전부가 상한에 잘려 이 도구가 "밀도가 낮다" 는 잘못된 답을 냈다.
+// 같은 상수가 두 도구를 굶긴 사고가 dataset_calib.hpp 머리말에 적혀 있다.
+bool boxDepth(const cv::Mat& depth, const wme::Detection& d, double zmin, double zmax,
+              double& z) {
     const int u = static_cast<int>(d.box.x + d.box.width * 0.5);
     const int v = static_cast<int>(d.box.y + d.box.height * 0.5);
     const int hw = std::max(1, static_cast<int>(d.box.width * 0.25));
@@ -77,13 +94,69 @@ bool boxDepth(const cv::Mat& depth, const wme::Detection& d, double& z) {
     for (int y = std::max(0, v - hh); y < std::min(depth.rows, v + hh); ++y) {
         for (int x = std::max(0, u - hw); x < std::min(depth.cols, u + hw); ++x) {
             const float zz = depth.at<float>(y, x);
-            if (zz > 0.1F && zz < 8.0F) zs.push_back(zz);
+            if (std::isfinite(zz) && zz > static_cast<float>(zmin) &&
+                zz < static_cast<float>(zmax)) zs.push_back(zz);
         }
     }
     if (zs.size() < 8) return false;
     std::nth_element(zs.begin(), zs.begin() + zs.size() / 2, zs.end());
     z = zs[zs.size() / 2];
     return true;
+}
+
+// 성좌 노드 한 프레임분을 CSV 로 흘린다.
+//
+// 계산은 tools/tum_fusion.cpp 의 nodesFromFrame 을 그대로 옮긴 것이다 -
+// 박스 중앙 절반의 중앙값 깊이, 반치수 무게중심 보정, 그리고 sigma 모델.
+// sigma_model 은 "현재 코드가 믿는 값" 이고 이 열의 존재 이유는 그것을 실측과
+// 나란히 놓기 위해서다. 값이 아니라 비교가 목적이므로 여기서 고치지 않는다.
+void dumpNodes(std::ofstream& out, const wme::DetectionSet& dets, const cv::Mat& depth,
+               const wme::CameraIntrinsics& K, double zmin, double zmax,
+               int frame_index, double stamp) {
+    constexpr double kShrink = 0.5;      // tum_fusion 의 --shrink 기본값
+    constexpr double kSzCoeff = 0.006;   // 현행 sz = c*z^2 의 c
+    constexpr double kBearingPx = 2.0;
+
+    for (const auto& d : dets.items) {
+        const float cxb = d.box.x + d.box.width * 0.5f;
+        const float cyb = d.box.y + d.box.height * 0.5f;
+        const float hw = d.box.width  * 0.5f * static_cast<float>(kShrink);
+        const float hh = d.box.height * 0.5f * static_cast<float>(kShrink);
+        const int x0 = std::max(0, static_cast<int>(std::floor(cxb - hw)));
+        const int y0 = std::max(0, static_cast<int>(std::floor(cyb - hh)));
+        const int x1 = std::min(K.width,  static_cast<int>(std::ceil(cxb + hw)));
+        const int y1 = std::min(K.height, static_cast<int>(std::ceil(cyb + hh)));
+        if (x1 <= x0 || y1 <= y0) continue;
+
+        std::vector<float> vals;
+        for (int y = y0; y < y1; ++y) {
+            const float* row = depth.ptr<float>(y);
+            for (int x = x0; x < x1; ++x) {
+                const float z = row[x];
+                if (std::isfinite(z) && z > static_cast<float>(zmin) &&
+                    z < static_cast<float>(zmax)) vals.push_back(z);
+            }
+        }
+        if (vals.size() < 8) continue;
+        const std::size_t mid = vals.size() / 2;
+        std::nth_element(vals.begin(), vals.begin() + static_cast<std::ptrdiff_t>(mid),
+                         vals.end());
+        const double z_surface = vals[mid];
+        const double z = z_surface +
+                         0.25 * (d.box.width * z_surface / K.fx +
+                                 d.box.height * z_surface / K.fy);
+
+        const wme::Vec3 p = K.backproject(wme::Vec2(cxb, cyb), z);
+        const double sz = kSzCoeff * z * z;
+        const double sx = kBearingPx * z / K.fx;
+        const double sy = kBearingPx * z / K.fy;
+        const double sigma = std::sqrt((sx * sx + sy * sy + sz * sz) / 3.0);
+
+        out << frame_index << "," << std::fixed << std::setprecision(6) << stamp << ","
+            << d.class_id << "," << d.confidence << ","
+            << cxb << "," << cyb << "," << z_surface << "," << z << ","
+            << p.x() << "," << p.y() << "," << p.z() << "," << sigma << "\n";
+    }
 }
 
 }  // namespace
@@ -101,41 +174,43 @@ int main(int argc, char** argv) {
     std::string model;
     double kf_dist = 0.15;
     int    window = 5;
-    std::string csv_path;
+    int    stride = 10;
+    double conf_lo = 0.10;
+    std::string csv_path, nodes_path;
     for (int i = 2; i + 1 < argc; i += 2) {
         const std::string k = argv[i];
         if (k == "--yolo") model = argv[i + 1];
         else if (k == "--kf-dist") kf_dist = std::atof(argv[i + 1]);
         else if (k == "--window") window = std::atoi(argv[i + 1]);
         else if (k == "--csv") csv_path = argv[i + 1];
+        else if (k == "--nodes") nodes_path = argv[i + 1];
+        else if (k == "--stride") stride = std::atoi(argv[i + 1]);
+        else if (k == "--conf") conf_lo = std::atof(argv[i + 1]);
     }
     if (model.empty()) { std::cerr << "--yolo 가 필요하다\n"; return 2; }
+    if (stride < 1) stride = 1;
 
     const auto rgb = readIndex(root + "/rgb.txt");
     const auto dep = readIndex(root + "/depth.txt");
     if (rgb.empty() || dep.empty()) { std::cerr << "인덱스를 읽지 못했다\n"; return 1; }
 
-    double fx, fy, cx, cy;
-    cv::Vec<double, 5> dist;
-    if (root.find("freiburg2") != std::string::npos) {
-        fx = 520.908620; fy = 521.007327; cx = 325.141442; cy = 249.701764;
-        dist = {0.2312, -0.7849, -0.0033, -0.0001, 0.9172};
-    } else if (root.find("freiburg3") != std::string::npos) {
-        fx = 535.4; fy = 539.2; cx = 320.1; cy = 247.6; dist = {0, 0, 0, 0, 0};
-    } else {
-        fx = 517.306408; fy = 516.469215; cx = 318.643040; cy = 255.313989;
-        dist = {0.2624, -0.9531, -0.0054, 0.0026, 1.1633};
-    }
+    // 내부파라미터/왜곡/깊이스케일/유효깊이는 시퀀스가 정한다. 경로에
+    // "freiburg" 가 들어있는지로 고르던 예전 방식은 KITTI 에서 조용히 틀린다.
+    wme_tools::DatasetCalib dc;
+    if (!wme_tools::resolveCalib(root, dc)) return 1;
+    const wme::CameraIntrinsics K = dc.K;
+    const double fx = K.fx, fy = K.fy, cx = K.cx, cy = K.cy;
     const cv::Matx33d Kcv(fx, 0, cx, 0, fy, cy, 0, 0, 1);
     cv::Mat m1, m2;
-    cv::initUndistortRectifyMap(Kcv, dist, cv::Mat(), Kcv, cv::Size(640, 480), CV_16SC2, m1, m2);
+    cv::initUndistortRectifyMap(Kcv, dc.dist, cv::Mat(), Kcv,
+                                cv::Size(K.width, K.height), CV_16SC2, m1, m2);
 
     // 임계를 여러 개 보려면 가장 낮은 값으로 한 번 추론하고 뒤에서 걸러야 한다.
     // 임계마다 다시 추론하면 같은 영상을 여러 번 돌리는 낭비이고, 무엇보다
     // NMS 가 임계에 따라 다르게 작동해 비교가 흐려진다.
     wme::YoloConfig yc;
     yc.model_path = model;
-    yc.confidence_threshold = 0.10F;
+    yc.confidence_threshold = static_cast<float>(conf_lo);
     auto rt = wme::YoloRuntimeOrt::create(yc);
     if (!rt.ok()) { std::cerr << "YOLO 로드 실패: " << rt.error().message() << "\n"; return 1; }
     auto yolo = std::move(rt.value());
@@ -147,6 +222,15 @@ int main(int argc, char** argv) {
     if (!csv_path.empty()) {
         csv.open(csv_path);
         csv << "stamp,raw25,raw15,raw10,depth25,depth15,depth10,cls25,win25\n";
+    }
+
+    // 노드 덤프. tum_fusion.cpp 의 nodesFromFrame 과 같은 규약으로 계산한 값을
+    // 그대로 흘린다. 진리값 포즈와 맞춰 노드 위치 오차를 재는 것이 목적이므로
+    // 여기서는 걸러내지 않는다 - max_nodes 절단도, sigma 정렬도 하지 않는다.
+    std::ofstream ncsv;
+    if (!nodes_path.empty()) {
+        ncsv.open(nodes_path);
+        ncsv << "frame,stamp,class_id,conf,u,v,z_surface,z,X,Y,Z,sigma_model\n";
     }
 
     // 창 누적: 최근 N 키프레임의 노드 수를 합친다. 상대 포즈가 필요하므로
@@ -163,7 +247,8 @@ int main(int argc, char** argv) {
     for (std::size_t fi = 0; fi < rgb.size(); ++fi) {
         // 진리값 포즈가 없으므로 프레임 간격으로 키프레임을 흉내낸다. 이 도구는
         // 밀도만 재므로 간격 규칙의 정확성은 결론에 영향을 주지 않는다.
-        if (static_cast<int>(fi) - last_kf_idx < 10) continue;
+        // (--nodes 모드에서는 --stride 1 로 두어 인접 프레임 쌍을 만든다.)
+        if (static_cast<int>(fi) - last_kf_idx < stride) continue;
         const std::string rf = root + "/" + rgb[fi].file;
         if (!fileExists(rf)) continue;
         const int di = nearest(dep, rgb[fi].stamp, 0.02);
@@ -177,7 +262,7 @@ int main(int argc, char** argv) {
 
         cv::Mat bu, d32, du;
         cv::remap(bgr, bu, m1, m2, cv::INTER_LINEAR);
-        draw.convertTo(d32, CV_32F, 1.0 / 5000.0);
+        draw.convertTo(d32, CV_32F, 1.0 / dc.depth_scale);
         cv::remap(d32, du, m1, m2, cv::INTER_NEAREST);
         cv::Mat gray;
         cv::cvtColor(bu, gray, cv::COLOR_BGR2GRAY);
@@ -187,19 +272,20 @@ int main(int argc, char** argv) {
         f.stamp = wme::Timestamp::fromSeconds(rgb[fi].stamp);
         f.gray = gray;
         f.depth = du;
-        wme::CameraIntrinsics K;
-        K.width = 640; K.height = 480; K.fx = fx; K.fy = fy; K.cx = cx; K.cy = cy;
         f.intrinsics = K;
         f.sensor = wme::SensorKind::RgbD;
 
         const auto det = yolo->infer(f);
         if (!det.ok()) continue;
 
+        if (ncsv.is_open()) dumpNodes(ncsv, det.value(), du, K, dc.depth_min, dc.depth_max,
+                                      static_cast<int>(fi), rgb[fi].stamp);
+
         int raw[3] = {0, 0, 0}, withd[3] = {0, 0, 0};
         std::set<int> classes;
         for (const auto& d : det.value().items) {
             double z;
-            const bool has_depth = boxDepth(du, d, z);
+            const bool has_depth = boxDepth(du, d, dc.depth_min, dc.depth_max, z);
             for (int t = 0; t < 3; ++t) {
                 if (d.confidence < THR[t]) continue;
                 ++raw[t];

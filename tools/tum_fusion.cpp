@@ -55,6 +55,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -129,9 +130,15 @@ void toQuat(const Mat3& R, double& qx, double& qy, double& qz, double& qw) {
 // 3.2 m)에서는 노면 잡음이 노드 깊이로 들어오고, TUM(상한 8 m)에서는 센서가
 // 내지 않는 깊이까지 받는다. Tier 1 의 입력이 Tier 0 과 다른 깊이를 보면
 // 두 티어의 차이가 알고리즘 차이인지 창 차이인지 말할 수 없다.
+//
+// depth_sigma_rel 도 같은 이유로 밖에서 온다. 노드 sigma 의 깊이 항 계수가
+// 여기 6e-3 으로 박혀 있었고 그것은 구조광 계수다 - Tier 0 은 같은 프레임에
+// 대해 스테레오에서 유도한 7.8e-4 를 쓰고 있었으므로, 두 티어가 같은 센서를
+// 여덟 배 다르게 믿고 있었다. 유도와 실측은 nodePositionSigma 주석에 있다.
 std::vector<ConstellationNode> nodesFromFrame(const DetectionSet& dets, const Frame& frame,
                                               double depth_shrink, std::size_t max_nodes,
-                                              double depth_min, double depth_max) {
+                                              double depth_min, double depth_max,
+                                              double depth_sigma_rel) {
     std::vector<ConstellationNode> nodes;
     const auto& K = frame.intrinsics;
     if (!frame.hasDepth()) return nodes;
@@ -169,10 +176,7 @@ std::vector<ConstellationNode> nodesFromFrame(const DetectionSet& dets, const Fr
         n.id       = TokenId(seq++);
         n.class_id = d.class_id;
         n.position = K.backproject(Vec2(cx, cy), z);
-        const double sz = 0.006 * z * z;
-        const double sx = 2.0 * z / K.fx;
-        const double sy = 2.0 * z / K.fy;
-        n.sigma = std::sqrt((sx * sx + sy * sy + sz * sz) / 3.0);
+        n.sigma    = nodePositionSigma(z, K, depth_sigma_rel);
         nodes.push_back(n);
     }
     std::sort(nodes.begin(), nodes.end(),
@@ -506,6 +510,12 @@ int main(int argc, char** argv) {
     // 그 둘을 노드에서 직접 잰다 - 안 재면 "failed" 만 보고 원인을 추측하게 된다.
     std::vector<double> node_sigmas, node_pair_d;
     long long pairs_total = 0, pairs_in_range = 0;
+    // 질의가 실패한 이유를 문자열 그대로 센다. "failed 268" 만 보면 대응이
+    // 안 붙은 것인지, 붙었는데 잔차 게이트가 잘랐는지, 잔차는 통과했는데
+    // 모호성/신뢰도 관문에서 떨어졌는지 구분할 수 없다 - 셋은 고칠 곳이 다르다.
+    std::map<std::string, int> tcg_fail;
+    std::map<std::string, int> tcg_reject;   // 후보(장소)별 기각 사유
+    std::vector<double> tcg_rms;
     for (const auto& rr : rgb_rows) {
         if (max_frames > 0 && used >= max_frames) break;
 
@@ -543,7 +553,8 @@ int main(int argc, char** argv) {
             const auto d = yolo->infer(f);
             if (d.ok()) {
                 cur_nodes = nodesFromFrame(d.value(), f, depth_shrink, ccfg.max_nodes,
-                                           node_depth_min, node_depth_max);
+                                           node_depth_min, node_depth_max,
+                                           cfg.depth_sigma_rel);
                 yolo_det_sum += static_cast<double>(d.value().items.size());
                 ++yolo_frames;
                 if (!d.value().items.empty()) ++frames_with_dets;
@@ -640,10 +651,14 @@ int main(int argc, char** argv) {
         } else {
             ConstellationIndex index(ccfg);
             index.insert(KeyframeId(1), ref.stamp, SE3::identity(), ref_nodes, ref_gravity);
-            const auto m = index.query(cur_nodes, cur_gravity);
+            ConstellationIndex::RejectionLog rej;
+            const auto m = index.query(cur_nodes, cur_gravity, &rej);
             if (!m.ok()) {
                 rec.tiers[1].reason = Abstain::Failed;
+                ++tcg_fail[m.error().detail];
+                for (const auto& [pid, why] : rej) ++tcg_reject[why];
             } else {
+                tcg_rms.push_back(m.value().rms_error);
                 // transform 은 query(cur) -> place(ref) 다. 즉 T_ref_cur.
                 const SE3 T1 = m.value().transform.inverse();
                 std::vector<fusion::ConstellationPair> pairs;
@@ -711,6 +726,14 @@ int main(int argc, char** argv) {
                   << "  쌍거리 중앙 " << med(node_pair_d) << " m"
                   << "  구간 [" << ccfg.min_distance << ", " << ccfg.max_distance
                   << "] 안 쌍 " << pairs_in_range << "/" << pairs_total << "\n";
+        std::cout << "Tier1 질의: 성공 " << tcg_rms.size() << "  rms 중앙 "
+                  << med(tcg_rms) << " m\n";
+        for (const auto& [why, n] : tcg_fail) {
+            std::cout << "  실패 " << n << "  " << why << "\n";
+        }
+        for (const auto& [why, n] : tcg_reject) {
+            std::cout << "    후보기각 " << n << "  " << why << "\n";
+        }
     }
     {
         // Tier 2 도 같은 이유로 입력 단계를 따로 본다. 평면이 0 개인 프레임 수가

@@ -559,7 +559,8 @@ void ConstellationIndex::annotate(std::vector<ConstellationMatch>& all) const {
 }
 
 std::vector<ConstellationMatch> ConstellationIndex::queryAll(
-    const std::vector<ConstellationNode>& nodes, std::optional<Vec3> gravity) const {
+    const std::vector<ConstellationNode>& nodes, std::optional<Vec3> gravity,
+    RejectionLog* rejections) const {
 
     std::vector<ConstellationMatch> results;
     if (nodes.size() < cfg_.min_nodes || places_.empty()) return results;
@@ -572,6 +573,7 @@ std::vector<ConstellationMatch> ConstellationIndex::queryAll(
         if (p == nullptr) continue;
         auto m = verify(nodes, *p, gravity);
         if (m) results.push_back(std::move(m).value());
+        else if (rejections != nullptr) rejections->emplace_back(pid, m.error().detail);
     }
     // 여기서도 동점 타이브레이크가 필요하다. query() 는 all.front() 를 대표로
     // 뽑고 annotate() 는 이 순서로 군집 대표를 정하므로, 동점이 남으면 후보
@@ -590,12 +592,13 @@ std::vector<ConstellationMatch> ConstellationIndex::queryAll(
 }
 
 Result<ConstellationMatch> ConstellationIndex::query(
-    const std::vector<ConstellationNode>& nodes, std::optional<Vec3> gravity) const {
+    const std::vector<ConstellationNode>& nodes, std::optional<Vec3> gravity,
+    RejectionLog* rejections) const {
 
     if (nodes.size() < cfg_.min_nodes) {
         return {ErrorCode::InsufficientData, "성좌 구성 객체 부족"};
     }
-    auto all = queryAll(nodes, gravity);
+    auto all = queryAll(nodes, gravity, rejections);
     if (all.empty()) return {ErrorCode::NotAvailable, "일치하는 장소 없음"};
 
     // --- 모호성 판정: 포즈 공간의 마진 -------------------------------------

@@ -191,6 +191,42 @@ TEST(Constellation, RejectsAmbiguousCandidates) {
     EXPECT_GE(index.queryAll(corridor).size(), 2u);
 }
 
+TEST(Constellation, ReportsWhyCandidatesWereRejected) {
+    // 빈 결과에는 이유가 세 가지 있고, 밖에서는 하나로 보인다.
+    // 그 셋은 고칠 곳이 다르므로 (검출기 / 성좌 기하 / 잡음 모델) 나뉘어야 한다.
+    ConstellationIndex index;
+    const auto room = makeRoom(10, 3, 5.0);
+    index.insert(KeyframeId(1), Timestamp::fromSeconds(1.0), SE3::identity(), room);
+
+    // 후보로는 뽑히되(같은 클래스 다중집합) 기하가 전혀 다른 질의.
+    // 노드 위치를 통째로 흐트러뜨리면 클리크가 자라지 못한다.
+    auto scrambled = room;
+    for (std::size_t i = 0; i < scrambled.size(); ++i) {
+        scrambled[i].position = Vec3(static_cast<double>(i) * 1.7 - 4.0,
+                                     static_cast<double>((i * 7) % 11) * 0.9 - 4.0,
+                                     static_cast<double>((i * 5) % 7) * 0.4 - 1.0);
+    }
+
+    ConstellationIndex::RejectionLog log;
+    const auto m = index.query(scrambled, std::nullopt, &log);
+    ASSERT_FALSE(m.ok());
+    ASSERT_FALSE(log.empty()) << "후보가 떨어졌는데 이유가 비어 있으면 진단이 아니다";
+    for (const auto& [pid, why] : log) {
+        EXPECT_NE(pid, 0u);
+        EXPECT_FALSE(why.empty());
+    }
+
+    // nullptr 은 아무 일도 하지 않아야 한다 (기본 경로에 비용 없음)
+    EXPECT_FALSE(index.query(scrambled).ok());
+
+    // 성공한 질의는 기각 기록을 남기지 않는다
+    ConstellationIndex::RejectionLog clean;
+    const SE3 T(SO3::exp(Vec3(0.1, -0.2, 0.3)), Vec3(1.0, -0.5, 0.2));
+    const auto good = index.query(transformed(room, T.inverse()), std::nullopt, &clean);
+    ASSERT_TRUE(good.ok()) << good.error().message();
+    EXPECT_TRUE(clean.empty());
+}
+
 TEST(Constellation, RejectsAmbiguityUnderRotation) {
     // 대조군 B - 병진은 같은데 회전만 다른 별칭.
     // 같은 방을 180도 돌려 등록하면 월드 병진은 붙고 자세만 어긋난다.

@@ -14,11 +14,48 @@
 #include "wme/core/Types.hpp"
 #include "wme/token/WorldToken.hpp"
 
+#include <cmath>
 #include <optional>
 #include <unordered_map>
 #include <vector>
 
 namespace wme {
+
+// 성좌 노드 하나의 위치 표준편차 (등방 근사, m).
+//
+// 노드는 박스 중심 화소 + 박스 중앙의 중앙값 깊이로 만들어진다. 그래서 위치
+// 잡음은 두 갈래이고 저울이 다르다:
+//   횡방향  sigma_x = sigma_px * z / fx      (z 에 **선형**)
+//   깊이    sigma_z = c * z^2                (z 에 **제곱**)
+//
+// c 는 센서가 정하는 값이지 튜닝 상수가 아니다. 스테레오는 Z = f*B/d 이므로
+// sigma_Z = (Z^2/(f*B)) * sigma_d, 즉 c = sigma_d/(f*B) 로 **유도**된다
+// (docs/06-results.md 25.21). KITTI gray: 0.3 px / (718.856 * 0.537) = 7.8e-4.
+// 구조광은 시차 기하가 아니라 그 유도가 성립하지 않으므로 적합값을 쓴다.
+//
+// 왜 인자로 받는가. 이 자리에 구조광 계수 6e-3 이 박혀 있었고, 그것이 KITTI 에
+// 그대로 적용되고 있었다. 20 m 에서 sigma_z = 2.4 m 가 되어 Kabsch 잔차 게이트
+// (max_rms_error = 0.45 m)의 다섯 배가 되고, 그러면 정대응조차 전부 기각된다.
+// Tier 1 이 kitti_00 에서 4/399, kitti_04/05 에서 0 회 발동한 이유가 이것이다.
+//
+// 게이트와 이 모델 중 무엇이 틀렸는지는 진리값 포즈로 갈랐다. 같은 물체를 두
+// 프레임에서 본 위치의 차이(= sqrt(2)*sigma_node)를 재면
+//   kitti_00  c = 7.0e-4,  3D sigma_node 0.128 m  (모델 0.99 m,  7.8 배 과대)
+//   kitti_05  c = 6.7e-4,  3D sigma_node 0.163 m  (모델 1.36 m,  8.3 배 과대)
+// 이다. 스테레오 유도값 7.8e-4 는 실측과 맞고 6e-3 은 여덟 배 어긋난다.
+// 틀린 것은 게이트가 아니라 이 계수다.
+[[nodiscard]] inline double nodePositionSigma(double z, const CameraIntrinsics& K,
+                                              double depth_sigma_rel,
+                                              double bearing_px = 2.0) {
+    // 모르면 구조광 값으로 돌아간다. DirectAligner::depthNoiseFloor 이 같은
+    // 자리에서 같은 선택을 한다 - 유도할 근거가 없을 때 적합값으로 물러선다.
+    const double c  = (depth_sigma_rel > 0.0) ? depth_sigma_rel
+                                              : kStructuredLightDepthSigmaRel;
+    const double sz = c * z * z;
+    const double sx = bearing_px * z / K.fx;
+    const double sy = bearing_px * z / K.fy;
+    return std::sqrt((sx * sx + sy * sy + sz * sz) / 3.0);
+}
 
 // 성좌를 구성하는 최소 정보. 전체 토큰을 복사하지 않는다.
 struct ConstellationNode {
@@ -129,16 +166,26 @@ public:
                          std::vector<ConstellationNode> nodes,
                          std::optional<Vec3> gravity = std::nullopt);
 
+    // 후보가 왜 떨어졌는지. queryAll 이 빈 벡터를 돌려주는 경우가 세 가지인데
+    // 밖에서는 "일치하는 장소 없음" 하나로만 보인다: 클래스 일치 대응이 아예
+    // 없었는가, 대응은 있었는데 상호일관 클리크가 min_inliers 를 못 채웠는가,
+    // 클리크는 찼는데 Kabsch 잔차가 게이트를 넘었는가. 셋은 고칠 곳이 전부
+    // 다르다 - 검출기, 성좌 기하, 잡음 모델. 그래서 세어서 내보낸다.
+    // nullptr 이면 아무 일도 하지 않는다 (기본 경로에 비용 없음).
+    using RejectionLog = std::vector<std::pair<std::uint64_t, std::string>>;
+
     // 질의. gravity 는 질의 프레임 좌표계 기준.
     // 실패 시 ErrorCode::InsufficientData / NotAvailable.
     [[nodiscard]] Result<ConstellationMatch> query(
         const std::vector<ConstellationNode>& nodes,
-        std::optional<Vec3> gravity = std::nullopt) const;
+        std::optional<Vec3> gravity = std::nullopt,
+        RejectionLog* rejections = nullptr) const;
 
     // 상위 후보를 모두 반환 (루프 클로저 다중 가설 검증용)
     [[nodiscard]] std::vector<ConstellationMatch> queryAll(
         const std::vector<ConstellationNode>& nodes,
-        std::optional<Vec3> gravity = std::nullopt) const;
+        std::optional<Vec3> gravity = std::nullopt,
+        RejectionLog* rejections = nullptr) const;
 
     // 활성 토큰 집합에서 성좌를 구성한다. 안정 랜드마크만 채택.
     [[nodiscard]] static std::vector<ConstellationNode> buildFrom(
