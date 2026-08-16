@@ -19,4 +19,4 @@ kitti_00	Data_Set_01	KITTI odometry 00 - 주택가, 폐곡선
 kitti_04	Data_Set_02	KITTI odometry 04 - 직선 도로 (자차 높이가 흔들리는 시퀀스다)
 kitti_05	Data_Set_03	KITTI odometry 05 - 주택가, 좌회전 구간
 kitti_07	Data_Set_04	KITTI odometry 07 - 시가지, 정지 구간 포함
-tartanground_downtown_360	Data_Set_05	TartanGround Downtown - 360 등장방형에서 잘라낸 도심 주행 (합성). WME 가 이 40 프레임에서 ATE 1251 cm 로 드리프트해 자차가 지도 위로 떠오른다 - 뷰어의 자차높이 검사가 그것을 화면에 적는다
+tartanground_downtown_360	Data_Set_05	TartanGround Downtown - 360 등장방형에서 잘라낸 도심 주행 (합성). 원본 10 Hz 그대로 118 프레임이고 WME 가 ATE 11.88 cm 로 ORB+PnP(14.42 cm)를 이긴다. 전에 stride 3 으로 뽑아 ATE 1251 cm 로 무너졌던 자리다 - 시퀀스가 어려운 것이 아니라 세 배 성기게 뽑아 직접 광도 정합의 수렴 반경을 넘겼던 것이다

@@ -5712,8 +5712,30 @@ int main(int argc, char** argv) {
     // 색인을 믿을 근거를 만들 때만 켠다.
     bool verify_tiles = false;
 
-    for (int i = 1; i + 1 < argc; i += 2) {
+    // **값을 받는 플래그와 안 받는 플래그를 갈라서 읽는다.**
+    //
+    // 예전에는 `for (i = 1; i + 1 < argc; i += 2)` 로 **모든** 플래그에 값이
+    // 있다고 가정했다. `--all` 은 값이 없으므로 그 뒤 인자가 통째로 먹혔고,
+    // 그때부터 짝이 어긋나 나머지가 전부 조용히 버려졌다 - `--all` 뒤에
+    // `--screenshot` 을 주면 스크린샷이 안 찍히고 창이 그냥 떠 있었다. 그것이
+    // "무한 루프" 로 보고된 것의 정체다. 그리고 맨 뒤에 놓인 플래그는 조건
+    // `i + 1 < argc` 때문에 값이 있든 없든 무시됐다.
+    //
+    // 모르는 플래그도 조용히 넘기지 않는다. 오타 하나로 설정이 달라진 채
+    // 결과가 나오면 그 표가 무엇을 잰 것인지 아무도 모른다.
+    auto needsValue = [](const std::string& k) {
+        return k != "--all";
+    };
+    for (int i = 1; i < argc; ++i) {
         const std::string k = argv[i];
+        if (k.rfind("--", 0) != 0) {
+            std::cerr << "알 수 없는 인자: " << k << "\n";
+            return 2;
+        }
+        if (needsValue(k) && i + 1 >= argc) {
+            std::cerr << k << " 에 값이 없다\n";
+            return 2;
+        }
         if (k == "--manifest") manifest = argv[i + 1];
         else if (k == "--seq") start_seq = std::atoi(argv[i + 1]);
         else if (k == "--autoplay") autoplay = std::atoi(argv[i + 1]) != 0;
@@ -5729,6 +5751,11 @@ int main(int argc, char** argv) {
         else if (k == "--car-model") car_obj = argv[i + 1];
         else if (k == "--export-scene") scene_glb = argv[i + 1];
         else if (k == "--export-json") scene_json = argv[i + 1];
+        else {
+            std::cerr << "알 수 없는 플래그: " << k << "\n";
+            return 2;
+        }
+        if (needsValue(k)) ++i;
     }
 
     const fs::path scene_dir = fs::path(manifest).parent_path();
@@ -5891,6 +5918,19 @@ int main(int argc, char** argv) {
         }
 
         const int nframes = std::max<int>(1, static_cast<int>(s.rgb.size()));
+        // **닿을 수 없는 목표 프레임은 여기서 끊는다.**
+        //
+        // 아래 클램프는 frame 을 nframes-1 로 되돌리고, 헤드리스 루프는
+        // frame < shot_frame 이면 ++frame 한다. shot_frame 이 nframes 이상이면
+        // 그 둘이 영원히 서로를 되돌린다 - 실측으로 5 분을 돌려도 끝나지
+        // 않았고, 화면에는 아무 말도 나오지 않는다. 조용한 무한 루프는 이
+        // 저장소가 결함으로 규정한 것이다.
+        if (headless && shot_frame >= nframes) {
+            std::cerr << "--frame " << shot_frame << " 은 이 시퀀스의 범위 밖이다 ("
+                      << s.name << " 는 " << nframes << " 프레임, 최대 "
+                      << (nframes - 1) << ").\n";
+            return 2;
+        }
         if (frame >= nframes) frame = nframes - 1;
 
         // 궤도는 **현재 카메라를 따라간다.** 전체 궤적에 맞추면 점군이 화면

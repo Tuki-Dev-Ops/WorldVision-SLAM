@@ -251,8 +251,28 @@ def main() -> int:
     ap.add_argument("--traj", default="P1000")
     ap.add_argument("--start", type=int, default=440,
                     help="이 구간이 멈춤 없이 계속 움직인다 (실측: 최소 0.37 m/프레임)")
-    ap.add_argument("--frames", type=int, default=40)
-    ap.add_argument("--stride", type=int, default=3)
+    ap.add_argument("--frames", type=int, default=118)
+    # **stride 1 이다 — 원본이 찍힌 그대로다.** 처음에는 3 이었고, 이유는
+    # "프레임당 1.4 m 라 KITTI 의 1.5 m 와 같은 자리" 였다. 그 기준이 틀렸다.
+    # 직접 광도 정합이 감당해야 하는 것은 미터가 아니라 **화소 변위** 이고,
+    # 그것은 장면 깊이와 프레임당 회전이 정한다. 이 크롭은 KITTI 보다 훨씬
+    # 가깝고(중앙 깊이 3~6 m vs kitti_00 10.4 m) 훨씬 빨리 돈다:
+    #
+    #   프레임당 회전   kitti_04 0.22 deg / kitti_00 1.49 deg / 여기 stride3 3.38 deg
+    #   회전 유도 광류  kitti_04 1.7 px  / kitti_00 6.6 px  / 여기 stride3 20.1 px
+    #
+    # 그래서 미터를 맞췄더니 화소가 3 배로 벌어졌고, 앞 열한 프레임에서 정합이
+    # 참 이동의 4~70 % 밖에 못 잡았다(추정 0.05 m vs 참 1.32 m). 실측 비교는
+    # 같은 구간(원본 440~476)에서 **끼워 넣은 두 장 말고는 완전히 같은 자료**로
+    # 했다 - 겹치는 12 자리의 화소·포즈·시각이 비트까지 같다:
+    #
+    #   stride 3 (1.42 m/프레임)  ATE 348.84 cm   inlier 0.12   측광 RMSE 44.7
+    #   stride 1 (0.475 m/프레임) ATE  10.50 cm   inlier 0.50   측광 RMSE 15.9
+    #
+    # 벤치 인자(--kf-dist 1.0 --depth-max 60)로는 6.82 cm 이고, 같은 자료에서
+    # ORB+PnP 가 4.96 cm 다. 즉 이 시퀀스는 어렵지 않았고, 세 배 성기게
+    # 뽑았을 뿐이다. stride 를 3 으로 되돌리려면 위 숫자부터 다시 재라.
+    ap.add_argument("--stride", type=int, default=1)
     ap.add_argument("--dt", type=float, default=0.1,
                     help="metadata.json 의 time_step. 추측이 아니라 데이터셋 값이다")
     ap.add_argument("--hfov", type=float, default=110.0)
