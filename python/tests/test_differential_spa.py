@@ -256,6 +256,87 @@ def test_plane_extractor_finds_the_same_planes():
         # 법선 부호 규약이 뒤집힐 수 있으므로 거리는 절대값으로 본다.
         assert abs(abs(a.distance) - abs(best.distance)) < 0.05, (
             f"거리 불일치 {a.distance:.3f} vs {best.distance:.3f}")
+        # 유도한 오프셋 sigma 도 같아야 한다. 이것이 빠지면 두 구현이 같은
+        # 평면을 뽑고도 정보행렬은 서로 다른 값을 내게 된다.
+        assert a.sigma_offset > 0.0, "sigma_offset 이 유도되지 않았다"
+        assert abs(a.sigma_offset - best.sigma_offset) < a.sigma_offset * 0.05, (
+            f"sigma_offset 불일치 {a.sigma_offset:.6f} vs {best.sigma_offset:.6f}")
+
+
+def test_plane_sigma_follows_the_derivation_in_both():
+    """판별 가드. sigma_offset = sqrt((c z d)^2 + rms^2) 인가를 두 구현에서 따로 본다.
+
+    위 테스트는 "둘이 같다" 만 말한다. 둘이 같이 c z^2 을 쓰거나 sqrt(N) 으로
+    나눠도 통과한다 - 7.1 의 회전 블록이 정확히 그렇게 오래 살아남았다.
+    여기서는 형태 자체를 못박는다.
+    """
+    from wme.geometry.planes import PlaneConfig, extract_planes
+    from wme.sim.world import CameraModel
+
+    d, fx, cx, cy = _synthetic_depth()
+    cfg = PlaneConfig()
+    cam = CameraModel(fx=fx, fy=fx, cx=cx, cy=cy, width=d.shape[1], height=d.shape[0])
+    py = extract_planes(d.astype(np.float64), cam, cfg)
+    ccfg = core.PlaneExtractorConfig()
+    ccfg.depth_sigma_rel = cfg.depth_sigma_rel
+    cpp = core.PlaneExtractor(ccfg).extract(d, fx, fx, cx, cy)
+
+    c = cfg.depth_sigma_rel
+    assert c > 0.0
+    for pl in list(py) + list(cpp):
+        z = float(np.asarray(pl.centroid)[2])
+        if z <= 0.0:
+            continue
+        want = float(np.hypot(c * z * pl.distance, pl.rms))
+        assert abs(pl.sigma_offset - want) < max(1e-12, want * 1e-9), (
+            f"{type(pl).__name__}: sigma_offset {pl.sigma_offset:.8f} != "
+            f"sqrt((c z d)^2 + rms^2) {want:.8f}")
+        # 거리 의존이 살아 있는가. c z^2 로 잘못 쓰면 이 비가 1 이 된다.
+        derived = float(np.sqrt(max(0.0, pl.sigma_offset ** 2 - pl.rms ** 2)))
+        assert derived > 0.0
+        assert abs(derived / (c * z * z) - pl.distance / z) < 1e-9, "투영 인자 d/z 가 빠졌다"
+
+
+def test_information_uses_the_plane_sigma_not_the_fallback():
+    """평면이 sigma_offset 을 들고 오면 config 상수가 아니라 그것이 쓰여야 한다.
+
+    두 구현 모두에서 확인한다. 거리만 열 배 다른 두 장면을 견주면 병진 정보가
+    1e4 배 갈려야 한다 - 26.x 까지는 정확히 1 배였다(거리 무관).
+    """
+    from wme.geometry.planes import Plane as PP
+
+    c = 0.006
+    normals = [[0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+
+    def build(d):
+        py, cpp = [], []
+        # 세 평면 모두 같은 sigma 를 준다. 거리 의존만 남겨서 다른 요인이
+        # 섞이지 않게 한다 (정면 평면이면 centroid.z = d 라 c z d = c d^2 이다).
+        sig = c * d * d
+        for nv in normals:
+            n = np.asarray(nv, float)
+            cen = n * d
+            py.append(PP(n, float(d), 400, cen, 0.5, 0.0, float(sig)))
+            cpp.append(core.Plane(n, float(d), 400, cen, 0.5, 0.0, float(sig)))
+        return py, cpp
+
+    py1, cpp1 = build(1.0)
+    py10, cpp10 = build(10.0)
+
+    ok1, r1 = core.StructuralAligner().align(cpp1, cpp1)
+    ok10, r10 = core.StructuralAligner().align(cpp10, cpp10)
+    assert ok1 and ok10
+    t1 = np.trace(np.asarray(r1.information)[:3, :3])
+    t10 = np.trace(np.asarray(r10.information)[:3, :3])
+    assert abs(t1 / t10 / 1e4 - 1.0) < 1e-6, f"C++ 병진 정보 비 {t1 / t10:.4g}, 기대 1e4"
+
+    p1 = pyspa.align(py1, py1)
+    p10 = pyspa.align(py10, py10)
+    q1 = np.trace(np.asarray(p1.information)[:3, :3])
+    q10 = np.trace(np.asarray(p10.information)[:3, :3])
+    assert abs(q1 / q10 / 1e4 - 1.0) < 1e-6, f"파이썬 병진 정보 비 {q1 / q10:.4g}, 기대 1e4"
+    # 두 구현이 같은 값을 내는가 (항등 정합이라 t = 0, 교차항이 사라져 비교 가능)
+    assert np.allclose(np.asarray(r1.information), np.asarray(p1.information), rtol=1e-9)
 
 
 def test_plane_extractor_rejects_a_sphere():

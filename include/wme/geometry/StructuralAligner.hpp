@@ -41,8 +41,56 @@ struct StructuralAlignerConfig {
     // 해가 움직이면 보고와 결과가 어긋난다.
     double degeneracy_ratio{1e-3};
 
-    // 정보행렬 스케일. 평면 법선/거리 추정 정확도에서 온다.
+    // 정보행렬 스케일.
+    //
+    // rotation_sigma 는 **잘 맞는 평면 둘**(fitDegradation = 1)의 합성 법선 잔차
+    // |n_cur - R n_ref| 의 표준편차다. 대응 하나의 실제 sigma 는
+    //
+    //     sigma_n = rotation_sigma * sqrt((f_ref^2 + f_cur^2) / 2),
+    //     f = Plane::fitDegradation()^2 = (1 + 20 * rms)^2
+    //
+    // 다. 1/2 로 정규화했으므로 f = 1 인 평면 둘이면 정확히 rotation_sigma 로
+    // 환원된다 - 실측으로 맞춘 절대 크기가 배율 도입으로 흔들리지 않는다.
+    //
+    // **크기는 유도되지 않았다.** 유도를 시도했고 실데이터가 기각했다:
+    //   결맞은 깊이 오차가 만드는 기울기 c*d*sqrt(1-n_z^2)(116 배), 표면 거칠기
+    //   rms/extent(4159 배), sigma_r/(sqrt(N)*extent)(135 배), 그리고 새 상수도
+    //   지수도 없는 유도형 sigma_offset/(c*z*d)(12.7 배) 넷 다 시퀀스 간 산포가
+    //   상수(11.4 배)보다 나빴다. 법선 sigma 를 유도하는 길은 찾지 못했다.
+    //
+    // 그래도 크기는 검산했다. 6 시퀀스 961 대응에서 정답 포즈로 잰 합성 법선
+    // 잔차의 중앙값을 0.02*sqrt(2) 로 나누면 0.26 ~ 2.94, 기하평균 0.55 다
+    // (가우시안이면 0.6745). 즉 0.02 rad 는 실측과 1.4 배 안에서 맞는다.
+    //
+    // **배율 f 는 유도가 아니라 적합이다.** 감추지 않는다. 961 대응에서
+    // median(|법선 잔차| / 예측) 의 시퀀스 간 산포와 시퀀스 안 순위상관:
+    //     상수                    11.4 배   rho -0.08
+    //     1 + 20*rms               9.3 배   rho +0.22
+    //     (1 + 20*rms)^2           7.5 배   rho +0.22   <- 채택
+    //     sqrt(1 + 20*rms)        10.3 배   rho +0.22
+    //     (1+20rms)(1+rms/extent)  9.1 배   rho +0.22
+    //     1/confidence            12.8 배   rho +0.18
+    //     1/min(1, N/400)         16.1 배   rho -0.10   <- 표본 수 항은 해롭다
+    //     1 + rms/extent          11.1 배   rho +0.11
+    //     z/d                     11.4 배   rho -0.21
+    //     1/sqrt(1 - n_z^2)       34.2 배   rho +0.09
+    //     sigma_offset/(c*z*d)    12.7 배   rho +0.02
+    // 표본 수 항이 해롭다는 것이 이 표의 핵심이다 - 옛 코드가 회전 정보에 곱하던
+    // confidence 에는 그 항이 들어 있었다. 적합 항만 남긴다.
+    //
+    // 지수는 두 지표를 함께 봐야 정해진다. 7 시퀀스 끝단 측정에서
+    //     p:            0      1      2      3
+    //     회전 W 산포  45.0   24.4   14.5   10.9   (단조 - 이것만으로는 못 고른다)
+    //     ANEES 거리   1.128  0.976  0.980  1.084  (p ~ 1..2 에서 최소)
+    // 회전 산포는 p 에 단조라 최적점이 없다. 1 차 지표인 ANEES 가 p=3 에서
+    // 되돌아서므로 p <= 2 이고, 그 중 회전 산포가 낮은 p=2 를 골랐다.
+    // **6 시퀀스에서 고른 지수라 표본이 얇다.** 새 상수를 만들지 않는 쪽을
+    // 택하려면 p=1 이고 (회전 산포 24.4, ANEES 0.976), 그 숫자도 위에 있다.
     double rotation_sigma{0.02};       // rad
+
+    // 평면의 sigma_offset 이 미상(0)일 때만 쓰는 **되돌림 값**이다. 정상 경로에서는
+    // PlaneExtractor 가 유도한 평면별 sigma 가 이것을 대신한다.
+    // 합성 잔차 |n_cur.t - (d_cur - d_ref)| 의 표준편차라는 뜻이다.
     double translation_sigma{0.05};    // m
 
     // 회전 해의 정칙화. 법선이 한 방향뿐이면 Kabsch 해는 그 축 둘레로 1-매개변수
@@ -58,7 +106,21 @@ struct PlaneMatch {
     std::size_t cur_index{0};
     double angle{0.0};             // rad, init 로 옮긴 뒤의 법선 사잇각
     double distance_diff{0.0};     // m
-    double weight{0.0};            // ref.confidence * cur.confidence
+
+    // 이 대응의 오프셋 잔차 sigma (m). 두 평면의 sigma_offset 을 직교로 합친
+    // 것이고, 한쪽이라도 미상이면 config 의 translation_sigma 로 물러선다.
+    // 병진 최소제곱의 가중치와 정보행렬이 **둘 다** 이 값에서 온다 - 추정기와
+    // 정보가 다른 가중을 쓰면 Lambda 는 그 추정기의 공분산이 아니게 된다.
+    double sigma_offset{0.0};
+
+    // 이 대응의 법선 잔차 sigma (rad). Kabsch 가중과 회전 정보가 둘 다 여기서
+    // 온다. 유도는 StructuralAlignerConfig::rotation_sigma 주석에 있다.
+    double sigma_normal{0.0};
+
+    // ref.confidence * cur.confidence. **정보량이 아니다** - 대응 순서와 진단용.
+    // 26.x 까지 이것이 정보행렬에 곱해졌고, 무차원인데다 inliers 400 에서
+    // 포화해서 실제 벽은 전부 1 이었다.
+    double weight{0.0};
 };
 
 struct StructuralAlignmentResult {

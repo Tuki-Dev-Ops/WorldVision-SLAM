@@ -31,12 +31,31 @@ class Plane:
     extent: float = 0.0                   # 평면 위 점들의 산포 (m)
     rms: float = 0.0                      # 평면 적합 잔차
 
+    # 오프셋 d 의 표준편차 (m). 추출기가 유도해서 채운다. 0 은 "미상" 이고
+    # 그때 SPA 는 SpaConfig.translation_sigma 로 물러선다.
+    # C++ Plane::sigma_offset 과 같은 뜻이고 유도는 _fit 의 주석에 있다.
+    sigma_offset: float = 0.0
+
+    @property
+    def fit_degradation(self) -> float:
+        """적합이 나쁜 만큼 sigma 를 키우는 **무차원** 배율. 잘 맞으면 1.
+
+        계수 20 (1/m) 은 여기 한 곳에만 두고 confidence 가 되쓴다.
+        C++ Plane::fitDegradation 과 같은 값이어야 한다.
+        """
+        return float(1.0 + 20.0 * self.rms)
+
     @property
     def confidence(self) -> float:
-        """넓고 잘 맞는 평면일수록 믿을 만하다."""
-        fit = 1.0 / (1.0 + 20.0 * self.rms)
+        """넓고 잘 맞는 평면일수록 믿을 만하다.
+
+        **정보량이 아니다.** 대응 순서와 정렬에만 쓴다. 26.x 까지는 이것의 곱이
+        정보행렬에 곱해졌는데, 무차원이라 sigma 를 대신할 수 없고 inliers 400
+        에서 포화해서 실제 벽은 전부 1 이었다. 두 항 중 적합 항만 정보로
+        돌아갔고, 표본 수 항은 실측에서 법선 잔차를 오히려 못 맞힌다.
+        """
         size = min(1.0, self.inliers / 400.0)
-        return float(fit * size)
+        return float(size / self.fit_degradation)
 
     def signed_distance(self, point: np.ndarray) -> float:
         return float(np.asarray(point, float) @ self.normal - self.distance)
@@ -46,7 +65,7 @@ class Plane:
         n = np.asarray(R, float) @ self.normal
         return Plane(n, float(self.distance + n @ np.asarray(t, float)),
                      self.inliers, np.asarray(R, float) @ self.centroid + t,
-                     self.extent, self.rms)
+                     self.extent, self.rms, self.sigma_offset)
 
     def __repr__(self) -> str:
         return (f"Plane(n={np.round(self.normal, 3).tolist()}, "
@@ -70,6 +89,11 @@ class PlaneConfig:
     # 법선 추정 시 이웃 깊이 차이가 이보다 크면 경계로 보고 버린다.
     # 이걸 안 하면 물체 실루엣에서 가짜 평면이 생긴다.
     depth_discontinuity: float = 0.15
+
+    # sigma_z = c * z^2 의 c. 센서가 정한다. C++ PlaneExtractorConfig 의
+    # 같은 이름과 같은 뜻이고 기본값도 같다 (구조광 6e-3, WorldToken.hpp).
+    # 0 이면 sigma_offset 을 유도하지 않고 0(미상)으로 남긴다.
+    depth_sigma_rel: float = 0.006
 
 
 def _backproject(depth: np.ndarray, cam: CameraModel, stride: int):
@@ -207,13 +231,29 @@ def _fit(points: np.ndarray, cfg: PlaneConfig) -> Plane | None:
         normal, distance = -normal, -distance
 
     residual = points @ normal - distance
+    rms = float(np.sqrt(np.mean(residual ** 2)))
+
+    # --- 오프셋 불확실성 ---------------------------------------------------
+    # 깊이 잡음 sigma_z = c z^2 은 시선 방향이다. p = z m (m.z = 1) 이면
+    # dp = dz m 이고 평면 잔차에는 법선 성분만 남으므로
+    #     sigma_r = sigma_z |n.m| = c z^2 (d/z) = c z d
+    # 이다 (평면 위에서 n.p = d 이므로 n.m = d/z). 표본 수로 나누지 않는다 -
+    # 이 깊이맵들의 잡음은 패치 전체에 결맞아 있고, 그 증거와 실측 근거는
+    # src/geometry/PlaneExtractor.cpp 의 같은 자리 주석에 있다.
+    # rms 는 그 평면이 스스로 잰 비결맞은 산포라 직교로 더한다.
+    sigma_offset = 0.0
+    if cfg.depth_sigma_rel > 0.0 and centroid[2] > 0.0:
+        sigma_r = cfg.depth_sigma_rel * float(centroid[2]) * distance
+        sigma_offset = float(math.sqrt(sigma_r * sigma_r + rms * rms))
+
     return Plane(
         normal=normal,
         distance=distance,
         inliers=len(points),
         centroid=centroid,
         extent=float(np.mean(np.linalg.norm(centred, axis=1))),
-        rms=float(np.sqrt(np.mean(residual ** 2))),
+        rms=rms,
+        sigma_offset=sigma_offset,
     )
 
 

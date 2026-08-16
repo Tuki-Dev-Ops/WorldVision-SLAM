@@ -39,7 +39,9 @@ class SpaConfig:
     # 랭크 판정. 대각 정규화 후 최대 고유값 대비 비율.
     degeneracy_ratio: float = 1e-3
 
-    # 정보행렬 스케일. 평면 법선/거리 추정 정확도에서 온다.
+    # 정보행렬 스케일. 근거는 C++ StructuralAlignerConfig 의 같은 이름 주석이다.
+    # rotation_sigma 는 유도되지 않았다(유도 시도가 실데이터에 기각됐다).
+    # translation_sigma 는 평면의 sigma_offset 이 미상일 때만 쓰는 되돌림 값이다.
     rotation_sigma: float = 0.02          # rad
     translation_sigma: float = 0.05       # m
 
@@ -50,10 +52,39 @@ class PlaneMatch:
     current: Plane
     angle: float
     distance_diff: float
+    # 미상일 때 쓸 되돌림 값. match_planes 가 config 에서 채운다.
+    fallback_sigma: float = 0.05
+    rotation_sigma: float = 0.02
 
     @property
     def weight(self) -> float:
+        """confidence 곱. **정보량이 아니다** - 대응 순서와 진단용이다."""
         return float(self.reference.confidence * self.current.confidence)
+
+    @property
+    def sigma_normal(self) -> float:
+        """이 대응의 법선 잔차 sigma (rad).
+
+        두 평면의 몫이 독립으로 더해진다. 1/2 로 정규화해서 잘 맞는 평면
+        둘(f = 1)이면 정확히 rotation_sigma 로 환원된다 - 실측으로 맞춘 절대
+        크기를 배율이 흔들지 않는다. C++ 과 같은 식이어야 한다.
+        """
+        fr = self.reference.fit_degradation ** 2
+        fc = self.current.fit_degradation ** 2
+        return float(self.rotation_sigma * math.sqrt(0.5 * (fr * fr + fc * fc)))
+
+    @property
+    def sigma_offset(self) -> float:
+        """이 대응의 오프셋 잔차 sigma (m).
+
+        두 평면의 오프셋 오차가 각각 한 번씩 독립으로 들어오므로 분산이 더해진다.
+        한쪽이라도 미상(0)이면 절반만 유도된 sigma 가 되므로 전체를 되돌림
+        상수로 간다.
+        """
+        a, b = self.reference.sigma_offset, self.current.sigma_offset
+        if a > 0.0 and b > 0.0:
+            return float(math.sqrt(a * a + b * b))
+        return float(self.fallback_sigma)
 
 
 @dataclass
@@ -112,7 +143,8 @@ def match_planes(reference: list[Plane], current: list[Plane],
 
         if best is not None:
             used.add(best)
-            matches.append(PlaneMatch(ref, current[best], best_angle, best_dd))
+            matches.append(PlaneMatch(ref, current[best], best_angle, best_dd,
+                                      cfg.translation_sigma, cfg.rotation_sigma))
     return matches
 
 
@@ -127,7 +159,18 @@ def align(reference: list[Plane], current: list[Plane],
     if len(matches) < cfg.min_matches:
         return result
 
-    w = np.array([m.weight for m in matches])
+    if cfg.rotation_sigma <= 0.0 or cfg.translation_sigma <= 0.0:
+        return result
+
+    # 가중치는 전부 **역분산**이다. 무차원 신뢰도가 아니다.
+    #
+    # 회전 sigma 는 평면의 적합 잔차로 스케일된다. 근거와 후보 비교는
+    # C++ StructuralAlignerConfig::rotation_sigma 주석이다.
+    sig_n = np.array([m.sigma_normal for m in matches])
+    w = 1.0 / (sig_n ** 2)
+    # 병진은 대응마다 다르다. 여기가 Lambda 에 거리가 들어오는 자리다.
+    sig_t = np.array([m.sigma_offset for m in matches])
+    w_t = 1.0 / (sig_t ** 2)
     n_ref = np.array([m.reference.normal for m in matches])
     n_cur = np.array([m.current.normal for m in matches])
 
@@ -174,7 +217,7 @@ def align(reference: list[Plane], current: list[Plane],
     # 된다. w 로 스케일하면 sum w^2 n n^T 가 되어 **가중치가 두 번 적용**된다.
     # inliers=400(=weight 1) 로만 시험하면 w 와 w^2 이 같아 보이지 않는다 -
     # 이 결함이 오래 남은 이유이고, 26.x 의 첫 테스트도 같은 함정에 빠질 뻔했다.
-    sw = np.sqrt(w)
+    sw = np.sqrt(w_t)
     A = n_cur * sw[:, None]
     ATA = A.T @ A
     trans_eig = np.linalg.eigvalsh(ATA)[::-1]
@@ -197,10 +240,15 @@ def align(reference: list[Plane], current: list[Plane],
     result.converged = True
 
     # --- 정보행렬 ---
-    # 회전은 법선 산포에서, 병진은 법선이 만드는 부분공간에서 온다.
+    # ATA 와 rot_info 는 이미 역분산으로 가중되어 있다. 병진 최소제곱이 쓴
+    # 가중과 정확히 같은 값이어야 Lambda 가 그 추정기의 공분산이 된다.
+    #
+    # 주의: 이 참조 구현은 t x n 교차항을 넣지 않는다. C++ 는 넣는다
+    # (좌측 섭동에서 dt = rho + phi x t). 항등 정합(t = 0)에서만 두 형태가
+    # 같으므로 차등 테스트는 그 자리에서만 두 정보행렬을 맞대야 한다.
     Lam = np.zeros((6, 6))
-    Lam[:3, :3] = ATA / (cfg.translation_sigma ** 2)
-    Lam[3:, 3:] = rot_info / (cfg.rotation_sigma ** 2)
+    Lam[:3, :3] = ATA
+    Lam[3:, 3:] = rot_info
     Lam *= max(alpha_structural, 1e-6)
     result.information = Lam
 

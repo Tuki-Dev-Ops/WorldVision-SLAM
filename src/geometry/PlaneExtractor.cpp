@@ -30,10 +30,13 @@ constexpr std::int64_t kKeyMax    = 60000;
 
 // --- Plane -----------------------------------------------------------------
 
+double Plane::fitDegradation() const {
+    return 1.0 + 20.0 * rms;
+}
+
 double Plane::confidence() const {
-    const double fit  = 1.0 / (1.0 + 20.0 * rms);
     const double size = std::min(1.0, static_cast<double>(inliers) / 400.0);
-    return fit * size;
+    return size / fitDegradation();
 }
 
 Plane Plane::transformed(const Mat3& R, const Vec3& t) const {
@@ -180,6 +183,59 @@ bool PlaneExtractor::fit(const std::vector<std::uint32_t>& idx, Plane& out) cons
     out.inliers  = idx.size();
     out.extent   = spread / static_cast<double>(idx.size());
     out.rms      = std::sqrt(sq / static_cast<double>(idx.size()));
+
+    // --- 오프셋 불확실성 -----------------------------------------------------
+    //
+    // 1. 깊이 잡음이 평면 잔차에 어떻게 들어오는가.
+    //    sigma_z = c z^2 이고 그 잡음은 **시선 방향**이다. 화소 시선을 m
+    //    (m.z = 1) 이라 하면 점은 p = z m 이고 잡음은 dp = dz * m 이다. 평면
+    //    잔차 r = n.p - d 에는 법선 성분만 남으므로
+    //
+    //        sigma_r = sigma_z * |n.m| = c z^2 * (d / z) = c * z * d
+    //
+    //    이다 (평면 위에서 n.p = d 이므로 n.m = n.p / z = d / z).
+    //    즉 점 하나의 유효 잡음은 깊이에 **선형**이고 평면까지의 거리에
+    //    비례한다. z 는 centroid.z() 다 - centroid 가 인라이어의 평균이므로
+    //    그 z 성분이 곧 평균 깊이다.
+    //
+    // 2. 표본 수 N 으로 나누지 **않는다**.
+    //    독립 표본이면 sigma_r/sqrt(N) 이어야 하지만 이 깊이맵들의 잡음은
+    //    패치 전체에 결맞아 있다. 증거는 이 함수가 방금 계산한 rms 자신이다:
+    //    KITTI 21 m 평면에서 유도값 sigma_r = 0.32 m 인데 같은 평면의 rms 는
+    //    중앙값 0 이다(refine_threshold 0.04 m 안에 전부 들어온다). 화소마다
+    //    독립인 0.32 m 잡음이 있었다면 그럴 수 없다. SGBM 도 구조광도 시차를
+    //    공간적으로 매끄럽게 만들어서, 패치 **안**의 상대 오차는 작고 패치
+    //    **전체**가 통째로 밀린다. 그 통째 이동은 평균화되지 않는다.
+    //
+    //    실측이 확인한다. 정답 포즈로 두 프레임의 같은 평면을 맞대고 남는
+    //    오프셋 차이의 중앙값을 예측 sigma 로 나누면 (6 시퀀스, 961 대응)
+    //        sigma_r        : 0.37 0.23 0.25 1.36 0.69 0.46   시퀀스 간 산포 5.9 배
+    //        sigma_r/sqrt(N): 7.3  5.8  4.5  62   49   34     산포 13.6 배, 값도 5~60 배 어긋남
+    //        현재 상수 0.05 : 2.7  2.1  2.1  0.55 0.096 0.069 산포 39 배
+    //    평균화는 일어나지 않고, 유도값은 상수보다 산포를 7 배 줄인다.
+    //
+    //    **결맞음의 형태까지 맞힌 것은 아니다.** 잡음이 정확히 반지름 방향
+    //    배율(z' = z(1 + c z g))이라면 평면은 기울어지면서 그 기울기를 적합이
+    //    흡수하고, 오프셋에 남는 몫은 c z d 가 아니라 정확히 c d^2 n_z 다
+    //    (정면 n_z=1 이면 c z^2, 광축과 나란한 벽 n_z=0 이면 0). 그 형태를 같은
+    //    실측에 대고 재면 산포가 8.3 배로 5.9 배보다 **나쁘다**. 즉 실제 오차는
+    //    순수한 반지름 배율도 아니고 화소별 독립도 아니다. 여기서는 유도한
+    //    점 잡음 sigma_r 을 평균화되지 않는 바닥으로 쓰는 형태를 택했고, 그것이
+    //    시험한 형태들 중 실데이터에서 가장 안정적이었다. 이 한계는 미해결이다.
+    //
+    // 3. 적합 잔차를 직교로 더한다.
+    //    rms 는 이 평면 자신이 잰 **비결맞은** 산포다. 유도가 예측한 것보다
+    //    실제로 더 지저분한 평면(곡면, 잘못 묶인 클러스터)은 그것으로 스스로
+    //    신고한다. 유도값과 실측값 중 큰 쪽이 이기는 구조라 검산이 내장된다.
+    //
+    // c 를 모르면(depth_sigma_rel <= 0) 유도할 근거가 없으므로 0(미상)으로 둔다.
+    // DirectAligner::depthNoiseFloor 이 같은 자리에서 같은 선택을 한다.
+    if (cfg_.depth_sigma_rel > 0.0 && centroid.z() > 0.0) {
+        const double sigma_r = cfg_.depth_sigma_rel * centroid.z() * distance;
+        out.sigma_offset = std::sqrt(sigma_r * sigma_r + out.rms * out.rms);
+    } else {
+        out.sigma_offset = 0.0;
+    }
     return true;
 }
 

@@ -92,6 +92,22 @@ std::vector<PlaneMatch> StructuralAligner::match(const std::vector<Plane>& refer
             m.angle         = best_angle;
             m.distance_diff = best_dd;
             m.weight        = reference[ri].confidence() * current[best].confidence();
+
+            // 오프셋 잔차 n_cur.t - (d_cur - d_ref) 에는 두 평면의 오프셋 오차가
+            // 각각 한 번씩 들어오고 서로 독립이므로 분산이 더해진다.
+            // 한쪽이라도 유도되지 않았으면(0) 전체를 되돌림 상수로 간다 -
+            // 절반만 유도된 sigma 는 유도값도 상수값도 아니다.
+            const double sr = reference[ri].sigma_offset;
+            const double sc = current[best].sigma_offset;
+            m.sigma_offset = (sr > 0.0 && sc > 0.0) ? std::sqrt(sr * sr + sc * sc)
+                                                    : cfg_.translation_sigma;
+
+            // 법선 잔차도 두 평면의 몫이 독립으로 더해진다. 1/2 로 정규화해서
+            // 잘 맞는 평면 둘(f = 1)이면 정확히 rotation_sigma 가 되게 한다 -
+            // 실측으로 맞춘 절대 크기를 배율이 흔들지 않는다.
+            const double fr = reference[ri].fitDegradation() * reference[ri].fitDegradation();
+            const double fc = current[best].fitDegradation() * current[best].fitDegradation();
+            m.sigma_normal = cfg_.rotation_sigma * std::sqrt(0.5 * (fr * fr + fc * fc));
             matches.push_back(m);
         }
     }
@@ -111,17 +127,26 @@ Result<StructuralAlignmentResult> StructuralAligner::align(const std::vector<Pla
         return {ErrorCode::InsufficientData, "평면 대응이 부족해 SPA 추정 불가"};
     }
 
+    // --- 가중치 -------------------------------------------------------------
+    // 가중치는 전부 **역분산**이다. 무차원 신뢰도가 아니다.
+    //
+    // 회전 가중도 역분산이다. 대응마다 sigma_normal 이 다르고, 그 차이는
+    // 평면의 적합 잔차에서 온다 (근거와 후보 비교는 rotation_sigma 주석).
+    // 무차원 confidence 를 곱하지 않는다 - 그러면 정보행렬이 주장하는 공분산과
+    // 추정기가 실제로 쓴 가중이 어긋난다.
+    if (cfg_.rotation_sigma <= 0.0 || cfg_.translation_sigma <= 0.0) {
+        return {ErrorCode::InvalidArgument, "sigma 가 0 이하라 정보를 만들 수 없음"};
+    }
+
     // --- 회전: 법선끼리의 Kabsch (중심화 없이, 방향만) ---------------------
     // min_R sum w |R n_ref - n_cur|^2  <=>  max_R trace(R^T M), M = sum w n_cur n_ref^T
     double w_sum = 0.0;
     Mat3 M = Mat3::Zero();
     for (const PlaneMatch& mt : result.matches) {
-        const double w = mt.weight;
+        const double w = 1.0 / (mt.sigma_normal * mt.sigma_normal);
         w_sum += w;
-        M.noalias() += w * current[mt.cur_index].normal * reference[mt.ref_index].normal.transpose();
-    }
-    if (w_sum <= 0.0) {
-        return {ErrorCode::Degenerate, "평면 신뢰도가 0 이라 가중치가 없음"};
+        M.noalias() += w * current[mt.cur_index].normal
+                         * reference[mt.ref_index].normal.transpose();
     }
 
     // 구속되지 않은 회전축은 init 을 유지한다. 이 항이 없으면 평면 하나짜리
@@ -142,11 +167,16 @@ Result<StructuralAlignmentResult> StructuralAligner::align(const std::vector<Pla
     //
     // 부호를 뒤집으면 병진이 정확히 반대로 나온다. 항등 정합에서는 양변이 0 이라
     // 드러나지 않으므로, 반드시 병진이 있는 케이스로 검증해야 한다.
+    //
+    // 가중은 1/sigma_offset^2 이다. sqrt(w) 로 잔차를 스케일해야 정규방정식이
+    // sum w n n^T 가 된다 - w 로 스케일하면 가중치가 두 번 적용된다.
+    // 이 가중이 거리를 넣는 자리다: 20 m 벽의 오프셋 sigma 는 1 m 벽의 수십 배라
+    // 병진 해가 가까운 평면 쪽으로 옳게 기운다.
     MatX A(static_cast<int>(m), 3);
     VecX b(static_cast<int>(m));
     for (std::size_t i = 0; i < m; ++i) {
         const PlaneMatch& mt = result.matches[i];
-        const double sw = std::sqrt(mt.weight);
+        const double sw = 1.0 / mt.sigma_offset;      // = sqrt(1/sigma^2)
         A.row(static_cast<int>(i)) = sw * current[mt.cur_index].normal.transpose();
         b(static_cast<int>(i)) = sw * (current[mt.cur_index].distance
                                        - reference[mt.ref_index].distance);
@@ -179,10 +209,11 @@ Result<StructuralAlignmentResult> StructuralAligner::align(const std::vector<Pla
     //
     // 병진 랭크는 위 절단에서 이미 나왔다. A 의 특이값과 A^T A 의 고유값은
     // 같은 것을 두 번 세는 셈이라 따로 만들지 않는다.
-    Mat3 Omega_r = Mat3::Zero();   // 회전 정보 (가중, sigma 미적용)
+    Mat3 Omega_r = Mat3::Zero();   // 회전 정보 (역분산 가중, 이미 sigma 적용됨)
     for (const PlaneMatch& mt : result.matches) {
         const Vec3& n = current[mt.cur_index].normal;
-        Omega_r.noalias() += mt.weight * (Mat3::Identity() - n * n.transpose());
+        Omega_r.noalias() += (1.0 / (mt.sigma_normal * mt.sigma_normal))
+                             * (Mat3::Identity() - n * n.transpose());
     }
 
     Eigen::SelfAdjointEigenSolver<Mat3> es_r(Omega_r);
@@ -205,34 +236,41 @@ Result<StructuralAlignmentResult> StructuralAligner::align(const std::vector<Pla
     // --- 잔차 --------------------------------------------------------------
     // 랭크가 6 이어도 대응이 틀렸으면 여기가 커진다. 랭크는 "구속했는가" 를,
     // 잔차는 "맞았는가" 를 말한다. 둘 다 없으면 조용한 오답을 못 잡는다.
+    //
+    // 가중 없는 RMS 로 낸다. 잔차는 진단이고 진단은 물리 단위로 읽혀야 한다 -
+    // 역분산으로 가중하면 "가까운 평면에서 몇 미터 어긋났는가" 가 아니라
+    // chi 를 읽게 되고, sigma 가 옳은지 물으려는 그 순간 sigma 를 끌어들인다.
     double n_sq = 0.0, o_sq = 0.0;
     for (const PlaneMatch& mt : result.matches) {
         const Plane& pr = reference[mt.ref_index];
         const Plane& pc = current[mt.cur_index];
-        n_sq += mt.weight * (pc.normal - R * pr.normal).squaredNorm();
+        n_sq += (pc.normal - R * pr.normal).squaredNorm();
         const double e = pc.normal.dot(t) - (pc.distance - pr.distance);
-        o_sq += mt.weight * e * e;
+        o_sq += e * e;
     }
-    result.normal_rms = std::sqrt(n_sq / w_sum);
-    result.offset_rms = std::sqrt(o_sq / w_sum);
+    const double inv_m = 1.0 / static_cast<double>(m);
+    result.normal_rms = std::sqrt(n_sq * inv_m);
+    result.offset_rms = std::sqrt(o_sq * inv_m);
 
     // --- 정보행렬 ----------------------------------------------------------
     // 접선 규약은 SE3 와 같은 xi = [rho(3), phi(3)], 좌측 섭동 T <- exp(xi) T 다.
     // 좌측 섭동에서 병진 변화는 rho 뿐 아니라 회전에서도 온다: dt = rho + phi x t.
     // 따라서 오프셋 잔차의 자코비안은 [n^T, (t x n)^T] 이고, 그 교차항을 빼면
     // 회전 불확실성이 병진 확신도로 잘못 새어 들어간다. t = 0 일 때만 블록대각이다.
+    //
+    // 병진 가중은 대응마다 다르다: 1/sigma_offset^2 이고 sigma_offset 은
+    // PlaneExtractor 가 c*z*d 에서 유도한다. 여기가 Lambda 에 **거리**가 들어오는
+    // 자리다. 병진 최소제곱이 쓴 가중과 정확히 같은 값이어야 한다 - 다르면
+    // Lambda 는 그 추정기의 공분산이 아니게 되고 ANEES 가 그 차이를 그대로 문다.
     Mat6 Lam = Mat6::Zero();
-    const double inv_st2 = 1.0 / (cfg_.translation_sigma * cfg_.translation_sigma);
-    const double inv_sr2 = 1.0 / (cfg_.rotation_sigma * cfg_.rotation_sigma);
-
     for (const PlaneMatch& mt : result.matches) {
         const Vec3& n = current[mt.cur_index].normal;
         Vec6 J;
         J.head<3>() = n;
         J.tail<3>() = t.cross(n);
-        Lam.noalias() += (mt.weight * inv_st2) * (J * J.transpose());
+        Lam.noalias() += (1.0 / (mt.sigma_offset * mt.sigma_offset)) * (J * J.transpose());
     }
-    Lam.block<3, 3>(3, 3).noalias() += inv_sr2 * Omega_r;
+    Lam.block<3, 3>(3, 3).noalias() += Omega_r;
     Lam *= std::max(alpha_structural, 1e-6);
     Lam = (0.5 * (Lam + Lam.transpose())).eval();
     result.information = Lam;

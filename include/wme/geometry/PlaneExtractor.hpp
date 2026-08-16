@@ -19,6 +19,7 @@
 
 #include "wme/core/Result.hpp"
 #include "wme/core/Types.hpp"
+#include "wme/token/WorldToken.hpp"   // kStructuredLightDepthSigmaRel - 상수는 한 곳에만 둔다
 
 #include <opencv2/core.hpp>
 
@@ -36,7 +37,33 @@ struct Plane {
     double rms{0.0};             // 적합 잔차 (m)
     std::size_t inliers{0};      // 서브샘플 격자 기준 점 수
 
-    // 넓고 잘 맞는 평면일수록 믿을 만하다. 대응 가중치로 그대로 쓰인다.
+    // 이 평면의 오프셋 d 를 얼마나 믿을 수 있는가 (m). **추출기가 유도해서 채운다** -
+    // 근거는 PlaneExtractor::fit 의 주석이다. 0 은 "미상" 이고, 그때 SPA 는
+    // StructuralAlignerConfig::translation_sigma 로 물러선다.
+    //
+    // 이 값이 생기기 전까지 SPA 의 정보행렬은 거리에도 증거량에도 아무 의존성이
+    // 없었다 - 10 m 벽과 1 m 벽이 같은 정보를 냈다. 이 저장소 자신의 깊이 모델이
+    // sigma_z = c z^2 인데도 그랬다.
+    double sigma_offset{0.0};
+
+    // 적합이 나쁜 만큼 sigma 를 키우는 **무차원** 배율. 잘 맞으면 1 이다.
+    //
+    // 계수 20 (1/m) 은 confidence 가 쓰던 것과 같은 값이고 여기 한 곳에만 둔다 -
+    // confidence 가 이것을 되쓴다. 유도된 값이 아니라 이 저장소가 예전부터
+    // 쓰던 적합 상수이며, 그 사실은 감추지 않는다. 다만 **쓰이는 자리**는 바뀌었다:
+    // 무차원 신뢰도로 정보를 곱하는 것이 아니라, 법선 sigma 를 스케일한다.
+    // 근거는 StructuralAlignerConfig::rotation_sigma 주석의 실측이다.
+    [[nodiscard]] double fitDegradation() const;
+
+    // 넓고 잘 맞는 평면일수록 믿을 만하다.
+    //
+    // **정보량이 아니다.** 대응 순서(큰 평면부터 짝짓기)와 정렬에만 쓴다.
+    // 26.x 까지는 이것의 곱이 PlaneMatch::weight 로 정보행렬에 그대로 들어갔는데,
+    // (a) 무차원이라 sigma 를 대신할 수 없고 (b) inliers 400 에서 포화해서
+    // 실제 벽은 전부 1 이었다. 정보는 sigma_offset / sigma_normal 에서만 온다.
+    //
+    // 두 항 중 **적합 항만** 정보로 돌아갔다. 표본 수 항 min(1, inliers/400) 은
+    // 실측에서 법선 잔차를 오히려 못 맞힌다 (시퀀스 간 산포 11.4 -> 16.1 배).
     [[nodiscard]] double confidence() const;
 
     [[nodiscard]] double signedDistance(const Vec3& p) const {
@@ -66,6 +93,11 @@ struct PlaneExtractorConfig {
 
     // 최소 특이값이 중간 특이값 대비 이 비율을 넘으면 평면이 아니다 (구·모서리).
     double planarity_ratio{0.3};
+
+    // sigma_z = c * z^2 의 c. **센서가 정한다.** 스테레오는 c = sigma_disp/(f*B) 로
+    // 유도되고 (KITTI gray 7.8e-4), 구조광은 여기 기본값이다. 0 을 주면 평면의
+    // sigma_offset 을 유도하지 않고 0(미상)으로 남긴다 - SPA 가 상수로 물러선다.
+    double depth_sigma_rel{kStructuredLightDepthSigmaRel};
 };
 
 // 법선 추정 결과. 진단과 단위 검증용으로 노출한다 - 법선이 틀리면 그 아래

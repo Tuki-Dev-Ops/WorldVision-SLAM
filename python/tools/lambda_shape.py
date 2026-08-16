@@ -82,6 +82,7 @@ Lambda 가 옳다면 eps ~ N(0, Lambda^-1) 이다. 프레임마다 Lambda 가 �
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -95,18 +96,21 @@ import fusion_eval as fe  # noqa: E402
 
 AXES = ["rho_x", "rho_y", "rho_z", "phi_x", "phi_y", "phi_z"]
 
-# 7 개 완전 시퀀스. 27 절과 같은 집합, 같은 산출물(tcgsig_ = TCG sigma 수정 후).
+# 7 개 완전 시퀀스. 27 절과 같은 집합.
+# 산출물 접두사는 WME_LAMBDA_PREFIX 로 바꾼다 - 같은 도구로 수정 전/후를 재려면
+# 접두사가 붙박이여서는 안 된다. 기본값은 27 절이 쓴 tcgsig_ 다.
+PREFIX = os.environ.get("WME_LAMBDA_PREFIX", "tcgsig")
 SEQUENCES = [
-    ("kitti_00", "data/kitti_00", "results/tcgsig_kitti_00"),
-    ("kitti_04", "data/kitti_04", "results/tcgsig_kitti_04"),
-    ("kitti_05", "data/kitti_05", "results/tcgsig_kitti_05"),
-    ("kitti_07", "data/kitti_07", "results/tcgsig_kitti_07"),
+    ("kitti_00", "data/kitti_00", f"results/{PREFIX}_kitti_00"),
+    ("kitti_04", "data/kitti_04", f"results/{PREFIX}_kitti_04"),
+    ("kitti_05", "data/kitti_05", f"results/{PREFIX}_kitti_05"),
+    ("kitti_07", "data/kitti_07", f"results/{PREFIX}_kitti_07"),
     ("fr1_360", "data/rgbd_dataset_freiburg1_360",
-     "results/tcgsig_rgbd_dataset_freiburg1_360"),
+     f"results/{PREFIX}_rgbd_dataset_freiburg1_360"),
     ("fr1_desk", "data/rgbd_dataset_freiburg1_desk",
-     "results/tcgsig_rgbd_dataset_freiburg1_desk"),
+     f"results/{PREFIX}_rgbd_dataset_freiburg1_desk"),
     ("fr1_xyz", "data/rgbd_dataset_freiburg1_xyz",
-     "results/tcgsig_rgbd_dataset_freiburg1_xyz"),
+     f"results/{PREFIX}_rgbd_dataset_freiburg1_xyz"),
 ]
 
 # Lambda^-1 을 쓰는 통계(A, C)의 조건수 게이트. 배정밀도에서 역이 의미를 잃는 지점
@@ -291,7 +295,7 @@ def selftest() -> int:
 
     # 실제 Lambda 를 쓴다. 합성 행렬을 쓰면 검사가 실제 조건수 분포를 안 본다.
     root = Path("data/kitti_00")
-    prefix = Path("results/tcgsig_kitti_00")
+    prefix = Path(f"results/{PREFIX}_kitti_00")
     if not Path(f"{prefix}_tiers.csv").exists():
         print(f"  건너뜀: {prefix}_tiers.csv 가 없다")
         return 1

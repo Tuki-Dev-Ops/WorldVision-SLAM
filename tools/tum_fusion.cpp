@@ -424,6 +424,12 @@ int main(int argc, char** argv) {
     if (plane_min_inliers_cli > 0)
         pcfg.min_inliers = static_cast<std::size_t>(plane_min_inliers_cli);
 
+    // 평면 오프셋 sigma 는 sigma_z = c z^2 에서 유도되므로 c 가 있어야 한다.
+    // Tier 0 에 준 것과 **같은 c** 여야 한다 - 두 티어가 같은 깊이맵을 서로 다른
+    // 잡음이라고 믿으면 융합 가중이 그 차이만큼 틀린다. 주지 않았으면
+    // PlaneExtractorConfig 의 구조광 기본값(TUM)이 남는다.
+    if (cfg.depth_sigma_rel > 0.0) pcfg.depth_sigma_rel = cfg.depth_sigma_rel;
+
     // 설정을 전부 찍는다. 비교표를 나중에 읽을 때 "같은 설정이었나" 를 로그만
     // 보고 답할 수 있어야 한다.
     std::cout << "깊이 유효 범위: [" << cfg.min_depth << ", " << cfg.max_depth << "] m"
@@ -433,7 +439,8 @@ int main(int argc, char** argv) {
               << "  disc " << pcfg.depth_discontinuity
               << "  dist_bin " << pcfg.distance_bin
               << "  refine " << pcfg.refine_threshold
-              << "  min_inliers " << pcfg.min_inliers << "\n";
+              << "  min_inliers " << pcfg.min_inliers
+              << "  depth_sigma_rel " << pcfg.depth_sigma_rel << "\n";
 
     StructuralAlignerConfig scfg;
     if (spa_min_matches_cli > 0)

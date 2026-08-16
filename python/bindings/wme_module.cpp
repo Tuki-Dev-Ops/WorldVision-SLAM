@@ -530,7 +530,7 @@ PYBIND11_MODULE(_core, m) {
     // 잡아야 했다.
     py::class_<Plane>(m, "Plane")
         .def(py::init([](const Vec3& n, double d, std::size_t inl,
-                         const Vec3& c, double ext, double rms) {
+                         const Vec3& c, double ext, double rms, double sig) {
             Plane p;
             p.normal = n.normalized();
             p.distance = d;
@@ -538,16 +538,19 @@ PYBIND11_MODULE(_core, m) {
             p.centroid = c;
             p.extent = ext;
             p.rms = rms;
+            p.sigma_offset = sig;
             return p;
         }), py::arg("normal"), py::arg("distance"), py::arg("inliers") = 100,
             py::arg("centroid") = Vec3::Zero(), py::arg("extent") = 0.5,
-            py::arg("rms") = 0.0)
+            py::arg("rms") = 0.0, py::arg("sigma_offset") = 0.0)
         .def_readwrite("normal", &Plane::normal)
         .def_readwrite("distance", &Plane::distance)
         .def_readwrite("inliers", &Plane::inliers)
         .def_readwrite("centroid", &Plane::centroid)
         .def_readwrite("extent", &Plane::extent)
         .def_readwrite("rms", &Plane::rms)
+        .def_readwrite("sigma_offset", &Plane::sigma_offset)
+        .def_property_readonly("fit_degradation", &Plane::fitDegradation)
         .def_property_readonly("confidence", &Plane::confidence)
         .def("signed_distance", &Plane::signedDistance, py::arg("point"));
 
@@ -563,7 +566,8 @@ PYBIND11_MODULE(_core, m) {
         .def_readwrite("refine_iterations", &PlaneExtractorConfig::refine_iterations)
         .def_readwrite("max_planes", &PlaneExtractorConfig::max_planes)
         .def_readwrite("depth_discontinuity", &PlaneExtractorConfig::depth_discontinuity)
-        .def_readwrite("planarity_ratio", &PlaneExtractorConfig::planarity_ratio);
+        .def_readwrite("planarity_ratio", &PlaneExtractorConfig::planarity_ratio)
+        .def_readwrite("depth_sigma_rel", &PlaneExtractorConfig::depth_sigma_rel);
 
     py::class_<PlaneExtractor>(m, "PlaneExtractor")
         .def(py::init<PlaneExtractorConfig>(), py::arg("config") = PlaneExtractorConfig{})
@@ -581,6 +585,8 @@ PYBIND11_MODULE(_core, m) {
         .def_readonly("cur_index", &PlaneMatch::cur_index)
         .def_readonly("angle", &PlaneMatch::angle)
         .def_readonly("distance_diff", &PlaneMatch::distance_diff)
+        .def_readonly("sigma_offset", &PlaneMatch::sigma_offset)
+        .def_readonly("sigma_normal", &PlaneMatch::sigma_normal)
         .def_readonly("weight", &PlaneMatch::weight);
 
     py::class_<StructuralAlignmentResult>(m, "StructuralAlignmentResult")

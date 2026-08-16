@@ -137,13 +137,15 @@ std::vector<Plane> planesAt(const std::vector<Quad>& scene, const SE3& pose,
 }
 
 // 수동 평면. 대응이 아니라 수치 거동을 재는 테스트에서 쓴다.
-Plane makePlane(const Vec3& n, double d, std::size_t inliers = 400) {
+// sigma = 0 은 "미상" 이고 SPA 가 translation_sigma 로 물러선다.
+Plane makePlane(const Vec3& n, double d, std::size_t inliers = 400, double sigma = 0.0) {
     Plane p;
-    p.normal   = n.normalized();
-    p.distance = d;
-    p.inliers  = inliers;
-    p.rms      = 0.0;
-    p.centroid = p.normal * d;
+    p.normal       = n.normalized();
+    p.distance     = d;
+    p.inliers      = inliers;
+    p.rms          = 0.0;
+    p.centroid     = p.normal * d;
+    p.sigma_offset = sigma;
     return p;
 }
 
@@ -495,6 +497,13 @@ TEST(StructuralAligner, InformationPredictsActualResidualIncrease) {
     // 회전 잔차 r = n_cur - exp(phi) R n_ref 의 정보는 sum w (I - n n^T) 이지
     // sum w n n^T (그 직교여공간) 이 **아니다**. 둘을 바꾸면 관측 가능한 축과
     // 불가능한 축이 정확히 뒤바뀌므로, 이 테스트가 그 오류를 잡는다.
+    //
+    // **이 테스트가 검증하지 못하는 것**을 명시한다: sigma 의 크기다. chi2 를
+    // 정보행렬과 같은 sigma 로 만들어 되읽으므로 sigma 가 통째로 열 배 틀려도
+    // 양변이 같이 움직여 통과한다. 실제로 rotation_sigma/translation_sigma 는
+    // 유도 기록 없이 오래 살아남았고 이 테스트가 그것을 막지 못했다.
+    // 크기는 아래 두 테스트(TranslationInformationIsTheEstimatorCovariance,
+    // DerivedPlaneSigmaMatchesTheScatterUnderDepthNoise)가 검증한다.
     const auto planes = planesAt(room(), looking(Vec3(-0.8, -1.2, 1.3), Vec3(2.0, 2.5, 0.6)));
     ASSERT_GE(planes.size(), 3u);
 
@@ -503,9 +512,6 @@ TEST(StructuralAligner, InformationPredictsActualResidualIncrease) {
     const auto r = spa.align(planes, planes);   // 항등 => t = 0, 잔차 0
     ASSERT_TRUE(r.ok()) << r.error().message();
     const Mat6& Lam = r.value().information;
-
-    const double inv_sr2 = 1.0 / (cfg.rotation_sigma * cfg.rotation_sigma);
-    const double inv_st2 = 1.0 / (cfg.translation_sigma * cfg.translation_sigma);
 
     std::mt19937 gen(4242);
     std::normal_distribution<double> nd(0.0, 1.0);
@@ -518,10 +524,12 @@ TEST(StructuralAligner, InformationPredictsActualResidualIncrease) {
         // --- 회전 섭동 ---
         const Vec3 phi = kStep * dir;
         const Mat3 Rp = SO3::exp(phi).matrix();
+        // 회전도 대응마다 sigma 가 다르다. 하나로 묶으면 평면별 법선 sigma 를
+        // 통째로 무시하는 구현도 이 테스트를 통과한다.
         double chi2 = 0.0;
         for (const PlaneMatch& m : r.value().matches) {
             const Vec3& n = planes[m.cur_index].normal;
-            chi2 += m.weight * (n - Rp * n).squaredNorm() * inv_sr2;
+            chi2 += (n - Rp * n).squaredNorm() / (m.sigma_normal * m.sigma_normal);
         }
         Vec6 xi = Vec6::Zero();
         xi.tail<3>() = phi;
@@ -531,18 +539,266 @@ TEST(StructuralAligner, InformationPredictsActualResidualIncrease) {
         EXPECT_GT(pred, 0.0);
 
         // --- 병진 섭동 ---
+        // 대응마다 sigma 가 다르다. 하나로 묶으면 그 차이가 사라져 이 테스트가
+        // 평면별 sigma 를 통째로 무시하는 구현도 통과시킨다.
         const Vec3 rho = kStep * dir;
         double chi2_t = 0.0;
         for (const PlaneMatch& m : r.value().matches) {
             const Vec3& n = planes[m.cur_index].normal;
             const double e = n.dot(rho);
-            chi2_t += m.weight * e * e * inv_st2;
+            chi2_t += e * e / (m.sigma_offset * m.sigma_offset);
         }
         Vec6 xt = Vec6::Zero();
         xt.head<3>() = rho;
         const double pred_t = xt.transpose() * Lam * xt;
         EXPECT_NEAR(chi2_t, pred_t, 1e-9 * std::max(1.0, chi2_t));
     }
+}
+
+TEST(StructuralAligner, TranslationInformationIsTheEstimatorCovariance) {
+    // **스케일 검증.** 위 테스트가 못 하는 것을 여기서 한다.
+    //
+    // 잡음을 테스트가 직접 주입한다. 평면 오프셋에 알려진 sigma 로 흔들고,
+    // 그때 나오는 병진 해의 표본 공분산이 Lambda^-1 과 맞는지 본다. Lambda 가
+    // 두 배 과신이면 NEES 가 네 배로 나오므로 상수를 되읽는 항등식이 아니다.
+    //
+    // 진리 포즈를 항등으로 두는 이유: t = 0 이면 J = [n; t x n] 의 회전 항이
+    // 사라져 병진 블록이 분리된다. 병진 3 자유도만 흔들었으므로 기대 NEES 는 3 이다.
+    constexpr double kSigma = 0.03;             // 대응 하나의 합성 오프셋 sigma
+    const double kHalf = kSigma / std::sqrt(2.0);   // 평면 하나의 몫
+
+    const Vec3 dirs[3] = {Vec3(0, 0, 1), Vec3(1, 0, 0), Vec3(0, 1, 0)};
+    const double dist[3] = {3.0, 2.0, 1.5};
+
+    StructuralAlignerConfig cfg;
+    StructuralAligner spa(cfg);
+
+    std::mt19937 gen(20260816);
+    std::normal_distribution<double> nd(0.0, kHalf);
+
+    constexpr int kTrials = 4000;
+    double nees_sum = 0.0;
+    int used = 0;
+    for (int trial = 0; trial < kTrials; ++trial) {
+        std::vector<Plane> ref, cur;
+        for (int k = 0; k < 3; ++k) {
+            ref.push_back(makePlane(dirs[k], dist[k] + nd(gen), 400, kHalf));
+            cur.push_back(makePlane(dirs[k], dist[k] + nd(gen), 400, kHalf));
+        }
+        const auto r = spa.align(ref, cur);
+        if (!r.ok()) continue;
+        // 진리는 항등이므로 오차는 해 그 자체다.
+        const Vec3 rho = r.value().T_cur_ref.translation();
+        const Mat3 Lam_t = r.value().information.block<3, 3>(0, 0);
+        nees_sum += rho.transpose() * Lam_t * rho;
+        ++used;
+    }
+    ASSERT_GT(used, kTrials / 2);
+    const double nees = nees_sum / used;
+    std::cout << "[측정] 병진 NEES " << nees << " (기대 3, 표본 " << used << ")\n";
+
+    // 표본 4000 개면 NEES 의 표준오차는 sqrt(2*3/4000) = 0.039 다. 0.15 는
+    // 그 네 배쯤이라 통계 요동으로는 못 넘고, sigma 가 5 % 만 틀려도 넘는다.
+    EXPECT_NEAR(nees, 3.0, 0.15)
+        << "Lambda 의 병진 블록이 추정기의 공분산이 아니다 - sigma 스케일이 틀렸다";
+}
+
+TEST(StructuralAligner, InformationScalesWithDistanceNotWithSampleCount) {
+    // Lambda 가 **거리**에 의존하고 **표본 수**에는 의존하지 않는다는 유도를
+    // 코드에 못박는다. 26.x 까지는 정확히 반대였다 - 거리 무관이고 inliers 400
+    // 에서 포화하는 confidence 곱에만 비례했다.
+    //
+    // 정면 평면이면 centroid = n*d 라 z = d 이고 sigma_r = c z d = c d^2 이므로
+    // 정보는 d^-4 로 떨어진다. 1 m 와 10 m 를 견주면 정확히 10^4 배다.
+    PlaneExtractorConfig pcfg;                 // depth_sigma_rel 기본값(구조광)
+    const double c = pcfg.depth_sigma_rel;
+    ASSERT_GT(c, 0.0);
+
+    auto frontalSet = [&](double d, std::size_t inliers) {
+        std::vector<Plane> v;
+        const Vec3 dirs[3] = {Vec3(0, 0, 1), Vec3(1, 0, 0), Vec3(0, 1, 0)};
+        for (const Vec3& n : dirs) {
+            Plane p = makePlane(n, d, inliers);
+            p.centroid     = n * d;
+            p.sigma_offset = c * p.centroid.dot(n) * d;   // = c d^2
+            v.push_back(p);
+        }
+        return v;
+    };
+
+    StructuralAligner spa;
+    const auto near_r = spa.align(frontalSet(1.0, 400), frontalSet(1.0, 400));
+    const auto far_r  = spa.align(frontalSet(10.0, 400), frontalSet(10.0, 400));
+    ASSERT_TRUE(near_r.ok());
+    ASSERT_TRUE(far_r.ok());
+
+    const double near_t = near_r.value().information.block<3, 3>(0, 0).trace();
+    const double far_t  = far_r.value().information.block<3, 3>(0, 0).trace();
+    std::cout << "[측정] 병진 정보 1 m " << near_t << " vs 10 m " << far_t
+              << "  비 " << near_t / far_t << " (유도 1e4)\n";
+    EXPECT_NEAR(near_t / far_t, 1e4, 1e4 * 1e-6)
+        << "정보가 거리에 의존하지 않는다 - sigma_z = c z^2 이 Lambda 에 닿지 않았다";
+
+    // 표본 수는 정보를 바꾸지 않는다. 깊이 잡음이 패치 전체에 결맞아 있어서
+    // 평균화가 일어나지 않는다는 유도의 직접 귀결이고, 회전 쪽에서도 실측이
+    // 표본 수 항을 기각했다 (시퀀스 간 산포 11.4 -> 16.1 배).
+    // confidence 곱을 정보행렬에 되돌려 놓으면 여기가 깨진다.
+    const auto few  = spa.align(frontalSet(2.0, 200), frontalSet(2.0, 200));
+    const auto many = spa.align(frontalSet(2.0, 5000), frontalSet(2.0, 5000));
+    ASSERT_TRUE(few.ok());
+    ASSERT_TRUE(many.ok());
+    EXPECT_TRUE(few.value().information.isApprox(many.value().information, 1e-12))
+        << "정보가 inliers 에 의존한다 - confidence 가 정보 경로로 돌아왔다";
+}
+
+TEST(StructuralAligner, RotationSigmaScalesWithFitResidualOnly) {
+    // 회전 정보가 **평면마다** 달라지고, 그 차이가 적합 잔차에서만 온다.
+    //
+    // 26.x 까지 회전 블록은 confidence 곱에 비례했고, 그 안에는 (a) 적합 항과
+    // (b) inliers 400 에서 포화하는 표본 수 항이 섞여 있었다. 실측은 (a) 만
+    // 법선 잔차를 맞히고 (b) 는 오히려 나쁘다고 말한다. 그 갈림을 못박는다.
+    auto set = [](double rms, std::size_t inliers) {
+        std::vector<Plane> v;
+        const Vec3 dirs[3] = {Vec3(0, 0, 1), Vec3(1, 0, 0), Vec3(0, 1, 0)};
+        for (const Vec3& n : dirs) {
+            Plane p = makePlane(n, 2.0, inliers, 0.01);   // sigma_offset 고정
+            p.rms = rms;
+            v.push_back(p);
+        }
+        return v;
+    };
+
+    StructuralAlignerConfig cfg;
+    StructuralAligner spa(cfg);
+
+    const auto clean = spa.align(set(0.0, 400), set(0.0, 400));
+    const auto rough = spa.align(set(0.05, 400), set(0.05, 400));
+    ASSERT_TRUE(clean.ok());
+    ASSERT_TRUE(rough.ok());
+
+    // f = (1 + 20 rms)^2. rms = 0.05 면 (1+1)^2 = 4 라 sigma 가 4 배, 정보는 1/16 배다.
+    const double rc = clean.value().information.block<3, 3>(3, 3).trace();
+    const double rr = rough.value().information.block<3, 3>(3, 3).trace();
+    std::cout << "[측정] 회전 정보 rms 0 " << rc << " vs rms 0.05 " << rr
+              << "  비 " << rc / rr << " (기대 16)\n";
+    EXPECT_NEAR(rc / rr, 16.0, 16.0 * 1e-9)
+        << "회전 sigma 가 적합 잔차를 따르지 않는다";
+
+    // 잘 맞는 평면 둘이면 정확히 rotation_sigma 로 환원된다. 배율 도입이
+    // 실측으로 맞춘 절대 크기를 흔들면 안 된다.
+    for (const PlaneMatch& mt : clean.value().matches) {
+        EXPECT_NEAR(mt.sigma_normal, cfg.rotation_sigma, cfg.rotation_sigma * 1e-12)
+            << "f = 1 인데 sigma_normal 이 rotation_sigma 가 아니다";
+    }
+
+    // 표본 수는 회전 정보를 바꾸지 않는다.
+    const auto few  = spa.align(set(0.0, 200), set(0.0, 200));
+    const auto many = spa.align(set(0.0, 5000), set(0.0, 5000));
+    ASSERT_TRUE(few.ok());
+    ASSERT_TRUE(many.ok());
+    const Mat3 rot_few  = few.value().information.block<3, 3>(3, 3);
+    const Mat3 rot_many = many.value().information.block<3, 3>(3, 3);
+    EXPECT_TRUE(rot_few.isApprox(rot_many, 1e-12))
+        << "회전 정보가 inliers 에 의존한다 - 실측이 기각한 항이 돌아왔다";
+}
+
+TEST(PlaneExtractor, DerivedPlaneSigmaMatchesTheScatterUnderDepthNoise) {
+    // **유도 검증.** sigma_offset = c * z * d 가 실제 산포를 맞히는가를
+    // 깊이맵에서 끝까지 확인한다. 정합기를 거치지 않으므로 "평면 하나를
+    // 관측하는 오차" 만 잰다.
+    //
+    // **이 테스트가 재는 것과 재지 않는 것.**
+    //   재는 것  : sigma_z = c z^2 -> sigma_r = c z d 의 전파, 특히 투영 인자
+    //              |n.m| = d/z 가 코드에 실제로 들어갔는가. 시점을 바꿔 d/z 를
+    //              흔들면 sigma_offset 이 그만큼 따라 움직여야 한다.
+    //   안 재는 것: sigma_offset 이 **실제 산포와 같은가**. 합성 장면에서는
+    //              그렇지 않고, 그 사실 자체가 측정으로 확인됐다:
+    //
+    //                화소마다 독립인 sigma_z = c z^2 을 넣고 400 회 뽑으면
+    //                오프셋 산포는 sigma_r/sqrt(N) 의 **13.9 배**다.
+    //                원인은 d = n . x_bar 라는 정의다 - 오프셋은 법선 오차를
+    //                원점까지의 팔 길이 |x_perp| 만큼 물려받는다.
+    //
+    //              그런데 그 지렛대 항을 실데이터(6 시퀀스 961 대응)에 넣으면
+    //              시퀀스 간 산포가 5.9 -> 7.4 배로 **나빠진다**. 즉 실제
+    //              깊이맵의 잡음은 여기 합성한 독립 잡음과 구조가 다르고,
+    //              합성 장면은 sigma 의 **크기**를 검증할 수 없다. 크기 검증은
+    //              TranslationInformationIsTheEstimatorCovariance 가 정합기
+    //              쪽에서, 실데이터 검증은 PlaneExtractor::fit 주석의 실측이
+    //              맡는다. 여기서 섞어서 주장하지 않는다.
+    //
+    // **비스듬한 시점**이라야 판별력이 있다. 정면이면 d = z 라 c z d 와 c z^2 이
+    // 같은 값이고, 투영 인자를 빠뜨린 구현도 통과한다.
+    constexpr double c = 2e-4;
+    const CameraIntrinsics K = makeK();
+    const auto scene = room();
+    const SE3 pose = looking(Vec3(-0.8, -1.2, 1.3), Vec3(2.0, 2.5, 0.6));
+    const cv::Mat clean = renderDepth(scene, pose, K);
+
+    PlaneExtractorConfig cfg;
+    cfg.depth_sigma_rel = c;
+    PlaneExtractor ex(cfg);
+
+    const auto base = ex.extract(clean, K);
+    ASSERT_TRUE(base.ok());
+    ASSERT_FALSE(base.value().empty());
+    // 가장 비스듬한 평면을 고른다. 1 등 평면은 이 시점에서 거의 정면이라
+    // d/z 가 0.94 이고, 그 값으로는 투영 인자를 빠뜨린 구현도 통과한다.
+    const Plane* pick = nullptr;
+    for (const Plane& q : base.value()) {
+        if (q.centroid.z() <= 0.0) continue;
+        if (pick == nullptr ||
+            q.distance / q.centroid.z() < pick->distance / pick->centroid.z()) {
+            pick = &q;
+        }
+    }
+    ASSERT_NE(pick, nullptr);
+    const Plane p0 = *pick;
+    const double dz_ratio = p0.distance / p0.centroid.z();
+    std::cout << "[측정] 검증 평면: z " << p0.centroid.z() << " m, d " << p0.distance
+              << " m, d/z " << dz_ratio << "\n";
+    ASSERT_LT(dz_ratio, 0.9) << "정면 평면이라 c*z*d 와 c*z^2 을 구분하지 못한다";
+
+    // --- 유도가 코드에 그대로 들어갔는가 ------------------------------------
+    // 잡음이 없으므로 rms 는 수치 바닥이고 sigma_offset 은 c z d 그 자체여야 한다.
+    const double expect = std::sqrt(std::pow(c * p0.centroid.z() * p0.distance, 2.0)
+                                    + p0.rms * p0.rms);
+    EXPECT_NEAR(p0.sigma_offset, expect, expect * 1e-12)
+        << "sigma_offset 이 sqrt((c z d)^2 + rms^2) 가 아니다";
+
+    // --- 투영 인자 d/z 가 실제로 들어갔는가 ---------------------------------
+    // 같은 c, 같은 장면에서 시점만 바꿔 d/z 를 흔든다. sigma_offset / (c z^2) 은
+    // 곧 d/z 여야 한다. c z^2 으로 잘못 쓰면 이 비가 두 평면에서 모두 1 이 되어
+    // 갈리지 않는다.
+    // rms 항은 빼고 본다. 합성 장면에서도 큰 비스듬한 면은 rms 가 3 mm 대라
+    // 그것을 남겨 두면 유도 몫이 묻힌다.
+    for (const Plane& q : base.value()) {
+        if (q.centroid.z() <= 0.0 || q.inliers < 200) continue;
+        const double derived = std::sqrt(std::max(0.0, q.sigma_offset * q.sigma_offset
+                                                       - q.rms * q.rms));
+        const double ratio = derived / (c * q.centroid.z() * q.centroid.z());
+        const double dz = q.distance / q.centroid.z();
+        std::cout << "[측정] 평면 d/z " << dz << " -> (유도 몫)/(c z^2) " << ratio
+                  << "  rms " << q.rms << "\n";
+        EXPECT_NEAR(ratio, dz, std::max(1e-9, dz * 0.02))
+            << "투영 인자 |n.m| = d/z 가 빠졌다";
+    }
+
+    // --- 거리 의존이 이차인가 ------------------------------------------------
+    // 정면 벽을 두 거리에서 본다. sigma_offset 은 c d^2 이므로 거리 두 배면 네 배다.
+    PlaneExtractorConfig wcfg = cfg;
+    PlaneExtractor wex(wcfg);
+    auto wall = [&](double y) {
+        auto r = wex.extract(renderDepth(singleWall(y), frontal(Vec3::Zero()), K), K);
+        EXPECT_TRUE(r.ok());
+        EXPECT_FALSE(r.value().empty());
+        return r.value().front().sigma_offset;
+    };
+    const double s3 = wall(3.0), s6 = wall(6.0);
+    std::cout << "[측정] 정면 벽 sigma_offset  3 m " << s3 << "  6 m " << s6
+              << "  비 " << s6 / s3 << " (유도 4)\n";
+    EXPECT_NEAR(s6 / s3, 4.0, 0.05)
+        << "거리 의존이 이차가 아니다 - sigma_z = c z^2 이 전파되지 않았다";
 }
 
 TEST(StructuralAligner, RotationInformationIsNotTheNormalScatter) {
