@@ -520,33 +520,45 @@ python python/tools/fetch_tartanair_360.py --out data/pano_seq --frames 50
 
 # 시각화
 
-WME는 계산 결과를 숫자로만 확인하지 않도록 두 가지 뷰어를 제공합니다.
+**결과를 보는 곳은 Unity 빌드 하나입니다.** SLAM이 만들어낸 세계를 직접 돌아다니면서 확인합니다.
 
-## C++ Viewer
+C++ 쪽에도 뷰어 창이 있지만 그것은 개발용 계측기이고, 결과를 보려고 띄울 필요는 없습니다. C++ 도구가 파이프라인에서 하는 일은 **씬을 파일로 내보내는 것**이고, 그건 아래 한 줄이면 끝납니다.
 
-점군과 포즈, 객체, 판정 결과를 직접 확인하는 계측용 뷰어입니다.
-
-```bash
-build/win/tools/wme_bench_viewer \
-    --manifest results/bench/viewer.tsv \
-    --seq 0 \
-    --frame 399 \
-    --voxel 0.15
+```text
+SLAM
+ ↓
+World Model
+ ↓
+JSON / WVPC        ← C++ 가 여기까지 만든다 (headless)
+ ↓
+Unity
+ ↓
+3D World           ← 여기서 본다
 ```
 
-조작은 `1`~`4` 카메라 전환, `Space` 재생·정지, `←→` 스크럽, `C` 점군 색 전환, `F1`~`F7` 클래스 토글, `Q` 종료입니다.
+## 씬 내보내기 (한 번)
 
-Windows에서는 실행 전에 OpenCV DLL 경로를 PATH에 넣어야 합니다. 넣지 않으면 `exit -1073741515`로 끝나는데, 종료 코드만 보면 크래시처럼 보이지만 실제로는 실행 자체가 시작되지 않은 것입니다.
+```bash
+# Windows: OpenCV DLL 경로를 PATH 에 넣어야 한다
+$env:PATH = "C:\opencv-dl\opencv\build\x64\vc16\bin;" + $env:PATH
 
-`--frame`에 시퀀스 길이 이상을 주면 조용히 무한 루프합니다. `nframes`는 kitti_00 / 05 / 07이 400, kitti_04가 136입니다.
+build/win/tools/wme_bench_viewer --manifest results/bench/viewer.tsv \
+    --seq 0 --frame 399 --voxel 0.15 \
+    --export-json results/scene/kitti_00.json \
+    --screenshot  /tmp/shot.png
+```
+
+`--export-json`을 주면 창을 띄우지 않고 `.json`과 `.wvpc`를 만들고 끝납니다. `.wvpc`는 확장자만 바꿔 자동으로 함께 나옵니다.
+
+DLL 경로를 빼면 `exit -1073741515`로 끝나는데, 종료 코드만 보면 크래시처럼 보이지만 실제로는 실행 자체가 시작되지 않은 것입니다.
+
+`--frame`에 시퀀스 길이 이상을 주면 조용히 무한 루프합니다. `nframes`는 kitti_00 / 05 / 07이 400, kitti_04가 136이므로 각각 399, 135가 최대입니다.
 
 ---
 
 ## Unity Viewer
 
-SLAM이 만들어낸 세계를 직접 돌아다니면서 확인할 수 있는 환경입니다.
-
-C++에서 생성한
+여기가 결과를 보는 곳입니다. 위에서 만든
 
 ```text
 .json
@@ -555,24 +567,14 @@ C++에서 생성한
 
 파일을 Unity가 읽어들입니다.
 
-```text
-SLAM
- ↓
-World Model
- ↓
-JSON / WVPC
- ↓
-Unity
- ↓
-3D World
-```
-
-Unity에서는 WASD 이동, 마우스 시점, 점프, 비행 등의 기본적인 탐색 기능을 제공합니다.
+WASD 이동, 마우스 시점, 점프, 비행 등의 기본적인 탐색 기능을 제공합니다.
 
 ```powershell
 powershell -ExecutionPolicy Bypass `
     -File engine/unity/build.ps1 -Run
 ```
+
+오른쪽 위 목록에서 시퀀스를 고릅니다. 화면 이름은 `Data_Set_01`~`05`이고 그 아래에 산출물 이름이 함께 뜹니다. 대응표는 `engine/unity/wvdata_names.tsv` 한 곳입니다.
 
 데이터만 바꾸는 경우 Unity를 다시 빌드할 필요도 없습니다. 실행 파일 옆의 `wvdata/`를 교체하면 됩니다.
 
