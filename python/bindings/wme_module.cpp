@@ -444,7 +444,11 @@ PYBIND11_MODULE(_core, m) {
         .def_readwrite("evidence_ema", &EnvironmentConfig::evidence_ema)
         .def_readwrite("dcp_patch", &EnvironmentConfig::dcp_patch)
         .def_readwrite("dark_brightness", &EnvironmentConfig::dark_brightness)
-        .def_readwrite("texture_min_gradient", &EnvironmentConfig::texture_min_gradient);
+        .def_readwrite("texture_min_gradient", &EnvironmentConfig::texture_min_gradient)
+        // 무한으로 두면 자기운동 게이트가 항상 열려 27 절 이전 동작이 된다.
+        // 같은 기록 하나에서 게이트 전/후 alpha 를 둘 다 유도하기 위한 손잡이다.
+        .def_readwrite("particle_max_window_shift_px",
+                       &EnvironmentConfig::particle_max_window_shift_px);
 
     // 추정기들은 private 이다. 그대로 두고 공개 경로(update)로 비교한다 -
     // evidence_ema=1.0 이면 EMA 가 통과가 되어 그 프레임의 원 추정값이 그대로

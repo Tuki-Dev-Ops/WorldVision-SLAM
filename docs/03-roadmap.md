@@ -47,6 +47,22 @@ looks more finished than it is.
 calibration. They must be fit on real adverse-condition data before any accuracy claim is
 publishable. Until then, treat them as a structural hypothesis, not a result.
 
+> **Update — this risk has been measured and it resolved against the hypothesis.**
+> `06-results.md` §21 fitted `α_k(E)` and §27 re-measured it on complete data. On seven full
+> sequences the schedule loses to plain uniform weights **7 of 7**, and both lose to using Tier 0
+> alone. §27.3 measured *why*: the Spearman correlation between `α_k` and the error of the tier it
+> governs is **−0.05 to −0.02**, with the sign holding on 4 of 7 sequences — the schedule does not
+> predict tier reliability, so no re-fit of its coefficients can help. §27.4 closes the escape
+> route: fusion is exactly invariant to a common weight scale, and every observable that *does*
+> predict per-frame error predicts it for all three tiers with the same sign, so it moves only the
+> common scale and changes nothing.
+>
+> The `0.40 · rain_streak` and `0.45 · snow_particle` coefficients specifically are **still
+> unvalidated and now known to be inert** on all available data: §27.5 found the two channels
+> feeding them were reporting rain 0.40 / snow 0.59 on dry indoor footage on 99.3 % of frames, and
+> §27.6 gates the estimator on ego-motion so it abstains instead. Validating the coefficients needs
+> static-camera precipitation footage, which is not on disk.
+
 **Second risk:** ECDA is verified only against synthetic planar homography warps. That
 proves the Jacobians, the pyramid, the affine model, and the dynamic-mask benefit are
 correct, but it does not prove behaviour on real sensor data with real depth noise. TUM-RGBD

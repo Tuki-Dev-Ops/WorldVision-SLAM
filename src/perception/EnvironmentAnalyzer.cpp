@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <numeric>
 
 namespace wme {
@@ -86,6 +87,11 @@ void EnvironmentAnalyzer::reset() {
     history_count_ = 0;
     prev_gray_.release();
     temporal_median_.release();
+    shift_hist_.clear();
+    shift_head_       = 0;
+    shift_count_      = 0;
+    last_shift_px_    = std::numeric_limits<double>::infinity();
+    last_shift_valid_ = false;
     state_       = EnvironmentState{};
     indoorness_ema_ = 0.5;
     last_update_ = Timestamp{};
@@ -131,6 +137,50 @@ void EnvironmentAnalyzer::analyzeTransientParticles(const cv::Mat& gray_f,
     // 시간적 중앙값 대비 양의 잔차를 뽑으면 배경 움직임과 분리된다.
     // 링 버퍼에 덮어쓴다. clone() 은 프레임마다 Mat 을 새로 잡았다.
     const auto cap = static_cast<std::size_t>(std::max(1, cfg_.history_size));
+
+    // --- 자기운동 게이트 ---------------------------------------------------
+    // 위 문장의 "배경 움직임과 분리된다" 는 카메라가 서 있을 때만 참이다.
+    // 화소별 시간 중앙값은 그 화소가 창 내내 같은 장면점을 보고 있어야
+    // 배경 모형이 된다. 카메라가 움직이면 모든 엣지가 양의 시간 잔차를 만들고,
+    // 그 잔차의 구조텐서 이방성이 비/눈으로 읽힌다.
+    //
+    // 실측: 손들기 TUM 시퀀스(강수 전무, 실내)에서 이 게이트가 없으면
+    // rain_streak 중앙값 0.40, snow_particle 0.59 가 프레임의 99.3 % 에서
+    // 보고됐다. particle_ratio 는 0.23~0.37 - 추정기 자신이 "극심" 으로 보는
+    // 0.05 의 5~7 배다. visibility 가 0.61 로 눌리고, 그 결과 alpha2/alpha0
+    // 비가 부풀어 가장 부정확한 tier(SPA)가 상대적으로 올라갔다.
+    //
+    // 한계값 1 px 는 튜닝한 숫자가 아니라 통계 자체의 표본 간격이다. 중앙값을
+    // 화소 색인별로 잡으므로 내용이 그 화소를 벗어나면 다른 장면점이 섞인다.
+    // 창 안의 경로길이(각 프레임 이동량의 합)로 재는 것은 보수적인 방향이다 -
+    // 경로길이는 알짜 변위의 상한이므로, 경로가 1 px 미만이면 알짜도 확실히
+    // 1 px 미만이다.
+    // 창에 프레임이 N 개면 그 안의 전이는 N-1 개다. 링을 cap 개로 잡고 N 개를
+    // 더하면 창 밖의 전이 하나가 섞인다 - 특히 첫 프레임의 "직전이 없다"(무한)가
+    // 9 프레임 동안 창에 남아 정지 카메라에서도 게이트가 열리지 않았다.
+    // 차등 테스트가 바로 이걸로 실패했다.
+    const std::size_t shift_cap = std::max<std::size_t>(1, cap - 1);
+    if (shift_hist_.size() != shift_cap) {
+        shift_hist_.assign(shift_cap, 0.0);
+        shift_head_  = 0;
+        shift_count_ = 0;
+    }
+    // 직전 프레임이 없었으면 전이가 존재하지 않는다. 무한을 밀어넣는 것이 아니라
+    // 아무것도 밀어넣지 않는 것이 맞다 - 없는 전이는 경로에 기여하지 않는다.
+    if (last_shift_valid_) {
+        shift_hist_[(shift_head_ + shift_count_) % shift_cap] = last_shift_px_;
+        if (shift_count_ < shift_cap) ++shift_count_;
+        else                          shift_head_ = (shift_head_ + 1) % shift_cap;
+    }
+
+    double path_px = 0.0;
+    for (std::size_t i = 0; i < shift_count_; ++i) {
+        path_px += shift_hist_[(shift_head_ + i) % shift_cap];
+    }
+    state_.particle_window_shift_px = path_px;
+    state_.particles_measurable     = (path_px < cfg_.particle_max_window_shift_px);
+
+    // --- 프레임 이력 링 ----------------------------------------------------
     if (history_.size() != cap) {
         history_.assign(cap, cv::Mat{});
         history_head_  = 0;
@@ -141,6 +191,15 @@ void EnvironmentAnalyzer::analyzeTransientParticles(const cv::Mat& gray_f,
     else                      history_head_ = (history_head_ + 1) % cap;
 
     if (history_count_ < 3) { ev.rain_streak = 0.0; ev.snow_particle = 0.0; return; }
+
+    // 판정 불가면 강수를 주장하지 않는다. 0 은 "비가 없다" 가 아니라 "이 창에서
+    // 비를 잴 수 없다" 는 뜻이며, 그 구별은 particles_measurable 이 들고 있다.
+    // 중앙값 계산 자체를 건너뛰므로 움직이는 카메라에서 비용도 사라진다.
+    if (!state_.particles_measurable) {
+        ev.rain_streak = 0.0;
+        ev.snow_particle = 0.0;
+        return;
+    }
 
     // 픽셀별 시간 중앙값
     const int n = static_cast<int>(history_count_);
@@ -205,6 +264,10 @@ void EnvironmentAnalyzer::analyzeTransientParticles(const cv::Mat& gray_f,
 double EnvironmentAnalyzer::estimateShake(const cv::Mat& gray_f) {
     if (prev_gray_.empty() || prev_gray_.size() != gray_f.size()) {
         gray_f.copyTo(prev_gray_);
+        // 직전 프레임이 없으면 전이 자체가 존재하지 않는다. "이동량 0" 도
+        // "이동량 무한" 도 아니라 "해당 없음" 이며, 경로 누적에서 빠져야 한다.
+        last_shift_px_   = std::numeric_limits<double>::infinity();
+        last_shift_valid_ = false;
         return 0.0;
     }
     // 위상상관으로 전역 병진 성분을 구한다. 큰 값 = 흔들림 또는 급회전.
@@ -213,6 +276,11 @@ double EnvironmentAnalyzer::estimateShake(const cv::Mat& gray_f) {
     gray_f.copyTo(prev_gray_);
 
     const double mag = std::hypot(shift.x, shift.y);
+    // 0..1 로 누르기 전의 원값. 시간 중앙값 유효성 판정이 이것을 쓴다.
+    // 위상상관이 값을 못 내면(NaN) 잰 것이 아니므로 창을 오염시켜야 한다 -
+    // 여기서만 무한이 유효한 전이로 들어간다.
+    last_shift_px_    = std::isfinite(mag) ? mag : std::numeric_limits<double>::infinity();
+    last_shift_valid_ = true;
     // 저해상도 기준 8 px 이동을 극심으로 본다
     return clamp01(mag / 8.0) * clamp01(response * 2.0);
 }

@@ -108,6 +108,72 @@ def scharr(gray_f: np.ndarray, scale: float = 1.0 / 32.0) -> tuple[np.ndarray, n
     return gx, gy
 
 
+# --- 시간 창 추정기 ---------------------------------------------------------
+
+# 시간 잔차에서 입자로 셀 최소 밝기 상승분 (gray). C++ 과 같은 값.
+PARTICLE_RESIDUAL_THRESH = 8.0
+# 이 비율 이상이면 입자 밀도를 1(극심)로 본다.
+PARTICLE_SATURATION_RATIO = 0.05
+# 시간 창 안에서 허용되는 전역 이동 경로길이 (분석 해상도 px).
+# 화소별 중앙값이 같은 장면점을 보고 있어야 하므로 표본 간격 = 1 px 이다.
+PARTICLE_MAX_WINDOW_SHIFT_PX = 1.0
+
+
+def transient_particles(history: list[np.ndarray],
+                        window_shift_px: float) -> tuple[float, float]:
+    """``EnvironmentAnalyzer::analyzeTransientParticles`` 의 오라클.
+
+    ``history`` 는 오래된 것부터 나열한 저해상도 그레이 프레임(float)이고
+    마지막 원소가 현재 프레임이다. ``window_shift_px`` 는 그 창에 누적된
+    전역 이동 경로길이로, 위상상관(``estimateShake``)에서 온다 - 여기서
+    phaseCorrelate 를 다시 쓰지 않는 이유는 INTER_AREA 를 재현하지 않는 것과
+    같다. 이 함수가 검증하려는 대상이 아니다.
+
+    반환은 (rain_streak, snow_particle).
+
+    자기운동 게이트가 이 함수의 핵심이다. 시간 중앙값은 카메라가 서 있을 때만
+    배경 모형이므로, 창 안에서 1 px 넘게 움직였으면 잔차는 강수가 아니라
+    자기운동을 잰다. 게이트 없이 손들기 TUM 시퀀스를 돌리면 강수가 전혀 없는
+    실내에서 rain 0.40 / snow 0.59 가 프레임의 99.3 % 에서 나온다.
+    """
+    if len(history) < 3:
+        return 0.0, 0.0
+    if not (window_shift_px < PARTICLE_MAX_WINDOW_SHIFT_PX):
+        # NaN/inf 도 여기서 걸린다 - 부정 비교로 쓴 이유가 그것이다.
+        return 0.0, 0.0
+
+    stack = np.stack([h.astype(np.float64) for h in history])
+    n = stack.shape[0]
+    # C++ 은 nth_element(begin + n/2) 로 **상위** 중앙값을 집는다. n 이 짝수인
+    # 채움 구간에서 np.median(두 값 평균)과 갈라지므로 정렬 후 색인으로 맞춘다.
+    med = np.sort(stack, axis=0)[n // 2]
+
+    resid = stack[-1] - med
+    resid = np.where(resid > PARTICLE_RESIDUAL_THRESH, resid, 0.0)
+
+    ratio = float(np.count_nonzero(resid)) / float(resid.size)
+    if ratio < 1e-4:
+        return 0.0, 0.0
+
+    # 구조텐서 이방성으로 비(줄무늬, 방향 일정)와 눈(둥글고 무방향)을 가른다.
+    # 이방성은 고유값의 비이므로 Scharr 스케일에 불변이다 - C++ 이 기본 스케일
+    # (게인 32)을 쓰는데 여기서 1/32 를 써도 같은 값이 나온다.
+    gx, gy = scharr(resid, scale=1.0)
+    sxx = float((gx * gx).sum())
+    syy = float((gy * gy).sum())
+    sxy = float((gx * gy).sum())
+    tr = sxx + syy
+    aniso = 0.0
+    if tr > 1e-12:
+        det = sxx * syy - sxy * sxy
+        disc = math.sqrt(max(0.0, tr * tr * 0.25 - det))
+        l1, l2 = tr * 0.5 + disc, tr * 0.5 - disc
+        aniso = _c01((l1 - l2) / l1) if l1 > 1e-12 else 0.0
+
+    density = _c01(ratio / PARTICLE_SATURATION_RATIO)
+    return density * aniso, density * (1.0 - aniso)
+
+
 # --- 개별 추정기 ------------------------------------------------------------
 
 def estimate_haze(bgr_small: np.ndarray, dcp_patch: int = DCP_PATCH) -> float:

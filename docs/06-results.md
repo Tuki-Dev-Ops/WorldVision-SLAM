@@ -3232,7 +3232,27 @@ be added to a document of published numbers without re-opening all of them.
   full fusion on TUM, §23.4 swept it under degradation, and §24 ran TCG in a real loop-closure
   loop. Tier 1 accepted one loop in 45 s and it was wrong; Tier 2 helps only where Tier 0 has
   already diverged. **§1's three-tier result remains unreproduced on a real sensor** — the slope
-  survives, the magnitude does not (§23.4).
+  survives, the magnitude does not (§23.4). §27 strengthens this on complete data: on seven full
+  sequences Tier-0-only beats both the environment schedule and uniform weighting on **6 of 7**,
+  by 1.8–2.4× in logmean.
+- **`α_k(E)` is settled, and it is settled against the architecture** (§27). It was carried here
+  as "hand-designed and never fitted"; it has now been fitted (§21.3) *and* the question behind
+  the fitting has been measured directly (§27.3–27.4). The schedule does not predict tier
+  reliability (ρ = −0.05…−0.02, sign holding 4/7), and because fusion is invariant to a common
+  weight scale while every predictive observable moves all three weights together, **no evidence
+  channel available in this repository can produce a useful `α_k(E)`**. What remains open is not
+  the coefficients but whether the *form* — a predicted, per-frame relative weight — is the right
+  mechanism at all. §27.8's robust kernel, which reacts to observed disagreement instead of
+  predicting trust, beats uniform on 6 of 7 and Tier-0-only on only 2 of 7.
+- **The binding constraint on fusion is `Λ`, not `α`** (§27.5, §27.8). The information matrices are
+  miscalibrated in scale — TCG by up to 23× against the 6-DOF ANEES target, SPA by up to 4× — and
+  κ-calibrating them leave-one-out beats uniform weighting on **6 of 7 by 16–53 %**, a larger
+  effect than any weighting result anywhere in this document. But their *per-axis* claims carry
+  almost no signal: when `Λ_SPA` asserts it is the more precise tier on its own strongest axis it
+  is right **10–41 %** of the time against a 12–26 % base rate. A scalar κ cannot repair a shape,
+  so even scale-corrected, robust-kernelled fusion beats Tier-0-only on only **3 of 7**. **Whether
+  a per-axis calibration exists that would is unestablished**, and testing it needs each tier's
+  error covariance measured per direction against ground truth, which has not been done.
 - **The stereo depth front-end is validated only against itself.** §25.20–25.21 ran KITTI, so
   the ATE numbers this bullet used to say were missing now exist — but the depth those numbers
   rest on has been checked against TUM's measured depth on a *self-consistently warped right
@@ -3522,3 +3542,468 @@ That locates the remaining work outside this subsystem: a detector or segmenter 
 dense indoors, not another way of assembling what YOLO already returns. §2's simulated results
 are not contradicted — they were measured where objects were guaranteed to exist, and that
 guarantee is what an office withdraws.
+
+---
+
+## 27. `α_k(E)` never beats uniform on seven full sequences, and the evidence is why
+
+§18.4 measured the hand-designed schedule losing to uniform weights on 6 of 7 runs. §21 then
+fitted constant `α` and concluded the schedule "was never the binding problem". **Both were
+measured on sequences truncated to 21–31 % of their length** (§25.22), and §25.22's own rule is
+that everything below 35 % coverage "moves by factors". Re-measured on complete data, with seven
+distinct full-length sequences instead of five sequences and two re-runs of two of them.
+
+Everything below uses one binary (`wme_tum_fusion`, md5 `7a14e395…`) and one configuration. No
+per-sequence constants. Every fit is leave-one-sequence-out.
+
+**On the tooling changing underneath this section.** `5c1dbcb` replaced `tum_fusion`'s
+path-string intrinsics lookup with `resolveCalib`, and `fusion_eval`'s `max_gap` became
+`max(0.05, 1.5 × median gap)`. Neither touches these numbers, and that was measured rather than
+assumed: the `max_gap` floor is unchanged for TUM (`1.5 × 0.010 < 0.05`), and re-recording
+`fr1_desk` through the rebuilt tool reproduces **Tier 0 and Tier 1 bit-identically** — every pose
+and every information entry — with SPA moving by 0.14 % in the median information entry and one
+extra frame firing. All seven sequences were then re-recorded end to end and §27.3's and §27.5's
+tables reproduce (`α₀` median ρ −0.011 vs −0.050, per-axis ρ +0.069 vs +0.071). The intrinsics bug
+was real and it was KITTI-only: the string lookup returned the *correct* calibration for every
+`freiburg*` path.
+
+**The answer is that two questions were being asked at once.** "Why does `α_k(E)` lose to uniform"
+is **(b)** — the environment evidence carries no signal about tier reliability (§27.3), and nothing
+available predicts the *relative* quantity a weight has to encode (§27.4). "Why does fusing lose to
+not fusing" is **(c)**, and it has two layers: the tiers' information matrices are miscalibrated in
+*scale* — repairable, and worth 16–53 % (§27.8) — and uninformative in *per-axis shape* — not
+repairable by any scalar, and right about a fifth of the time (§27.5). **(a) is dead**: no
+coefficient of a signal with ρ ≈ 0 is worth finding.
+
+### 27.1 Two gates before any of it counts
+
+**The replay reproduces the engine.** `fusion_replay.py --validate` on the seven full sequences:
+**56 trajectories, worst relative disagreement 0.005 %**, and the discrimination guard — a
+deliberately corrupted weight must move the ATE — fires on **7 of 7**. Both halves, as §10.4
+demands.
+
+**Fusion is exactly invariant to a common weight scale, and that bounds what any `α` can do.**
+`fuse()` minimises a sum of weighted quadratics, so `H` and `g` scale together and the update does
+not move. Measured on `fr1_desk`, not assumed:
+
+| weights | ATE |
+|---|---|
+| `(1, 1, 1)` | 9.466681 cm |
+| `(10, 10, 10)` | 9.466681 cm |
+| `(0.01, 0.01, 0.01)` | 9.466681 cm |
+| `α_k(E)` | 12.716206 cm |
+| `5 · α_k(E)` | 12.716206 cm |
+| `(1, 0.1, 0.1)` — *ratio* changed | **5.678004 cm** |
+
+Identical to six decimals under common scaling, and moves under a ratio change. **Only the two
+ratios `α₁/α₀` and `α₂/α₀` exist as far as the fused pose is concerned.** §27.4 turns this into
+the section's sharpest result.
+
+### 27.2 On complete data the schedule loses 7 of 7 — and both variants lose to not fusing
+
+ATE cm, seven full sequences:
+
+| sequence | frames | **T0 only** | `α_k(E)` | uniform | winner |
+|---|---|---|---|---|---|
+| fr1_360 | 756 | **27.65** | 84.99 | 62.09 | uniform |
+| fr1_desk | 596 | **5.35** | 12.72 | 9.47 | uniform |
+| fr1_room | 1362 | **23.82** | 73.74 | 49.32 | uniform |
+| fr1_xyz | 798 | **4.14** | 9.32 | 6.87 | uniform |
+| fr3_sitting_xyz | 1215 | **3.51** | 24.31 | 15.34 | uniform |
+| fr3_walking_halfsphere | 1017 | **54.28** | 74.64 | 66.07 | uniform |
+| fr3_walking_xyz | 826 | 112.96 | 110.24 | 110.47 | tie |
+| **logmean** | | **16.36** | 39.44 | 30.08 | |
+
+**0 wins, 6 losses, 1 tie.** Uniform still beats the schedule on 6 of 7, exactly as §18.4 reported
+— but §18.4's one schedule *win* (by 1.74 %) becomes a **tie**, so on complete data the schedule
+never wins anywhere. And the more important number is the column §18.4 did not put beside it: the
+gap to Tier-0-only widens rather than closing. The schedule is **2.4×** worse than not fusing at
+all and uniform is **1.8×**, and Tier-0-only is the best configuration on **6 of these 7
+sequences**.
+
+### 27.3 The environment evidence does not predict tier reliability
+
+`α_k` means "trust tier k". If the schedule were merely mis-tuned, `α_k` would still rank frames
+correctly and only the mapping's shape would be wrong. Spearman ρ between `α_k` and tier k's own
+per-frame translation error — negative is the predicted direction:
+
+| | median ρ | sequences with the predicted sign |
+|---|---|---|
+| `α₀` → ECDA error | **−0.050** | 4/7 |
+| `α₁` → TCG error | **−0.019** | 4/7 |
+| `α₂` → SPA error | **−0.060** | 5/7 |
+
+Per-sequence 95 % half-widths are ±0.05–0.07, so every one of these is indistinguishable from
+zero, and the sign is a coin flip. Ranked against every other observable the harness records,
+**all three `α_k` sit in the bottom half for every tier**:
+
+| predicting… | best observable | median \|ρ\| | consistent sign | where `α_k` ranks |
+|---|---|---|---|---|
+| ECDA error | `t0_depth_incons` | **+0.561** | 7/7 | `α₀` 14th of 16 (0.075) |
+| ECDA error | `t0_depth_rel` | −0.492 | 7/7 | |
+| ECDA error | `t0_logtrace` | −0.431 | 7/7 | |
+| TCG error | `t0_logtrace` | **−0.326** | 7/7 | `α₁` 15th of 16 (0.076) |
+| SPA error | `t2_dof` | **+0.276** | 7/7 | `α₂` 7th of 16 (0.101, 5/7) |
+
+`α₀` and `α₁` rank second-to-last and third-to-last among sixteen observables for the tiers they
+are supposed to govern. `α₂` places mid-table, but at \|ρ\| = 0.101 with the sign holding on only
+5 of 7 sequences, which is not a usable predictor either.
+
+`t0_depth_incons` is §25's geometric self-consistency signal, and it predicts ECDA's error at
+**+0.561 with the same sign on all seven sequences** — an order of magnitude more signal than the
+entire environment model carries. **Cause (b): the schedule is not mis-tuned, it is measuring
+something uncorrelated with what it weights.**
+
+### 27.4 And the signals that do predict cannot be used as weights either
+
+The obvious next move is §26's — put `depth_incons` into `EnvironmentState` and weight with it.
+**That cannot work, and §27.1 is why.** Look at which tiers `depth_incons` predicts: **all three,
+with the same sign** (+0.561 ECDA, +0.302 TCG, +0.220 SPA, 7/7, 6/7, 7/7). It is a *frame
+difficulty* signal, not a *tier ordering* signal — and a signal that moves all three `α_k` in the
+same direction moves only the common scale, which §27.1 measured to be **exactly a no-op**.
+
+Measured directly, as `d_k = log(err_k / err_0)` — the relative advantage a weight actually needs:
+
+| | best observable | median \|ρ\| | consistent sign | `α_k` |
+|---|---|---|---|---|
+| `d₁` (TCG vs ECDA) | `t0_depth_rel` | 0.185 | 5/7 | 0.101, 5/7, **wrong sign** |
+| `d₂` (SPA vs ECDA) | `t0_depth_rel` | 0.139 | 7/7 | 0.089, 5/7 |
+
+`depth_incons`'s correlation collapses from **0.561 on the absolute quantity to 0.121–0.185 on the
+relative one**. Nothing measured here predicts tier ordering.
+
+> **Before fitting a weight, measure whether anything predicts the quantity the weight actually
+> encodes.** Fusion is invariant to common scale, so `α_k(E)` can only express relative trust. The
+> best predictors in this repository predict absolute per-frame difficulty, which the objective
+> discards exactly. This is §10.2's quantity mismatch again — the eighth occurrence, and the second
+> in an objective rather than a sensor model.
+
+So for the weighting question the answer is **(b), and not repairable by better evidence of the
+kind available**. §21.3 reached "no constant α helps" by fitting; this reaches the stronger
+statement by measuring what the fit was searching for.
+
+**But two questions were being asked at once, and they have different answers.** "Why does
+`α_k(E)` lose to uniform" and "why does fusing lose to not fusing" are not the same question, and
+§27.2's table answers both at once only by accident. The first is (b): the evidence carries no
+signal about tier reliability, so the schedule is uncorrelated noise on top of uniform, plus one
+spurious channel (§27.6). The second is **(c)**, and §27.5 measures it.
+
+### 27.5 The information matrices do not know where they are better — this is (c)
+
+§27.3–27.4 dispose of the *weighting* question. They do not explain why fusing is worse than not
+fusing, because a scalar `α_k` is not the only thing deciding that. The information sum already
+implements a stronger rule than any schedule could: *on each axis, defer to whichever tier claims
+more precision there.* §25's KITTI work restated the same thing from the error side — SPA helps on
+an axis exactly when Tier 0's error there exceeds SPA's own accuracy. That rule is right. The
+question this section asks is whether the system can **observe** it.
+
+Along SPA's own best-constrained direction `u` (the top eigenvector of `Λ_SPA`), compare what the
+tiers *claim* against what they *do*:
+
+- claim `c = log( σ₀(u) / σ₂(u) )`, with `σ_k(u)² = uᵀ Λ_k⁺ u` — positive means "SPA is more
+  precise on this axis"
+- actual `a = log( |e₀·u| / |e₂·u| )` — positive means SPA really was more accurate there
+
+| sequence | ρ(claim, actual) | n | SPA claims better | **SPA right when it claims** | base rate |
+|---|---|---|---|---|---|
+| fr1_360 | +0.107 | 595 | 54.8 % | 12.9 % | 12.1 % |
+| fr1_desk | +0.063 | 223 | 14.8 % | 33.3 % | 23.8 % |
+| fr1_room | −0.026 | 979 | 23.4 % | **15.7 %** | **17.7 %** |
+| fr1_xyz | +0.264 | 301 | 5.6 % | 41.2 % | 25.6 % |
+| fr3_sitting_xyz | +0.004 | 1209 | 2.5 % | **10.0 %** | **15.1 %** |
+| fr3_walking_halfsphere | +0.071 | 966 | 5.9 % | 17.5 % | 15.4 % |
+| fr3_walking_xyz | +0.194 | 792 | 2.5 % | 20.0 % | 13.8 % |
+
+**ρ = −0.03 to +0.26, median +0.07.** The raw sign-agreement rate looks respectable (47–85 %) and
+means nothing: where SPA claims superiority on only 2.5 % of frames, "always believe Tier 0" scores
+97.5 %. The two right-hand columns are the measurement. **When `Λ_SPA` asserts it is the more
+precise tier on its own strongest axis, it is actually more accurate there 10–41 % of the time,
+against a base rate of 12–26 %** — a lift of +0.8 to +15.6 points on five sequences and **negative
+on two**. The claim is wrong most of the time it is made, and on `fr1_360` — the one sequence where
+the claim is near-balanced and therefore actually carries a decision — it lands at **12.9 % against
+a 12.1 % base rate**, which is chance.
+
+> **The three-tier fusion arbitrates per axis using precision claims that are right about a fifth
+> of the time.** That is cause **(c)**, and it sits underneath (b) rather than beside it: `α_k` is
+> one scalar per tier, and no scalar can repair a per-axis shape that points the wrong way.
+
+This also explains why §18.3 and §21.5 kept finding "the gap is correctly identified and then
+filled with a worse number", and why selectivity stayed at 0.99–1.14 no matter what was done to the
+weights. The shape of `Λ` is doing the filling, and the shape is not informative. §27.8 tests the
+one repair a scalar *can* make — matching the tiers' overall scale — and it does not close this,
+because κ rescales `Λ_k` uniformly and leaves its per-axis shape exactly as it was.
+
+### 27.6 Rain and snow, on a dry indoor sequence, on 99.3 % of frames
+
+That still leaves §27.2's *size* unexplained: if `E` is uncorrelated noise, the schedule should
+land near uniform, not 31 % worse than it. It does not, and the reason is a single channel.
+
+Fed real hand-held TUM frames, the **shipped** `EnvironmentAnalyzer` reports:
+
+| sequence | `rain_streak` med (max) | `snow_particle` med (max) | non-zero frames | `visibility` |
+|---|---|---|---|---|
+| fr1_360 | **0.40** (0.82) | **0.59** (0.98) | **99.3 %** | 0.614 |
+| fr1_desk | 0.37 (0.65) | 0.63 (0.97) | 99.3 % | 0.611 |
+
+There is no precipitation in these sequences. They are offices. The `particle_ratio` driving it
+runs **0.23–0.37**, where the estimator's own saturation point — the density it calls *extreme* —
+is **0.05**. It is 5–7× past its own maximum, every frame.
+
+**The cause is in the estimator's premise, not its coefficients.** `analyzeTransientParticles`
+subtracts a 9-frame per-pixel temporal median, keeps the positive residual, and reads its
+structure-tensor anisotropy as rain-versus-snow. A per-pixel temporal median is a background model
+only while that pixel keeps looking at the same scene point. On a hand-held camera every edge in
+the frame produces a positive temporal residual, and the residual of a translating edge is
+strongly oriented — which the estimator reads as *streaks*. It was designed for a static camera
+watching rain fall, and nothing said so. Worse, the analyser runs at 5 Hz, so consecutive history
+frames are 0.2 s apart and the motion between them is larger still.
+
+An independent numpy re-implementation agrees with the shipped C++ to **0.005** (rain 0.4051 vs
+0.4005), so this is the shipped path and not a binding artefact.
+
+**Why it costs the ratio and not just the scale.** `tum_fusion.cpp` reads its RGB with
+`IMREAD_GRAYSCALE`, so `frame.rgb` is empty, and `computeEvidence` therefore never computes haze,
+specular or indoorness — `estimateHaze` returns 0 on an empty matrix. **On these runs the spurious
+particles are the only thing depressing `visibility` at all.** From there the three weights move
+*differentially*:
+
+- `α₀ ×= (1 − 0.45·rain) = 0.82`
+- `α₁ = 0.35 + 0.65·visibility^0.45` falls 1.00 → **0.87**
+- `α₂ = 0.40 + 0.60·texture_poverty + 0.30·(1 − α₀)` **rises** as `α₀` falls
+
+so `α₂/α₀` inflates, and `α₂` is SPA — the tier measured at 411–461 cm standalone. **The schedule's
+worst structural property, up-weighting the least accurate tier, is substantially one broken
+estimator.** Observed medians across all seven sequences: `α₀` 0.27–0.37 while `α₁` ≈ 0.86 and
+`α₂` 0.84–0.99.
+
+### 27.7 The fix, and what it does not buy
+
+The gate: **the temporal median may be trusted only while the global image motion accumulated over
+the window is under 1 px.** The threshold is the statistic's own sampling interval — the median is
+taken per pixel index, so content leaving that pixel mixes scene points — and the window is scored
+by *path length* (the sum of per-frame shifts), which is an upper bound on net displacement and so
+errs toward distrust. Nothing is tuned. The shift already exists: `estimateShake` computes it by
+phase correlation and was throwing away the magnitude before squashing it to 0…1.
+
+When it cannot measure, it abstains rather than reporting 0 — `particles_measurable` and
+`particle_window_shift_px` are on `EnvironmentState`, because "no rain" and "cannot see whether it
+is raining" are different claims and the consumer must be able to tell.
+
+Measured without rebuilding, deliberately: the working tree carries another agent's in-progress
+`DirectAligner` changes, so a rebuild would mix their change into this number. Instead `α` is
+re-derived in Python from the *shipped* estimator and fed to the validated replay, which makes `α`
+provably the only thing that differs. The harness reproduces the recorded per-frame `α` to
+**5.0 × 10⁻¹⁴ on all seven sequences** (matched by frame index and cross-checked on the stamp),
+which is this experiment's §10.4 gate. It did not pass on the first attempt: `tiers.csv` writes
+stamps at 12 significant digits, losing 0.5 ms, so matching on float equality paired **2 or 3
+frames per sequence** and silently fell back to the original `α` everywhere else — reporting
+"+0.0 % change" for every run. A gate that reports a difference of exactly zero deserves the same
+suspicion as one that reports a large one.
+
+**The gate almost never opens on this data.** Median accumulated window path is **27.6–70.1 px**
+against the 1 px limit — the estimator's precondition is violated by 28–70× on the typical frame —
+and `particles_measurable` is true on only **0.6–3.4 %** of frames. So the corrected schedule is
+very nearly the schedule with rain and snow deleted.
+
+| sequence | **T0 only** | `α` orig | `α` fixed | uniform | fixed vs orig | fixed vs uniform |
+|---|---|---|---|---|---|---|
+| fr1_360 | **27.65** | 84.99 | 82.76 | 62.09 | **−2.6 %** | +33.3 % |
+| fr1_desk | **5.35** | 12.72 | 12.27 | 9.47 | **−3.5 %** | +29.6 % |
+| fr1_room | **23.82** | 73.74 | 69.96 | 49.32 | **−5.1 %** | +41.9 % |
+| fr1_xyz | **4.14** | 9.32 | 9.42 | 6.87 | +1.1 % | +37.2 % |
+| fr3_sitting_xyz | **3.51** | 24.31 | 24.41 | 15.34 | +0.4 % | +59.1 % |
+| fr3_walking_halfsphere | **54.28** | 74.64 | 75.66 | 66.07 | +1.4 % | +14.5 % |
+| fr3_walking_xyz | 112.96 | 110.24 | 111.68 | 110.47 | +1.3 % | +1.1 % tie |
+| **logmean** | **16.36** | 39.44 | **39.03** | 30.08 | −1.0 % | |
+
+**Three sequences improve, four get slightly worse, the logmean moves 1.0 %, and the schedule still
+loses to uniform on 7 of 7.** The fix is correct and it is not a rescue.
+
+The gate was then compiled in and `fr1_desk` re-run, to confirm the shipped path does what the
+harness modelled. It does, and it moves the ratio in the direction §27.6 predicted:
+
+| | `α₀` med | `α₁` med | `α₂` med | `α₂/α₀` | `α₁/α₀` |
+|---|---|---|---|---|---|
+| before | 0.336 | 0.863 | 0.933 | 2.785 | 2.574 |
+| after | **0.389** | **0.994** | 0.914 | **2.353** | 2.557 |
+
+`α₁` returns to ≈1.0 because `visibility` was being held down by nothing but the phantom
+precipitation, and `α₂/α₀` — the ratio that was up-weighting the least accurate tier — falls
+15.5 %. `α₁/α₀` barely moves, which is why the ATE effect is small: §21.3's fitted optimum for both
+ratios was `≤ 0.01`, and this moves one of them from 2.79 to 2.35.
+
+That number is the most useful one in this section. The evidence pipeline contained about the worst
+bug it could contain — a channel reporting heavy rain and snow on dry office footage, on 99.3 % of
+frames, with its stated precondition violated by more than an order of magnitude — and repairing it
+is worth **1 %** of ATE and does not change a single verdict. That is exactly what §27.3's ρ ≈ 0
+predicts, and it is a stronger confirmation of cause (b) than the correlations are: **when the
+evidence does not predict the target, even a gross error in the evidence does not much matter.**
+
+### 27.8 §21.4's gate does not survive de-truncation either
+
+§21.4 reported a one-parameter χ²(6) consistency gate beating Tier-0-only on **4 of 5** held-out
+folds at `p = 0.50`, and called the fusion failure a robustness failure. Re-run on complete data,
+and generalised from the hard 0/1 gate to a proper robust kernel — the thing §18.1 named as
+missing ("information fusion has no robust kernel across tiers") — with the per-tier NEES
+re-weighted at every Gauss-Newton iteration against the *current fused estimate* rather than
+against Tier 0, which removes §21.7's own caveat that the Tier-0 anchor is an input to the rule
+rather than an output.
+
+The identity check first: with the kernel switched off the robust path reproduces `fuse()` to
+**0.0000 %** on all seven sequences.
+
+Leave-one-sequence-out over kernel × quantile (both are fitted; ties at 2 %):
+
+| held out | fitted | held-out ATE | vs T0 | vs uniform |
+|---|---|---|---|---|
+| fr1_360 | cauchy, p=0.01 | 34.13 | +23.4 % | **−45.0 %** |
+| fr1_desk | cauchy, p=0.01 | 5.60 | +4.8 % | **−40.8 %** |
+| fr1_room | hard, p=0.25 | 20.18 | **−15.3 %** | **−59.1 %** |
+| fr1_xyz | cauchy, p=0.01 | 3.21 | **−22.4 %** | **−53.3 %** |
+| fr3_sitting_xyz | cauchy, p=0.01 | 3.56 | +1.5 % tie | **−76.8 %** |
+| fr3_walking_halfsphere | cauchy, p=0.01 | 55.15 | +1.6 % tie | **−16.5 %** |
+| fr3_walking_xyz | cauchy, p=0.01 | 112.85 | −0.1 % tie | +2.2 % tie |
+
+**Beats uniform on 6 of 7. Beats Tier-0-only on 2 of 7**, with 3 ties and 2 losses. On truncated
+data the same family of rules beat Tier-0-only on 4 of 5; the selected quantile also moved from
+`p = 0.50` to `p = 0.01`, a 5× tighter gate — the fit asking to trust the other tiers *less* as
+more data arrives, which is §21.3's "switch them off" reappearing from a different direction.
+
+> **A robust kernel repairs the damage fusion does relative to uniform weighting. It does not make
+> fusing better than not fusing.** Six of seven against uniform and two of seven against
+> Tier-0-only are the same measurement read at two baselines, and the honest baseline is the better
+> one.
+
+#### Matching the tiers' scale is the one scalar repair that works — up to a point
+
+§27.5 says the *shape* of `Λ` is uninformative. Its *scale* is a separate defect and a fixable
+one: ANEES per tier, pooled over training folds only, against the 6-DOF target of 6.0.
+
+| sequence | ANEES ECDA | ANEES TCG | ANEES SPA |
+|---|---|---|---|
+| fr1_360 | 3.39 | **54.98** | 24.39 |
+| fr1_desk | 5.66 | 21.85 | 4.63 |
+| fr1_room | 6.28 | 19.75 | 11.92 |
+| fr1_xyz | 5.62 | 14.01 | 2.33 |
+| fr3_sitting_xyz | 9.32 | **138.17** | 11.99 |
+| fr3_walking_halfsphere | 13.42 | 22.76 | 18.88 |
+| fr3_walking_xyz | 10.33 | 14.28 | 16.31 |
+
+TCG is overconfident by up to **23×** against target, SPA by up to 4×, ECDA is roughly honest.
+Setting `κ_k = 6 / ANEES_k` from the training folds and applying it to the held-out sequence:
+
+| held out | fitted (κ₀, κ₁, κ₂) | uniform + κ | + robust kernel | T0 | uniform | κ vs uniform | κ+robust vs T0 |
+|---|---|---|---|---|---|---|---|
+| fr1_360 | (0.698, 0.107, 0.454) | 52.23 | 32.35 | **27.65** | 62.09 | **−15.9 %** | +17.0 % |
+| fr1_desk | (0.730, 0.102, 0.400) | 7.13 | 5.51 | **5.35** | 9.47 | **−24.7 %** | +3.0 % |
+| fr1_room | (0.711, 0.102, 0.396) | 36.13 | **20.10** | 23.82 | 49.32 | **−26.7 %** | **−15.6 %** |
+| fr1_xyz | (0.721, 0.095, 0.392) | **3.22** | 3.96 | 4.14 | 6.87 | **−53.1 %** | **−4.1 %** |
+| fr3_sitting_xyz | (0.780, 0.326, 0.392) | 9.79 | **3.22** | 3.51 | 15.34 | **−36.2 %** | **−8.1 %** |
+| fr3_walking_halfsphere | (0.857, 0.094, 0.444) | 54.63 | 53.80 | 54.28 | 66.07 | **−17.3 %** | −0.9 % tie |
+| fr3_walking_xyz | (0.784, 0.089, 0.423) | 108.42 | 111.73 | 112.96 | 110.47 | −1.9 % tie | −1.1 % tie |
+
+The fitted `κ` is **stable across folds** — `κ₁ ≈ 0.10`, `κ₂ ≈ 0.40`, `κ₀ ≈ 0.7–0.86` on six of
+seven — which is what a real property of the tiers looks like rather than a fit chasing folds.
+**κ alone beats uniform on 6 of 7**, by 16–53 %, and on `fr1_xyz` it beats Tier-0-only outright.
+
+Stacking both repairs — scale by `κ`, tails by the robust kernel, everything else uniform —
+**beats Tier-0-only on 3 of 7**, with 2 ties and 2 losses, against 2 of 7 for the kernel alone.
+
+> **Cause (c) is confirmed and it is only half-repairable.** Matching the tiers' *scale* is worth
+> 16–53 % against uniform and is the single largest lever found anywhere in this section — far
+> larger than anything `α_k(E)` was ever going to do. Matching their *shape* is not available: κ is
+> one number per tier and rescales `Λ_k` uniformly, so it cannot touch the per-axis claim that
+> §27.5 measured at ~20 % precision. That is exactly where the remaining 4 of 7 sit.
+
+The practical reading, and the one this section would defend: **the schedule should be deleted, the
+weights set uniform, and the tiers κ-calibrated.** That configuration is same-everywhere, has no
+per-sequence constants, is fitted leave-one-out, and beats both the shipped schedule and plain
+uniform on 6 of 7. It still does not beat Tier-0-only often enough to justify running three tiers.
+
+### 27.9 The rule this earns
+
+> **An estimator must gate itself on the conditions its own derivation assumes, and the gate
+> belongs inside the estimator, not in whatever consumes it.** `analyzeTransientParticles` assumed
+> a static camera. It never said so, no test supplied a moving one, and for the entire life of the
+> module it reported heavy rain and snow on dry office footage — which then propagated into the
+> one array (`α_k`) the architecture says is its whole adaptation mechanism.
+
+The channel had unit tests. What it did not have was an oracle and an input it was not designed
+for, which is §19.3's trap in a different subsystem: the tests confirmed the arithmetic and never
+questioned the premise.
+
+The second rule is about the order the questions were asked in:
+
+> **Measure whether a quantity carries signal before building machinery that consumes it.** Three
+> sections and two sprints went into weighting a sum whose per-axis arbitration (§27.5) is right
+> about a fifth of the time. `α_k(E)` was tuned, then fitted, then gated, then de-truncated, and
+> at every stage the thing underneath it was not carrying information. The measurement that
+> settled it — a rank correlation between a claim and an outcome — costs minutes and needed no new
+> code beyond a loader that already existed.
+
+### 27.10 What this does not settle
+
+- **The `0.40` / `0.45` coefficients are still untested.** They were never the problem, but they
+  are also still hand-written and have still never seen real rain or snow. Testing them needs
+  static-camera precipitation footage, which this repository does not have. §03-roadmap's open item
+  stays open, with its reason changed.
+- **The particle channel is now dead on any moving camera**, which is every application this
+  project targets. Abstaining is correct but it is not a rain detector. The real fix is
+  ego-motion-compensated background modelling — warp the history by the estimated pose before
+  differencing — and it is **not implemented**.
+- **The 1 px threshold is derived, not swept.** It follows from the statistic's sampling interval,
+  and the path-length bound makes it conservative, but no measurement here shows the result is
+  insensitive to it. On this data it is academic: the measured window path is far above 1 px
+  essentially always.
+- **Seven sequences, one dataset family, indoor, hand-held, 640×480.** The same caveat §26 already
+  carries, and it is the sharpest limit on §27.5. `Λ`'s per-axis claims are worthless *here*; on
+  KITTI the axes are physically different (a forward-driving vehicle starves the same directions
+  every frame) and the answer could differ.
+- **KITTI was recorded and could not answer the question.** `5c1dbcb` made the fusion harness
+  runnable on KITTI, so `kitti_00` and `kitti_04` were re-recorded through it. At the shipped plane
+  configuration **SPA contributes on 8 of 399 frames (2.0 %) on `kitti_00` and 0 of 135 on
+  `kitti_04`**, and TCG on 12 of 399 (3.0 %). §27.5 needs paired ECDA/SPA estimates and there are
+  eight of them, so it returns `n = 8` and nothing usable. §25's KITTI results that *do* show SPA
+  helping used non-default plane parameters; matching them would mean a per-dataset constant, which
+  this section's own rule forbids. **So the generality of §27.5 rests on TUM alone**, and the
+  cheapest way to change that is a plane front-end that fires outdoors at the shipped settings.
+- **`ρ = depth_consistency/(√2·c·Z̄)` was not tested directly.** §25 measured it correlating
+  **+0.938** with `kitti_04`'s vertical error, and it is the obvious candidate to put into
+  `EnvironmentState`. Two things stop this section from settling it. It is not computable from the
+  fusion recordings — `depth_sigma_rel` is 0 there, so `c` is undefined — and on TUM it reduces to
+  a mild per-frame rescaling of `depth_incons`, which §27.4 measured against the *relative* target
+  at \|ρ\| = 0.12–0.19. The `Z̄` normalisation is what would make it different, and `Z̄` varies by a
+  factor of 20 on KITTI against about 3 indoors. **So §27.4's argument bounds it on TUM and says
+  nothing about KITTI**, which is exactly where its evidence came from. That test is owed.
+- **§27.5 does not license "throw `Λ` away".** It measures that the *ratio* of claimed precisions
+  across tiers does not predict the ratio of actual accuracies. Each tier's `Λ` may still be
+  internally useful — §25.16's ECDA oracle agrees on the information accumulation to 8 % — and the
+  failure could live entirely in the *cross-tier* comparison, which is what §18.1's 3–47×
+  differential overconfidence would produce. Distinguishing "each `Λ` is wrong" from "the `Λ`s are
+  mutually incomparable" needs a per-tier calibration measured against ground truth per axis, and
+  that was not done.
+- **The C++ change is validated by tests and by the `α` it produces, not by a re-measured ATE.**
+  ctest 236/236 and the Python suite 641 passed / 6 skipped with the gate in, and the compiled gate
+  reproduces the predicted `α` shift on `fr1_desk`. But the ATE comparison deliberately came from
+  the isolation harness (§27.7) because the working tree was shared with another agent's
+  in-progress `DirectAligner` changes. **A clean seven-sequence re-run of `wme_tum_fusion` with the
+  gate compiled in and no other pending changes is still owed**, and until it exists the ATE column
+  is a replay result rather than an engine result.
+- **`estimateShake` is unreliable on periodic and low-texture content, and the gate inherits that.**
+  Measured while writing the differential test: `cv::phaseCorrelate` on **two identical
+  checkerboards** returns a shift of **80.0 px** (response 0.05), and on two identical flat images
+  **(79, 59)** (response 0.0005). The gate errs toward abstaining there, which is the safe
+  direction — "motion unmeasurable" and "cannot claim rain" agree. But the converse is unguarded:
+  nothing here rules out an unreliable correlation returning a *spurious sub-pixel* magnitude and
+  opening the gate on a moving camera. Using the correlation response to reject the measurement
+  outright would need a threshold, and no derivation for one was found, so it was not added.
+- **The κ result is a replay result and is not wired into the engine.** §27.8's calibration is
+  applied in `fusion_replay`, and `wme_tum_fusion` already accepts `--kappa0/1/2`, but nothing
+  computes `κ` online — it is measured against ground truth. A shipping version needs a `κ`
+  estimated without truth (from residual consistency, not from ATE), and that is not built. Until
+  it is, "uniform + κ" is a statement about what the tiers *could* contribute, not a configuration
+  anyone can run.
+- **`α_k(E)` is still in the pipeline and still loses to uniform.** §27.7 narrows the gap; it does
+  not make the schedule worth having. On this evidence the defensible configuration is
+  Tier-0-only, and the architecture's central claim — that environment-scheduled information
+  weighting is what buys robustness — remains unsupported on real data.

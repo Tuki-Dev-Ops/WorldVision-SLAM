@@ -370,3 +370,128 @@ def test_evidence_reaches_tier_weights():
     a2 = analyzer().update(IMAGES["flat"], qc, 1.0)
     w2 = (a2.tier.photometric, a2.tier.constellation, a2.tier.structural)
     assert max(abs(x - y) for x, y in zip(w1, w2)) > 0.02, f"{w1} vs {w2}"
+
+
+# --- 비/눈: 시간 창 추정기와 자기운동 게이트 ---------------------------------
+#
+# 이 채널은 여태 오라클이 없었다. 그 사이에 실제 동작은 이랬다: 강수가 전혀
+# 없는 실내 손들기 TUM 시퀀스에서 rain_streak 중앙값 0.40, snow_particle 0.59
+# 가 프레임의 99.3 % 에서 보고됐다 (docs/06-results.md 27 절). 원인은 카메라가
+# 움직이면 화소별 시간 중앙값이 배경 모형이 아니게 되는 것이고, 고칠 곳은
+# 계수(0.40/0.45)가 아니라 추정기의 적용 조건이었다.
+
+def _feed(a, images, qc, t0=1.0, dt=0.05):
+    """같은 analyzer 에 프레임을 순서대로 넣고 마지막 상태를 돌려준다.
+    시간 창 추정기는 이력이 있어야 하므로 한 프레임만으로는 검증할 수 없다."""
+    st = None
+    for i, im in enumerate(images):
+        st = a.update(im, qc, t0 + i * dt)
+    return st
+
+
+def test_static_camera_particle_estimate_matches_oracle():
+    """카메라가 정지해 있으면 게이트가 열리고, 그 값이 오라클과 같아야 한다.
+
+    배경을 체커로 두면 안 된다. 위상상관은 주기 무늬에서 원리상 모호하고,
+    실측으로 **동일한** 체커 두 장에 대해 (79.99, 0.00) 을 응답 0.05 로 돌려준다
+    (평탄 영상은 (79, 59), 응답 0.0005). 즉 정지해 있어도 이동량이 80 px 로
+    잡히고 게이트가 닫힌다 - 게이트의 판단은 그 상황에서 옳다(움직임을 확인할
+    수 없으면 비를 주장할 수 없다). 그래서 여기서는 위상상관이 실제로 (0,0) 을
+    내는 비주기 텍스처를 쓴다. 같은 잡음 영상 두 장의 응답은 1.0 이다.
+    """
+    qc, _ = quality(brightness=0.5)
+    base = img_noise(seed=5, mu=110, sigma=35)
+    # 정지 배경 + 마지막 프레임에만 밝은 점들을 얹는다 = 입자의 정의
+    frames = [base] * 8
+    spotted = base.copy()
+    r = _rng(11)
+    ys = r.integers(0, H, 400)
+    xs = r.integers(0, W, 400)
+    spotted[ys, xs] = 255
+    frames = frames + [spotted]
+
+    a = analyzer()
+    st = _feed(a, frames, qc)
+
+    assert st.particles_measurable, (
+        f"정지 카메라인데 판정 불가: shift={st.particle_window_shift_px:.3f} px")
+
+    hist = [ref.bgr_to_gray_u8(im).astype(np.float64) for im in frames[-9:]]
+    rain, snow = ref.transient_particles(hist, st.particle_window_shift_px)
+    assert st.evidence.rain_streak == pytest.approx(rain, abs=2e-3), \
+        f"rain C++ {st.evidence.rain_streak:.4f} vs ref {rain:.4f}"
+    assert st.evidence.snow_particle == pytest.approx(snow, abs=2e-3), \
+        f"snow C++ {st.evidence.snow_particle:.4f} vs ref {snow:.4f}"
+    # 10.4: 이 비교가 0 == 0 이 아닌지 확인한다.
+    assert rain + snow > 0.05, f"오라클이 아무것도 검출하지 않음: {rain:.4f}/{snow:.4f}"
+
+
+def test_moving_camera_abstains_from_particles():
+    """카메라가 창 안에서 1 px 넘게 움직이면 강수를 주장하지 않는다.
+
+    게이트 이전에는 이 입력이 rain/snow 를 크게 보고했다. 그것이 이 시험의
+    요점이다 - 움직이는 카메라의 시간 잔차는 강수가 아니다.
+    """
+    qc, _ = quality(brightness=0.5)
+    # 매 프레임 3 px 씩 굴린 같은 장면. 강수는 전혀 없다.
+    # 배경은 비주기 텍스처여야 한다 - 체커로 두면 이동량이 크게 잡히는 이유가
+    # 실제 운동인지 위상상관의 주기 모호성인지 구별되지 않는다. 잡음이면
+    # 위상상관이 3 px 를 정확히 집으므로 창 경로가 8 x 3 = 24 px 로 예측된다.
+    base = img_noise(seed=5, mu=110, sigma=35)
+    frames = [np.roll(base, 3 * i, axis=1) for i in range(9)]
+
+    a = analyzer()
+    st = _feed(a, frames, qc)
+
+    # 전이 8 개 x 3 px = 24 px. 위상상관이 실제 운동을 재고 있음을 확인한다.
+    assert st.particle_window_shift_px == pytest.approx(24.0, abs=1.0), \
+        f"3 px x 8 전이 = 24 px 를 기대했는데 {st.particle_window_shift_px:.3f} px"
+    assert not st.particles_measurable
+    assert st.evidence.rain_streak == 0.0
+    assert st.evidence.snow_particle == 0.0
+
+    # 오라클도 같은 판정을 해야 한다.
+    hist = [ref.bgr_to_gray_u8(im).astype(np.float64) for im in frames]
+    assert ref.transient_particles(hist, st.particle_window_shift_px) == (0.0, 0.0)
+    # 그리고 게이트를 강제로 열면 오라클은 실제로 큰 값을 낸다 - 게이트가
+    # 무언가를 막고 있다는 증거이고, 없으면 이 시험은 아무것도 말하지 않는다.
+    open_rain, open_snow = ref.transient_particles(hist, 0.0)
+    assert open_rain + open_snow > 0.3, (
+        f"게이트를 열어도 조용하다 - 이 입력은 게이트를 시험하지 못한다: "
+        f"{open_rain:.4f}/{open_snow:.4f}")
+
+
+def test_disabling_the_gate_restores_the_spurious_detection():
+    """문턱을 무한으로 두면 게이트 이전 동작이 그대로 돌아와야 한다.
+
+    이 손잡이는 27 절의 '게이트 전/후' 비교를 같은 바이너리에서 만들기 위한
+    것이다. 시험하지 않으면 비교의 한쪽이 검증된 적 없는 경로가 된다.
+    동시에 이 시험은 게이트가 **무언가를 실제로 막고 있다** 는 증거이기도 하다 -
+    두 설정이 같은 값을 내면 게이트는 아무 일도 하지 않는 것이다.
+    """
+    qc, _ = quality(brightness=0.5)
+    base = img_noise(seed=5, mu=110, sigma=35)
+    frames = [np.roll(base, 3 * i, axis=1) for i in range(9)]   # 프레임당 3 px
+
+    gated = _feed(analyzer(), frames, qc)
+    ungated = _feed(analyzer(particle_max_window_shift_px=float("inf")),
+                    frames, qc)
+
+    # 이동량은 두 설정에서 같아야 한다 - 바뀐 것은 판정뿐이다.
+    assert ungated.particle_window_shift_px == pytest.approx(
+        gated.particle_window_shift_px, rel=1e-12)
+    assert not gated.particles_measurable
+    assert ungated.particles_measurable
+
+    assert gated.evidence.rain_streak == 0.0
+    assert gated.evidence.snow_particle == 0.0
+    # 게이트를 끄면 강수가 없는 입력에서 강수를 보고한다. 그것이 고친 버그다.
+    spurious = ungated.evidence.rain_streak + ungated.evidence.snow_particle
+    assert spurious > 0.3, f"게이트를 꺼도 조용하다 - 손잡이가 죽어 있다: {spurious:.4f}"
+
+    # 그리고 그 오검출이 alpha 까지 실제로 흘러가야 한다. 증거만 바뀌고
+    # 가중치가 그대로면 27 절의 인과 사슬이 끊긴 것이다.
+    assert ungated.visibility < gated.visibility - 0.05, (
+        f"visibility {gated.visibility:.3f} -> {ungated.visibility:.3f}")
+    assert ungated.tier.constellation < gated.tier.constellation - 0.02, (
+        f"alpha1 {gated.tier.constellation:.3f} -> {ungated.tier.constellation:.3f}")

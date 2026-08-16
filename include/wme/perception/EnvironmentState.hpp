@@ -63,6 +63,14 @@ struct EnvironmentState {
     double dynamic_level{0.0};     // 동적 객체 점유 비율 (Tracking 이 주입)
     double sensor_reliability{1.0};// 종합 센서 신뢰도
 
+    // --- 비/눈 판정 가능 여부 ----------------------------------------------
+    // 시간 중앙값은 같은 화소가 같은 장면점을 보고 있을 때만 배경 모형이다.
+    // 카메라가 창 안에서 1 px 넘게 움직이면 그 전제가 깨지고, 잔차는 강수가
+    // 아니라 자기운동을 잰다. 판정 불가를 "비 없음" 과 같은 0 으로만 내보내면
+    // 밖에서 구별할 수 없으므로 따로 보고한다 (docs/06-results.md 27 절).
+    bool   particles_measurable{false};   // 아래 이동량이 1 px 미만인가
+    double particle_window_shift_px{0.0}; // 시간 창에 누적된 전역 이동 경로길이
+
     // --- 3-tier 정보 가중치 alpha_k(E) -------------------------------------
     // docs/02-correspondence-problem.md 5장의 융합 규칙. 이 배열이 적응 로직의
     // 유일한 출력 채널이며, 다른 엔진은 라벨이 아니라 이 값을 읽는다.

@@ -53,6 +53,17 @@ class Adaptation:
 
 def derive_adaptation(ev: Evidence) -> Adaptation:
     # --- 가시도: 동시 악화를 반영하도록 곱으로 결합 ---
+    #
+    # rain_streak / snow_particle 의 계수 0.40 / 0.45 는 여전히 손으로 쓴
+    # 숫자이고, 실제 비나 눈에 대조된 적이 없다 (docs/03-roadmap.md 의 미해결
+    # 항목). 다만 docs/06-results.md 27 절이 잰 바에 따르면 이 저장소가 가진
+    # 어떤 데이터에서도 그 계수는 결과를 바꾸지 않는다 - 입력이 되는 두 채널이
+    # 움직이는 카메라에서 판정 불가로 기권하기 때문이다(자기운동 게이트).
+    # 즉 이 두 계수는 "틀렸다" 가 아니라 "아직 시험된 적이 없다" 이고,
+    # 시험하려면 정지 카메라의 실제 강수 영상이 필요하다.
+    #
+    # 27 절 이전에는 게이트가 없어서 이 두 항이 실내 손들기 시퀀스에서
+    # visibility 를 0.61 로 눌렀다 - 강수가 전혀 없는데도.
     visibility = _c01((1.0 - 0.85 * ev.haze)
                       * (1.0 - 0.40 * ev.rain_streak)
                       * (1.0 - 0.45 * ev.snow_particle)
